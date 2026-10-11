@@ -36,16 +36,10 @@ init_database()
 
 st.title("明白账 - 财务健康看板")
 st.subheader("上传账单")
-upload_file = st.file_uploader("上传账单文件，支持 .csv 和 .xlsx", type=["csv", "xlsx"])
+upload_file = st.file_uploader("上传账单文件，支持 .csv", type=["csv"])
 if upload_file is not None:
     try:
-        if upload_file.name.endswith(".csv"):
-            df_upload = pd.read_csv(upload_file, encoding="utf-8-sig")
-        elif upload_file.name.endswith(".xlsx"):
-            df_upload = pd.read_excel(upload_file)
-        else:
-            st.error("不支持的文件格式！")
-            st.stop()
+        df_upload = pd.read_csv(upload_file, encoding="utf-8-sig")
         required_cols = ["date", "merchant", "amount", "payment_method", "type"]
         if not all(col in df_upload.columns for col in required_cols):
             st.error("文件缺少必要列！必须包含：date, merchant, amount, payment_method, type")
