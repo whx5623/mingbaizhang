@@ -4,6 +4,34 @@ import sqlite3
 import requests
 import os
 
+def init_database():
+    conn = sqlite3.connect("finance.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS bills (
+        date TEXT,
+        merchant TEXT,
+        amount REAL,
+        payment_method TEXT,
+        type TEXT
+    )
+    ''')
+    cursor.execute("SELECT COUNT(*) FROM bills")
+    count = cursor.fetchone()[0]
+    if count == 0:
+        sample_data = [
+            ("2026-09-01", "食堂", 12.5, "微信", "支出"),
+            ("2026-09-03", "奶茶店", 18.0, "支付宝", "支出"),
+            ("2026-09-05", "兼职收入", 800, "银行卡", "收入"),
+            ("2026-09-08", "超市", 45.2, "微信", "支出"),
+            ("2026-09-10", "文具店", 22.0, "支付宝", "支出")
+        ]
+        cursor.executemany("INSERT INTO bills (date, merchant, amount, payment_method, type) VALUES (?, ?, ?, ?, ?)", sample_data)
+        conn.commit()
+    conn.close()
+
+init_database()
+
 st.title("明白账 - 财务健康看板")
 
 try:
@@ -32,7 +60,7 @@ try:
     st.bar_chart(merchant_sum)
 
 except sqlite3.Error:
-    st.error("数据库 finance.db 不存在，请先运行 db_init.py。")
+    st.error("数据库读取异常。")
 
 st.subheader("AI 金融导师")
 
@@ -44,9 +72,13 @@ for msg in st.session_state.messages:
 
 user_input = st.chat_input()
 if user_input:
-    api_key = os.getenv("DEEPSEEK_API_KEY")
+    try:
+        api_key = st.secrets["DEEPSEEK_API_KEY"]
+    except Exception:
+        api_key = os.environ.get("DEEPSEEK_API_KEY")
+
     if not api_key:
-        st.error("请先设置 DEEPSEEK_API_KEY 环境变量")
+        st.error("请先设置 DEEPSEEK_API_KEY")
     else:
         try:
             conn = sqlite3.connect("finance.db")
