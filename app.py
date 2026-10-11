@@ -3,6 +3,8 @@ import pandas as pd
 import sqlite3
 import requests
 import os
+import plotly.express as px
+import plotly.graph_objects as go
 
 def init_database():
     conn = sqlite3.connect("finance.db")
@@ -33,6 +35,32 @@ def init_database():
 init_database()
 
 st.title("明白账 - 财务健康看板")
+st.subheader("上传账单")
+upload_file = st.file_uploader("上传账单文件，支持 .csv 和 .xlsx", type=["csv", "xlsx"])
+if upload_file is not None:
+    try:
+        if upload_file.name.endswith(".csv"):
+            df_upload = pd.read_csv(upload_file, encoding="utf-8-sig")
+        elif upload_file.name.endswith(".xlsx"):
+            df_upload = pd.read_excel(upload_file)
+        else:
+            st.error("不支持的文件格式！")
+            st.stop()
+        required_cols = ["date", "merchant", "amount", "payment_method", "type"]
+        if not all(col in df_upload.columns for col in required_cols):
+            st.error("文件缺少必要列！必须包含：date, merchant, amount, payment_method, type")
+            st.stop()
+        df_upload["amount"] = pd.to_numeric(df_upload["amount"])
+        conn = sqlite3.connect("finance.db")
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM bills")
+        df_upload[required_cols].to_sql("bills", conn, if_exists="append", index=False)
+        conn.commit()
+        conn.close()
+        st.success("账单上传成功，页面自动刷新！")
+        st.rerun()
+    except Exception as e:
+        st.error(f"读取或写入数据失败：{str(e)}")
 
 try:
     conn = sqlite3.connect("finance.db")
@@ -56,8 +84,13 @@ try:
 
     st.subheader("各商户支出金额")
     expense_df = df[df["type"] == "支出"]
-    merchant_sum = expense_df.groupby("merchant")["amount"].sum()
-    st.bar_chart(merchant_sum)
+    merchant_sum = expense_df.groupby("merchant")["amount"].sum().reset_index()
+    fig = px.bar(merchant_sum, x="merchant", y="amount",
+                 title="各商户支出金额统计",
+                 labels={"merchant": "商户", "amount": "金额(元)"},
+                 color_discrete_sequence=["#4a90e2", "#50c878"])
+    fig.update_traces(hovertemplate="商户：%{x}<br>金额：%{y} 元")
+    st.plotly_chart(fig, use_container_width=True)
 
 except sqlite3.Error:
     st.error("数据库读取异常。")
@@ -66,6 +99,7 @@ st.subheader("AI 金融导师")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+    st.session_state.messages.append({"role": "assistant", "content": "你好！我是你的AI金融导师，我可以结合你的账单给你财务建议，请问有什么想咨询的？"})
 
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
@@ -85,7 +119,7 @@ if user_input:
             df_recent = pd.read_sql_query("SELECT * FROM bills ORDER BY date DESC LIMIT 5", conn)
             conn.close()
             recent_bills = df_recent.to_string(index=False)
-            background = f"""你的身份是大学生财务导师。用户财务数据：
+            system_prompt = f"""你的身份是大学生财务导师。用户财务数据：
 总收入：{total_income}
 总支出：{total_outcome}
 当前结余：{balance}
@@ -93,16 +127,18 @@ if user_input:
 {recent_bills}
 请结合账单数据给出实用、口语化的财务建议。"""
 
+            st.session_state.messages.append({"role": "user", "content": user_input})
+            st.chat_message("user").write(user_input)
+
+            request_messages = [{"role": "system", "content": system_prompt}] + st.session_state.messages
+
             headers = {
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json"
             }
             payload = {
                 "model": "deepseek-chat",
-                "messages": [
-                    {"role": "system", "content": background},
-                    {"role": "user", "content": user_input}
-                ],
+                "messages": request_messages,
                 "temperature": 0.7
             }
             response = requests.post("https://api.deepseek.com/chat/completions", headers=headers, json=payload, timeout=15)
@@ -111,8 +147,6 @@ if user_input:
             else:
                 res_data = response.json()
                 ai_content = res_data["choices"][0]["message"]["content"]
-                st.session_state.messages.append({"role": "user", "content": user_input})
-                st.chat_message("user").write(user_input)
                 st.session_state.messages.append({"role": "assistant", "content": ai_content})
                 st.chat_message("assistant").write(ai_content)
         except requests.exceptions.Timeout:
