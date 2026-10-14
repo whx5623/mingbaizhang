@@ -46,15 +46,7 @@ def init_db():
             );
         """))
 
-        # 3. 安全地添加外键约束（如果是 PostgreSQL）
-        conn.execute(text("""
-            DO $$ BEGIN
-                ALTER TABLE bills ADD CONSTRAINT fk_bills_user 
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
-            EXCEPTION
-                WHEN duplicate_object THEN NULL;
-            END $$;
-        """))
+
         conn.commit()
 
 
