@@ -1,5 +1,8 @@
+# requirements.txt
 streamlit
 pandas
 requests
-sqlalchemy
 plotly
+psycopg2-binary
+sqlalchemy
+bcrypt

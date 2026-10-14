@@ -1,77 +1,64 @@
+# app.py
 import streamlit as st
-import sqlite3
 import pandas as pd
-import os
-import requests
 import plotly.express as px
 from datetime import datetime
+from config import get_deepseek_api_key
+from db import init_db, get_all_bills, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, check_user_exists
+import requests
+import json
 
-# -------------------------- 数据库初始化 --------------------------
-def init_db():
-    conn = sqlite3.connect("finance.db")
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS bills (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT,
-            merchant TEXT,
-            amount REAL,
-            payment_method TEXT,
-            type TEXT
-        )
-    ''')
-    # 检查表是否为空，为空则插入模拟数据
-    df_check = pd.read_sql_query("SELECT * FROM bills", conn)
-    if len(df_check) == 0:
-        sample_data = [
-            ("2026-10-01", "食堂", 12.5, "微信", "支出"),
-            ("2026-10-02", "兼职收入", 800, "支付宝", "收入"),
-            ("2026-10-03", "奶茶店", 18, "微信", "支出"),
-            ("2026-10-04", "超市", 56.2, "支付宝", "支出"),
-            ("2026-10-05", "外卖", 24, "微信", "支出")
-        ]
-        c.executemany("INSERT INTO bills(date, merchant, amount, payment_method, type) VALUES (?,?,?,?,?)", sample_data)
-    conn.commit()
-    conn.close()
+st.set_page_config(layout="wide")
+init_db()
 
-def load_demo_data():
-    conn = sqlite3.connect("finance.db")
-    c = conn.cursor()
-    c.execute("DELETE FROM bills")
-    demo_10rows = [
-        ("2026-10-01", "学校食堂", 11.8, "微信", "支出"),
-        ("2026-10-02", "线上家教兼职", 600.0, "支付宝", "收入"),
-        ("2026-10-03", "蜜雪冰城", 7.5, "微信", "支出"),
-        ("2026-10-04", "淘宝网购服饰", 129.0, "支付宝", "支出"),
-        ("2026-10-06", "食堂早餐", 6.0, "校园卡", "支出"),
-        ("2026-10-08", "白条分期", 85.0, "支付宝", "支出"),
-        ("2026-10-10", "超市零食饮料", 42.3, "微信", "支出"),
-        ("2026-10-12", "美团外卖", 23.6, "微信", "支出"),
-        ("2026-10-14", "打印店", 3.5, "微信", "支出"),
-        ("2026-10-15", "奖学金补贴", 1200.0, "银行卡", "收入")
-    ]
-    c.executemany("INSERT INTO bills(date, merchant, amount, payment_method, type) VALUES (?,?,?,?,?)", demo_10rows)
-    conn.commit()
-    conn.close()
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None
+
+def logout():
+    st.session_state.user_id = None
+    st.cache_data.clear()
+
+if st.session_state.user_id is not None:
+    if not check_user_exists(st.session_state.user_id):
+        st.warning("当前用户不存在，请重新登录")
+        logout()
+        st.rerun()
+
+if st.session_state.user_id is None:
+    st.title("明白账 - 登录 / 注册")
+    username = st.text_input("用户名")
+    password = st.text_input("密码", type="password")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("登录"):
+            uid = verify_user(username, password)
+            if uid:
+                st.session_state.user_id = uid
+                st.rerun()
+            else:
+                st.error("用户名或密码错误")
+    with col2:
+        if st.button("注册"):
+            if not username or not password:
+                st.warning("用户名和密码不能为空")
+            else:
+                try:
+                    new_uid = register_user(username, password)
+                    if new_uid:
+                        st.session_state.user_id = new_uid
+                        st.success("注册成功，已自动登录")
+                        st.rerun()
+                    else:
+                        st.error("注册失败，未获取用户ID")
+                except Exception as e:
+                    st.error(f"注册失败：{str(e)}")
+    st.stop()
 
 @st.cache_data
-def load_data():
-    conn = sqlite3.connect("finance.db")
-    df = pd.read_sql_query("SELECT * FROM bills", conn)
-    conn.close()
-    return df
+def load_data(user_id):
+    return get_all_bills(user_id)
 
-if not os.path.exists("finance.db"):
-    init_db()
-
-# -------------------------- 读取数据库数据 --------------------------
-df = load_data()
-total_income = df[df["type"] == "收入"]["amount"].sum()
-total_expense = df[df["type"] == "支出"]["amount"].sum()
-balance = total_income - total_expense
-recent_3 = df.tail(3)
-
-# -------------------------- 侧边栏个人设定 --------------------------
+# Sidebar
 with st.sidebar:
     st.header("个人设定")
     if "monthly_living" not in st.session_state:
@@ -86,15 +73,30 @@ with st.sidebar:
     st.session_state.city_level = st.selectbox("所在城市", ["一线", "二线", "三线"], index=["一线", "二线", "三线"].index(st.session_state.city_level))
     st.divider()
     if st.button("一键加载演示数据（答辩专用）"):
-        load_demo_data()
-        st.cache_data.clear()
-        st.success("演示数据加载成功，请刷新查看")
+        if st.session_state.get("user_id") and check_user_exists(st.session_state.user_id):
+            ok = insert_demo_bills(st.session_state.user_id)
+            if ok:
+                st.cache_data.clear()
+                st.success("演示数据加载成功")
+                st.rerun()
+            else:
+                st.error("用户校验失败，无法插入演示数据")
+        else:
+            st.warning("请先登录或注册")
+    if st.button("退出登录"):
+        logout()
         st.rerun()
 
-# -------------------------- 页面标题 --------------------------
+# Load data
+df = load_data(st.session_state.user_id)
+total_income = df[df["type"] == "收入"]["amount"].sum()
+total_expense = df[df["type"] == "支出"]["amount"].sum()
+balance = total_income - total_expense
+
+# Page Title
 st.title("明白账 - 财务健康看板")
 
-# -------------------------- 上传账单模块 --------------------------
+# Upload section
 st.subheader("上传账单")
 uploaded_file = st.file_uploader("上传账单文件", type=['csv'])
 if uploaded_file is not None:
@@ -105,33 +107,30 @@ if uploaded_file is not None:
         if missing_cols:
             st.error(f"文件缺少必要列：{','.join(missing_cols)}")
         else:
-            conn_u = sqlite3.connect("finance.db")
-            c_u = conn_u.cursor()
-            c_u.execute("DELETE FROM bills")
-            conn_u.commit()
-            df_upload.to_sql("bills", conn_u, if_exists="append", index=False)
-            conn_u.close()
+            import_csv_to_bills(st.session_state.user_id, df_upload)
             st.cache_data.clear()
             st.success("账单上传成功！页面即将刷新")
             st.rerun()
     except Exception as e:
         st.error(f"读取文件失败：{str(e)}")
 
-# -------------------------- 财务指标卡片 --------------------------
+# Metric cards
 st.subheader("收支概览")
-col1, col2, col3 = st.columns(3)
+col1, col2 = st.columns(2)
 with col1:
     st.metric("总收入", f"{total_income:.2f}")
 with col2:
-    st.metric("总支出", f"{total_expense:.2f}")
-with col3:
-    st.metric("当前结余", f"{balance:.2f}")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.metric("总支出", f"{total_expense:.2f}")
+    with col_b:
+        st.metric("当前结余", f"{balance:.2f}")
 
-# -------------------------- 账单明细表 --------------------------
+# Bill table
 st.subheader("账单明细")
 st.dataframe(df, use_container_width=True)
 
-# -------------------------- Plotly 商户支出柱状图 --------------------------
+# Plotly chart
 st.subheader("各商户支出金额")
 exp_df = df[df["type"] == "支出"]
 bar_data = exp_df.groupby("merchant")["amount"].sum().reset_index()
@@ -146,64 +145,77 @@ fig_bar = px.bar(
 fig_bar.update_traces(hovertemplate="商户：%{x}<br>金额：%{y:.2f}元")
 st.plotly_chart(fig_bar, use_container_width=True)
 
-# -------------------------- AI 金融导师聊天模块 --------------------------
+# AI Chat
 st.subheader("AI 金融导师")
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
-    st.session_state.chat_history.append({"role": "assistant", "content": "你好！我是明白账AI财务管家，可以帮你分析账单，给你适合大学生的省钱小建议，有什么想问我的吗？"})
+    st.session_state.chat_history.append({"role": "assistant", "content": "你好！我是明白账AI财务管家，可以帮你分析账单，也可以直接帮你记账，有什么想问我的吗？"})
 
-# 渲染对话历史
 for msg in st.session_state.chat_history:
     st.chat_message(msg["role"]).write(msg["content"])
 
-user_input = st.chat_input("请输入你的问题")
+user_input = st.chat_input("可以直接让我帮你记账，例如：今天喝奶茶花了15元")
 if user_input:
     st.chat_message("user").write(user_input)
     st.session_state.chat_history.append({"role": "user", "content": user_input})
-
-    # 获取API Key
-    try:
-        api_key = st.secrets["DEEPSEEK_API_KEY"]
-    except Exception:
-        api_key = os.environ.get("DEEPSEEK_API_KEY")
-
+    api_key = get_deepseek_api_key()
     if not api_key:
         st.error("请先设置 DEEPSEEK_API_KEY 环境变量")
     else:
-        # 拼接财务背景信息
-        recent_text = recent_3.to_string(index=False)
-        background_info = f"""【实时财务数据】
-总收入：{total_income:.2f}元
-总支出：{total_expense:.2f}元
-当前结余：{balance:.2f}元
-每月生活费设定：{st.session_state.monthly_living:.2f}元
-存钱目标：{st.session_state.save_target:.2f}元
-所在城市等级：{st.session_state.city_level}
-最近3笔账单：
-{recent_text}
-"""
-        system_prompt = f"""你是「明白账」的 AI 财务管家，专为大学生服务，语气亲切、不爹味。
-你需要结合下面的实时财务数据回答用户问题：
-{background_info}
-回答要求：必须结合这些实时数据回答。如果用户超支了，提醒他并给出奶茶、外卖等校园场景的省钱建议。
-"""
-        messages = [{"role": "system", "content": system_prompt}] + st.session_state.chat_history
-        payload = {
-            "model": "deepseek-chat",
-            "messages": messages,
-            "temperature": 0.7
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
         try:
-            resp = requests.post("https://api.deepseek.com/chat/completions", headers=headers, json=payload, timeout=20)
+            from ai_agent import get_ai_response
+            resp = get_ai_response(
+                st.session_state.chat_history,
+                df,
+                total_income,
+                total_expense,
+                balance,
+                st.session_state.monthly_living,
+                st.session_state.save_target,
+                st.session_state.city_level,
+                api_key
+            )
             if resp.status_code != 200:
                 st.error(f"API请求失败，状态码：{resp.status_code}，返回信息：{resp.text}")
             else:
                 res_data = resp.json()
-                ai_answer = res_data["choices"][0]["message"]["content"]
+                msg = res_data["choices"][0]["message"]
+                if "tool_calls" in msg and msg["tool_calls"]:
+                    tool_call = msg["tool_calls"][0]
+                    func_name = tool_call["function"]["name"]
+                    func_args = json.loads(tool_call["function"]["arguments"])
+                    tool_result = ""
+                    if func_name == "add_bill":
+                        bill_date = func_args.get("date", datetime.now().strftime("%Y-%m-%d"))
+                        merchant = func_args["merchant"]
+                        amount = float(func_args["amount"])
+                        bill_type = func_args["type"]
+                        add_bill(st.session_state.user_id, bill_date, merchant, amount, "未知", bill_type)
+                        tool_result = f"已成功添加账单：日期{bill_date}，商户{merchant}，金额{amount}，类型{bill_type}"
+                        st.cache_data.clear()
+                    elif func_name == "get_summary":
+                        tool_result = f"用户财务汇总：总收入{total_income:.2f}，总支出{total_expense:.2f}，结余{balance:.2f}"
+                    st.session_state.chat_history.append(msg)
+                    st.session_state.chat_history.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": tool_result
+                    })
+                    resp2 = get_ai_response(
+                        st.session_state.chat_history,
+                        get_all_bills(st.session_state.user_id),
+                        total_income,
+                        total_expense,
+                        balance,
+                        st.session_state.monthly_living,
+                        st.session_state.save_target,
+                        st.session_state.city_level,
+                        api_key
+                    )
+                    res2 = resp2.json()
+                    ai_answer = res2["choices"][0]["message"]["content"]
+                else:
+                    ai_answer = msg["content"]
                 st.chat_message("assistant").write(ai_answer)
                 st.session_state.chat_history.append({"role": "assistant", "content": ai_answer})
         except requests.exceptions.Timeout:
@@ -213,11 +225,9 @@ if user_input:
         except Exception as err:
             st.error(f"发生错误：{str(err)}")
 
-# -------------------------- 导出功能模块 --------------------------
+# Export
 st.subheader("数据导出")
 export_col1, export_col2 = st.columns(2)
-
-# 导出CSV账单明细
 csv_data = df.to_csv(index=False, encoding="utf-8-sig")
 with export_col1:
     st.download_button(
@@ -226,8 +236,6 @@ with export_col1:
         file_name="明白账_账单明细.csv",
         mime="text/csv"
     )
-
-# 生成TXT诊断报告
 over_status = "已超支" if total_expense > st.session_state.monthly_living else "未超支"
 suggestion = "平时可以减少奶茶和外卖的消费，优先选择食堂就餐，轻松省下不少生活费。"
 report_text = f"""明白账 - 财务诊断报告
