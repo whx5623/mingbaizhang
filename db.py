@@ -115,6 +115,19 @@ def get_all_bills(user_id):
     return df
 
 
+def get_bills_paginated(user_id, limit=10, offset=0):
+    with engine.connect() as conn:
+        df = pd.read_sql(text("SELECT * FROM bills WHERE user_id = :uid LIMIT :limit OFFSET :offset"),
+                         conn, params={"uid": user_id, "limit": limit, "offset": offset})
+    return df
+
+
+def get_total_bill_count(user_id):
+    with engine.connect() as conn:
+        cnt = conn.execute(text("SELECT COUNT(*) FROM bills WHERE user_id = :uid"), {"uid": user_id}).scalar()
+    return cnt
+
+
 def add_bill(user_id, date, merchant, amount, payment_method, bill_type):
     with engine.connect() as conn:
         stmt = text("""

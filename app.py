@@ -2,9 +2,9 @@
 import streamlit as st
 import pandas as pd
 from streamlit_echarts import st_echarts
-from datetime import datetime
+from datetime import datetime, date
 from config import get_deepseek_api_key
-from db import init_db, get_all_bills, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, check_user_exists, add_feedback
+from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, check_user_exists, add_feedback
 import requests
 import json
 
@@ -13,6 +13,14 @@ init_db()
 
 if "user_id" not in st.session_state:
     st.session_state.user_id = None
+if "page" not in st.session_state:
+    st.session_state.page = 0
+if "ai_call_timestamps" not in st.session_state:
+    st.session_state.ai_call_timestamps = []
+if "ai_daily_count" not in st.session_state:
+    st.session_state.ai_daily_count = 0
+if "ai_last_count_date" not in st.session_state:
+    st.session_state.ai_last_count_date = None
 
 def logout():
     st.session_state.user_id = None
@@ -55,7 +63,7 @@ if st.session_state.user_id is None:
     st.stop()
 
 @st.cache_data
-def load_data(user_id):
+def load_all_data(user_id):
     return get_all_bills(user_id)
 
 # Sidebar
@@ -75,6 +83,15 @@ with st.sidebar:
     st.session_state.save_target = st.number_input("每月存钱目标（元）", min_value=0.0, value=st.session_state.save_target, step=50.0)
     st.session_state.city_level = st.selectbox("所在城市", ["一线", "二线", "三线"], index=["一线", "二线", "三线"].index(st.session_state.city_level))
     st.divider()
+
+    today = date.today()
+    if st.session_state.ai_last_count_date != today:
+        st.session_state.ai_daily_count = 0
+        st.session_state.ai_last_count_date = today
+    remaining = 20 - st.session_state.ai_daily_count
+    st.info(f"今日剩余提问次数：{remaining}")
+
+    st.divider()
     if st.button("一键加载演示数据（答辩专用）"):
         if st.session_state.get("user_id") and check_user_exists(st.session_state.user_id):
             ok = insert_demo_bills(st.session_state.user_id)
@@ -90,8 +107,8 @@ with st.sidebar:
         logout()
         st.rerun()
 
-# Load data
-df = load_data(st.session_state.user_id)
+# Load full data for metrics and charts
+df = load_all_data(st.session_state.user_id)
 total_income = df[df["type"] == "收入"]["amount"].sum()
 total_expense = df[df["type"] == "支出"]["amount"].sum()
 balance = total_income - total_expense
@@ -129,6 +146,7 @@ if uploaded_file is not None:
         else:
             import_csv_to_bills(st.session_state.user_id, df_upload)
             st.cache_data.clear()
+            st.session_state.page = 0
             st.success("账单上传成功！页面即将刷新")
             st.rerun()
     except Exception as e:
@@ -146,9 +164,29 @@ with col2:
     with col_b:
         st.metric("当前结余", f"{balance:.2f}")
 
-# Bill table
+# Bill table with pagination
 st.subheader("账单明细")
-st.dataframe(df, use_container_width=True)
+total_count = get_total_bill_count(st.session_state.user_id)
+page_size = st.selectbox("每页条数", options=[10,20,50])
+offset = st.session_state.page * page_size
+paginated_df = get_bills_paginated(st.session_state.user_id, limit=page_size, offset=offset)
+
+st.dataframe(paginated_df, use_container_width=True)
+
+btn_left, btn_mid, btn_right = st.columns(3)
+with btn_left:
+    if st.button("上一页"):
+        if st.session_state.page > 0:
+            st.session_state.page -= 1
+            st.rerun()
+with btn_mid:
+    st.write(f"第 {st.session_state.page + 1} 页，共 {total_count} 条记录")
+with btn_right:
+    max_page = (total_count -1) // page_size
+    if st.button("下一页"):
+        if st.session_state.page < max_page:
+            st.session_state.page +=1
+            st.rerun()
 
 # ECharts 双图表
 st.subheader("支出可视化图表")
@@ -206,72 +244,76 @@ user_input = st.chat_input("可以直接让我帮你记账，例如：今天喝�
 if user_input:
     st.chat_message("user").write(user_input)
     st.session_state.chat_history.append({"role": "user", "content": user_input})
+
+    from ai_agent import get_ai_response
     api_key = get_deepseek_api_key()
     if not api_key:
         st.error("请先设置 DEEPSEEK_API_KEY 环境变量")
     else:
-        try:
-            from ai_agent import get_ai_response
-            resp = get_ai_response(
-                st.session_state.chat_history,
-                df,
-                total_income,
-                total_expense,
-                balance,
-                st.session_state.monthly_living,
-                st.session_state.save_target,
-                st.session_state.city_level,
-                api_key
-            )
-            if resp.status_code != 200:
-                st.error(f"API请求失败，状态码：{resp.status_code}，返回信息：{resp.text}")
-            else:
-                res_data = resp.json()
-                msg = res_data["choices"][0]["message"]
-                if "tool_calls" in msg and msg["tool_calls"]:
-                    tool_call = msg["tool_calls"][0]
-                    func_name = tool_call["function"]["name"]
-                    func_args = json.loads(tool_call["function"]["arguments"])
-                    tool_result = ""
-                    if func_name == "add_bill":
-                        bill_date = func_args.get("date", datetime.now().strftime("%Y-%m-%d"))
-                        merchant = func_args["merchant"]
-                        amount = float(func_args["amount"])
-                        bill_type = func_args["type"]
-                        add_bill(st.session_state.user_id, bill_date, merchant, amount, "未知", bill_type)
-                        tool_result = f"已成功添加账单：日期{bill_date}，商户{merchant}，金额{amount}，类型{bill_type}"
-                        st.cache_data.clear()
-                    elif func_name == "get_summary":
-                        tool_result = f"用户财务汇总：总收入{total_income:.2f}，总支出{total_expense:.2f}，结余{balance:.2f}"
-                    st.session_state.chat_history.append(msg)
-                    st.session_state.chat_history.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "content": tool_result
-                    })
-                    resp2 = get_ai_response(
-                        st.session_state.chat_history,
-                        get_all_bills(st.session_state.user_id),
-                        total_income,
-                        total_expense,
-                        balance,
-                        st.session_state.monthly_living,
-                        st.session_state.save_target,
-                        st.session_state.city_level,
-                        api_key
-                    )
-                    res2 = resp2.json()
-                    ai_answer = res2["choices"][0]["message"]["content"]
+        current_ts = datetime.now().timestamp()
+        st.session_state.ai_call_timestamps.append(current_ts)
+        st.session_state.ai_call_timestamps = [t for t in st.session_state.ai_call_timestamps if current_ts - t <= 10]
+
+        if len(st.session_state.ai_call_timestamps) > 3:
+            warn_msg = "提问太快了，请休息 10 秒后再试"
+            st.chat_message("assistant").write(warn_msg)
+            st.session_state.chat_history.append({"role": "assistant", "content": warn_msg})
+        elif st.session_state.ai_daily_count >=20:
+            limit_msg = "今日免费额度已用完，请明天再来"
+            st.chat_message("assistant").write(limit_msg)
+            st.session_state.chat_history.append({"role": "assistant", "content": limit_msg})
+        else:
+            st.session_state.ai_daily_count += 1
+            remaining = 20 - st.session_state.ai_daily_count
+            with st.sidebar:
+                st.info(f"今日剩余提问次数：{remaining}")
+            try:
+                resp = get_ai_response(
+                    st.session_state.chat_history,
+                    api_key
+                )
+                if resp.status_code != 200:
+                    st.error(f"API请求失败，状态码：{resp.status_code}，返回信息：{resp.text}")
                 else:
-                    ai_answer = msg["content"]
-                st.chat_message("assistant").write(ai_answer)
-                st.session_state.chat_history.append({"role": "assistant", "content": ai_answer})
-        except requests.exceptions.Timeout:
-            st.error("请求超时，请稍后重试")
-        except requests.exceptions.ConnectionError:
-            st.error("网络连接失败，请检查网络")
-        except Exception as err:
-            st.error(f"发生错误：{str(err)}")
+                    res_data = resp.json()
+                    msg = res_data["choices"][0]["message"]
+                    if "tool_calls" in msg and msg["tool_calls"]:
+                        tool_call = msg["tool_calls"][0]
+                        func_name = tool_call["function"]["name"]
+                        func_args = json.loads(tool_call["function"]["arguments"])
+                        tool_result = ""
+                        if func_name == "add_bill":
+                            bill_date = func_args.get("date", datetime.now().strftime("%Y-%m-%d"))
+                            merchant = func_args["merchant"]
+                            amount = float(func_args["amount"])
+                            bill_type = func_args["type"]
+                            add_bill(st.session_state.user_id, bill_date, merchant, amount, "未知", bill_type)
+                            tool_result = f"已成功添加账单：日期{bill_date}，商户{merchant}，金额{amount}，类型{bill_type}"
+                            st.cache_data.clear()
+                        elif func_name == "get_summary":
+                            tool_result = f"用户财务汇总：总收入{total_income:.2f}，总支出{total_expense:.2f}，结余{balance:.2f}"
+                        st.session_state.chat_history.append(msg)
+                        st.session_state.chat_history.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "content": tool_result
+                        })
+                        resp2 = get_ai_response(
+                            st.session_state.chat_history,
+                            api_key
+                        )
+                        res2 = resp2.json()
+                        ai_answer = res2["choices"][0]["message"]["content"]
+                    else:
+                        ai_answer = msg["content"]
+                    st.chat_message("assistant").write(ai_answer)
+                    st.session_state.chat_history.append({"role": "assistant", "content": ai_answer})
+            except requests.exceptions.Timeout:
+                st.error("请求超时，请稍后重试")
+            except requests.exceptions.ConnectionError:
+                st.error("网络连接失败，请检查网络")
+            except Exception as err:
+                st.error(f"发生错误：{str(err)}")
 
 # Export
 st.subheader("数据导出")
