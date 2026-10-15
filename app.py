@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 import pandas as pd
 from streamlit_echarts import st_echarts
@@ -7,10 +6,35 @@ from config import get_deepseek_api_key
 from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, check_user_exists, add_feedback
 import requests
 import json
+import os
+import tomllib
 
 st.set_page_config(layout="wide")
+
+def get_secret(key: str):
+    try:
+        val = st.secrets.get(key)
+        if val is not None:
+            return val
+    except Exception:
+        pass
+    try:
+        secret_path = ".streamlit/secrets.toml"
+        if os.path.exists(secret_path):
+            with open(secret_path, "rb") as f:
+                secrets_data = tomllib.load(f)
+                val = secrets_data.get(key)
+                if val is not None:
+                    return val
+    except Exception:
+        pass
+    return os.environ.get(key)
+
+ZHIPU_API_KEY = get_secret("ZHIPU_API_KEY")
+
 init_db()
 
+# 初始化session状态
 if "user_id" not in st.session_state:
     st.session_state.user_id = None
 if "page" not in st.session_state:
@@ -21,17 +45,14 @@ if "ai_daily_count" not in st.session_state:
     st.session_state.ai_daily_count = 0
 if "ai_last_count_date" not in st.session_state:
     st.session_state.ai_last_count_date = None
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
 def logout():
     st.session_state.user_id = None
     st.cache_data.clear()
 
-if st.session_state.user_id is not None:
-    if not check_user_exists(st.session_state.user_id):
-        st.warning("当前用户不存在，请重新登录")
-        logout()
-        st.rerun()
-
+# ========== 未登录分支 ==========
 if st.session_state.user_id is None:
     st.title("明白账 - 登录 / 注册")
     username = st.text_input("用户名")
@@ -62,6 +83,13 @@ if st.session_state.user_id is None:
                     st.error(f"注册失败：{str(e)}")
     st.stop()
 
+# 校验用户有效性
+if not check_user_exists(st.session_state.user_id):
+    st.warning("当前用户不存在，请重新登录")
+    logout()
+    st.rerun()
+
+# ========== 已登录分支，全部业务代码放这里 ==========
 @st.cache_data
 def load_all_data(user_id):
     return get_all_bills(user_id)
@@ -233,8 +261,7 @@ with chart_col2:
 
 # AI Chat
 st.subheader("AI 金融导师")
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+if len(st.session_state.chat_history) == 0:
     st.session_state.chat_history.append({"role": "assistant", "content": "你好！我是明白账AI财务管家，可以帮你分析账单，也可以直接帮你记账，有什么想问我的吗？"})
 
 for msg in st.session_state.chat_history:
@@ -268,9 +295,16 @@ if user_input:
             with st.sidebar:
                 st.info(f"今日剩余提问次数：{remaining}")
             try:
+                recent_5_bills = df.sort_values("date_parsed", ascending=False).head(5)
+                recent_bills_text = recent_5_bills.to_string(index=False)
                 resp = get_ai_response(
-                    st.session_state.chat_history,
-                    api_key
+                    messages=st.session_state.chat_history,
+                    api_key=api_key,
+                    zhipu_api_key=ZHIPU_API_KEY,
+                    total_income=total_income,
+                    total_expense=total_expense,
+                    balance=balance,
+                    recent_bills_text=recent_bills_text
                 )
                 if resp.status_code != 200:
                     st.error(f"API请求失败，状态码：{resp.status_code}，返回信息：{resp.text}")
@@ -286,8 +320,9 @@ if user_input:
                             bill_date = func_args.get("date", datetime.now().strftime("%Y-%m-%d"))
                             merchant = func_args["merchant"]
                             amount = float(func_args["amount"])
+                            payment_method = func_args.get("payment_method","未知")
                             bill_type = func_args["type"]
-                            add_bill(st.session_state.user_id, bill_date, merchant, amount, "未知", bill_type)
+                            add_bill(st.session_state.user_id, bill_date, merchant, amount, payment_method, bill_type)
                             tool_result = f"已成功添加账单：日期{bill_date}，商户{merchant}，金额{amount}，类型{bill_type}"
                             st.cache_data.clear()
                         elif func_name == "get_summary":
@@ -299,8 +334,13 @@ if user_input:
                             "content": tool_result
                         })
                         resp2 = get_ai_response(
-                            st.session_state.chat_history,
-                            api_key
+                            messages=st.session_state.chat_history,
+                            api_key=api_key,
+                            zhipu_api_key=ZHIPU_API_KEY,
+                            total_income=total_income,
+                            total_expense=total_expense,
+                            balance=balance,
+                            recent_bills_text=recent_bills_text
                         )
                         res2 = resp2.json()
                         ai_answer = res2["choices"][0]["message"]["content"]
