@@ -1,11 +1,32 @@
 # seed_knowledge.py
 import os
+import tomllib
 import requests
 from supabase import create_client, Client
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-ZHIPU_API_KEY = os.environ.get("ZHIPU_API_KEY")
+def get_secret(key: str):
+    try:
+        import streamlit as st
+        val = st.secrets.get(key)
+        if val is not None:
+            return val
+    except Exception:
+        pass
+    try:
+        secret_path = ".streamlit/secrets.toml"
+        if os.path.exists(secret_path):
+            with open(secret_path, "rb") as f:
+                secrets_data = tomllib.load(f)
+                val = secrets_data.get(key)
+                if val is not None:
+                    return val
+    except Exception:
+        pass
+    return os.environ.get(key)
+
+SUPABASE_URL = get_secret("SUPABASE_URL")
+SUPABASE_KEY = get_secret("SUPABASE_KEY")
+ZHIPU_API_KEY = get_secret("ZHIPU_API_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 EMBED_URL = "https://open.bigmodel.cn/api/paas/v4/embeddings"
