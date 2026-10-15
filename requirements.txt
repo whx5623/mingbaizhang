@@ -6,3 +6,4 @@ plotly
 psycopg2-binary
 sqlalchemy
 bcrypt
+streamlit-echarts

@@ -1,3 +1,4 @@
+# db.py
 import sqlite3
 import bcrypt
 import pandas as pd
@@ -46,7 +47,25 @@ def init_db():
             );
         """))
 
-
+        # 3. 创建 feedbacks 反馈表
+        if is_sqlite():
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS feedbacks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    content TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """))
+        else:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS feedbacks (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER,
+                    content TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """))
         conn.commit()
 
 
@@ -159,4 +178,11 @@ def import_csv_to_bills(user_id, df_upload):
     df_upload["user_id"] = user_id
     with engine.connect() as conn:
         df_upload.to_sql("bills", conn, if_exists="append", index=False)
+        conn.commit()
+
+
+def add_feedback(user_id, content):
+    with engine.connect() as conn:
+        stmt = text("INSERT INTO feedbacks(user_id, content) VALUES (:uid, :cnt)")
+        conn.execute(stmt, {"uid": user_id, "cnt": content})
         conn.commit()

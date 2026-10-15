@@ -1,10 +1,10 @@
 # app.py
 import streamlit as st
 import pandas as pd
-import plotly.express as px
+from streamlit_echarts import st_echarts
 from datetime import datetime
 from config import get_deepseek_api_key
-from db import init_db, get_all_bills, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, check_user_exists
+from db import init_db, get_all_bills, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, check_user_exists, add_feedback
 import requests
 import json
 
@@ -61,6 +61,8 @@ def load_data(user_id):
 # Sidebar
 with st.sidebar:
     st.header("个人设定")
+    if "monthly_budget" not in st.session_state:
+        st.session_state.monthly_budget = 1500.0
     if "monthly_living" not in st.session_state:
         st.session_state.monthly_living = 1500.0
     if "save_target" not in st.session_state:
@@ -68,6 +70,7 @@ with st.sidebar:
     if "city_level" not in st.session_state:
         st.session_state.city_level = "二线"
 
+    st.session_state.monthly_budget = st.number_input("每月预算", min_value=0.0, value=st.session_state.monthly_budget, step=50.0)
     st.session_state.monthly_living = st.number_input("每月生活费（元）", min_value=0.0, value=st.session_state.monthly_living, step=50.0)
     st.session_state.save_target = st.number_input("每月存钱目标（元）", min_value=0.0, value=st.session_state.save_target, step=50.0)
     st.session_state.city_level = st.selectbox("所在城市", ["一线", "二线", "三线"], index=["一线", "二线", "三线"].index(st.session_state.city_level))
@@ -92,6 +95,23 @@ df = load_data(st.session_state.user_id)
 total_income = df[df["type"] == "收入"]["amount"].sum()
 total_expense = df[df["type"] == "支出"]["amount"].sum()
 balance = total_income - total_expense
+
+# 计算本月支出
+now = datetime.now()
+current_month_str = now.strftime("%Y-%m")
+df["date_parsed"] = pd.to_datetime(df["date"], errors="coerce")
+df_current_month = df[df["date_parsed"].dt.strftime("%Y-%m") == current_month_str]
+month_expense = df_current_month[df_current_month["type"] == "支出"]["amount"].sum()
+budget = st.session_state.monthly_budget
+percent = (month_expense / budget) * 100 if budget > 0 else 0
+
+# 预算预警提示
+if budget > 0:
+    if month_expense > budget:
+        over_amt = month_expense - budget
+        st.error(f"🚨 严重超支！本月已超预算 {over_amt:.2f} 元！")
+    elif month_expense > budget * 0.8:
+        st.warning(f"⚠️ 注意：本月支出已达预算的 {percent:.1f}%！")
 
 # Page Title
 st.title("明白账 - 财务健康看板")
@@ -130,20 +150,48 @@ with col2:
 st.subheader("账单明细")
 st.dataframe(df, use_container_width=True)
 
-# Plotly chart
-st.subheader("各商户支出金额")
-exp_df = df[df["type"] == "支出"]
-bar_data = exp_df.groupby("merchant")["amount"].sum().reset_index()
-fig_bar = px.bar(
-    bar_data,
-    x="merchant",
-    y="amount",
-    title="各商户支出统计",
-    labels={"merchant": "商户", "amount": "金额(元)"},
-    color_discrete_sequence=["#638bd6", "#62c490"]
-)
-fig_bar.update_traces(hovertemplate="商户：%{x}<br>金额：%{y:.2f}元")
-st.plotly_chart(fig_bar, use_container_width=True)
+# ECharts 双图表
+st.subheader("支出可视化图表")
+chart_col1, chart_col2 = st.columns(2)
+exp_df = df[df["type"] == "支出"].copy()
+
+# 饼图：各商户支出占比
+pie_data = exp_df.groupby("merchant")["amount"].sum().reset_index()
+pie_list = []
+for _, row in pie_data.iterrows():
+    pie_list.append({"name": row["merchant"], "value": round(row["amount"],2)})
+pie_option = {
+    "title": {"text": "各商户支出占比", "left": "center"},
+    "tooltip": {"trigger": "item", "formatter": "{b}<br/>金额：{c} 元"},
+    "series": [{
+        "type": "pie",
+        "radius": ["40%", "70%"],
+        "data": pie_list
+    }],
+    "color": ["#b8e1ff", "#b2e9cc", "#96ccf0", "#a9e6d0", "#c8e8ff"]
+}
+with chart_col1:
+    st_echarts(pie_option, height="400px")
+
+# 折线图：每日消费趋势
+daily_exp = exp_df.groupby("date")["amount"].sum().reset_index()
+x_data = daily_exp["date"].tolist()
+y_data = daily_exp["amount"].round(2).tolist()
+line_option = {
+    "title": {"text": "每日消费趋势", "left": "center"},
+    "tooltip": {"trigger": "axis", "formatter": "日期：{b}<br/>消费金额：{c} 元"},
+    "xAxis": {"type": "category", "data": x_data, "axisLabel": {"rotate":30}},
+    "yAxis": {"type": "value", "name": "金额(元)"},
+    "series": [{
+        "type": "line",
+        "data": y_data,
+        "itemStyle": {"color":"#638bd6"},
+        "areaStyle": {"color":"rgba(178, 233, 204,0.3)"}
+    }],
+    "color":["#62c490"]
+}
+with chart_col2:
+    st_echarts(line_option, height="400px")
 
 # AI Chat
 st.subheader("AI 金融导师")
@@ -254,3 +302,13 @@ with export_col2:
         file_name="明白账_诊断报告.txt",
         mime="text/plain"
     )
+
+# 用户反馈模块
+with st.expander("💬 给我们提建议"):
+    feedback_content = st.text_area("请输入你的反馈内容：", height=120)
+    if st.button("提交"):
+        if feedback_content.strip():
+            add_feedback(st.session_state.user_id, feedback_content.strip())
+            st.success("感谢您的反馈！")
+        else:
+            st.warning("反馈内容不能为空！")
