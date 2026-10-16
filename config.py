@@ -1,20 +1,29 @@
-# config.py
-import streamlit as st
 import os
+import tomllib
 
-# DeepSeek API Key
+def get_secret(key):
+    try:
+        import streamlit as st
+        val = st.secrets.get(key)
+        if val is not None:
+            return val
+    except Exception:
+        pass
+
+    try:
+        secret_path = ".streamlit/secrets.toml"
+        if os.path.exists(secret_path):
+            with open(secret_path, "rb") as f:
+                secrets_data = tomllib.load(f)
+                val = secrets_data.get(key)
+                if val is not None:
+                    return val
+    except Exception:
+        pass
+
+    return os.environ.get(key)
+
+DEEPSEEK_API_KEY = get_secret("DEEPSEEK_API_KEY")
+DATABASE_URL = get_secret("DATABASE_URL")
 def get_deepseek_api_key():
-    try:
-        api_key = st.secrets["DEEPSEEK_API_KEY"]
-    except Exception:
-        api_key = os.environ.get("DEEPSEEK_API_KEY")
-    return api_key
-
-# Database URL, priority: st.secrets then env
-def get_database_url():
-    try:
-        db_url = st.secrets["DATABASE_URL"]
-    except Exception:
-        db_url = os.environ.get("DATABASE_URL", "sqlite:///finance.db")
-    return db_url
-
+    return get_secret("DEEPSEEK_API_KEY")

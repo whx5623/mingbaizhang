@@ -1,9 +1,9 @@
 import streamlit as st
 import pandas as pd
 from streamlit_echarts import st_echarts
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from config import get_deepseek_api_key
-from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, check_user_exists, add_feedback, add_user_credits
+from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, check_user_exists, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data
 import requests
 import json
 import os
@@ -21,6 +21,7 @@ if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('static/sw.js');
   });
 }
+</script>
 </script>
 '''
 st.markdown(pwa_html, unsafe_allow_html=True)
@@ -62,9 +63,12 @@ if "ai_last_count_date" not in st.session_state:
     st.session_state.ai_last_count_date = None
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+if "is_admin" not in st.session_state:
+    st.session_state.is_admin = False
 
 def logout():
     st.session_state.user_id = None
+    st.session_state.is_admin = False
     st.cache_data.clear()
 
 # ========== 未登录分支 ==========
@@ -104,7 +108,63 @@ if not check_user_exists(st.session_state.user_id):
     logout()
     st.rerun()
 
-# ========== 已登录分支，全部业务代码放这里 ==========
+# ========== 管理员面板 ==========
+if st.session_state.is_admin:
+    st.header("管理员面板")
+    st.subheader("运营数据")
+    reg_7df, active_7df, sponsor_user_count = get_admin_operate_data()
+    col_m1, col_m2, col_m3 = st.columns(3)
+    with col_m1:
+        st.metric("7天新增注册用户", reg_7df["count"].sum())
+    with col_m2:
+        st.metric("7天活跃用户数", active_7df["count"].sum())
+    with col_m3:
+        st.metric("模拟赞助用户总数", sponsor_user_count)
+
+    st.subheader("过去7天每日注册用户")
+    reg_option = {
+        "xAxis": {"type": "category", "data": reg_7df["date"].tolist()},
+        "yAxis": {"type": "value"},
+        "series": [{"type": "line", "data": reg_7df["count"].tolist()}],
+        "tooltip": {"trigger": "axis"}
+    }
+    st_echarts(reg_option, height=300)
+
+    st.subheader("过去7天每日活跃用户")
+    active_option = {
+        "xAxis": {"type": "category", "data": active_7df["date"].tolist()},
+        "yAxis": {"type": "value"},
+        "series": [{"type": "line", "data": active_7df["count"].tolist()}],
+        "tooltip": {"trigger": "axis"}
+    }
+    st_echarts(active_option, height=300)
+    st.divider()
+
+    st.subheader("用户漏斗分析")
+    total_reg, bill_user_count, login_7d_user, ai_user_count = get_admin_funnel_data()
+    activate_rate = bill_user_count / total_reg * 100 if total_reg > 0 else 0
+    retain_rate = login_7d_user / total_reg * 100 if total_reg > 0 else 0
+    ai_usage_rate = ai_user_count / total_reg * 100 if total_reg > 0 else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("总注册用户数", total_reg)
+    with c2:
+        st.metric("填写账单用户", bill_user_count, f"{activate_rate:.1f}% 激活率")
+    with c3:
+        st.metric("7天登录用户", login_7d_user, f"{retain_rate:.1f}% 留存率")
+    with c4:
+        st.metric("使用AI聊天用户", ai_user_count, f"{ai_usage_rate:.1f}% AI使用率")
+
+    if activate_rate < 30:
+        st.warning("⚠️ 激活率过低，请优化新手引导")
+    if retain_rate < 30:
+        st.warning("⚠️ 7天留存率过低，请优化用户留存策略")
+    if ai_usage_rate < 30:
+        st.warning("⚠️ AI功能使用率偏低，可以增加AI记账引导提示")
+    st.divider()
+
+# ========== 已登录普通用户业务代码 ==========
 @st.cache_data
 def load_all_data(user_id):
     return get_all_bills(user_id)
