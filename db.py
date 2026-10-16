@@ -204,3 +204,4 @@ def add_user_credits(user_id, delta):
         stmt = text("UPDATE users SET credits = credits + :delta WHERE id = :uid")
         conn.execute(stmt, {"delta": delta, "uid": user_id})
         conn.commit()
+
