@@ -1,3 +1,4 @@
+# app.py（仅追加注入PWA的markdown代码，其余原有代码保持不变，放在st.set_page_config之后）
 import streamlit as st
 import pandas as pd
 from streamlit_echarts import st_echarts
@@ -10,6 +11,21 @@ import os
 import tomllib
 
 st.set_page_config(layout="wide")
+
+# ========= PWA注入代码 =========
+pwa_html = '''
+<link rel="manifest" href="static/manifest.json">
+<meta name="theme-color" content="#4191e1">
+<script>
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function() {
+    navigator.serviceWorker.register('static/sw.js');
+  });
+}
+</script>
+'''
+st.markdown(pwa_html, unsafe_allow_html=True)
+# ==============================
 
 def get_secret(key: str):
     try:
