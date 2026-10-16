@@ -1,10 +1,9 @@
-# app.py（仅追加注入PWA的markdown代码，其余原有代码保持不变，放在st.set_page_config之后）
 import streamlit as st
 import pandas as pd
 from streamlit_echarts import st_echarts
 from datetime import datetime, date
 from config import get_deepseek_api_key
-from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, check_user_exists, add_feedback
+from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, check_user_exists, add_feedback, add_user_credits
 import requests
 import json
 import os
@@ -150,6 +149,14 @@ with st.sidebar:
     if st.button("退出登录"):
         logout()
         st.rerun()
+
+    st.divider()
+    with st.expander("☕ 赞助我们"):
+        st.write("感谢你支持明白账！学生免费，如果你愿意请我们喝杯奶茶，可以扫码赞助。")
+        st.image("static/qrcode.png")
+        if st.button("模拟赞助"):
+            add_user_credits(st.session_state.user_id, 10)
+            st.success("赞助模拟成功！已为你增加10积分")
 
 # Load full data for metrics and charts
 df = load_all_data(st.session_state.user_id)

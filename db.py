@@ -199,3 +199,8 @@ def add_feedback(user_id, content):
         stmt = text("INSERT INTO feedbacks(user_id, content) VALUES (:uid, :cnt)")
         conn.execute(stmt, {"uid": user_id, "cnt": content})
         conn.commit()
+def add_user_credits(user_id, delta):
+    with engine.connect() as conn:
+        stmt = text("UPDATE users SET credits = credits + :delta WHERE id = :uid")
+        conn.execute(stmt, {"delta": delta, "uid": user_id})
+        conn.commit()
