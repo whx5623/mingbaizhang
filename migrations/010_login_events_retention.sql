@@ -10,13 +10,12 @@
 --        没装则只打 NOTICE，不影响函数本身。
 --
 --   为什么需要它：登录事件是持续增长的流水表，不清理会一直涨。
---   默认保留 180 天：既能支撑半年趋势，又不至于无限膨胀（按每次登录 1 行、每天几百行估算，
---   半年也就几万行量级；真实流量请按需调小）。
+--   默认保留 180 天：既能支撑半年趋势，又不至于无限膨胀。
 --
 --   ⚠ 安全：这是**删数据的函数**，且 login_events 在 public schema（PostgREST 会暴露函数）。
---     脚本会 `REVOKE ALL ... FROM PUBLIC` 并对 anon/authenticated（若存在）单独 REVOKE，
+--     脚本会 REVOKE ALL ... FROM PUBLIC，并对 anon/authenticated（若存在）单独 REVOKE，
 --     只留高权限角色（服务端连接串用的 postgres / cron 的执行者）能调用。
---     不要为了"方便"给 anon 授 EXECUTE，那等于把删表入口开到公网。
+--     不要为了「方便」给 anon 授 EXECUTE，那等于把删数据入口开到公网。
 --
 --   ⚠ 清理是**不可逆**的：函数只删 occurred_at 早于阈值的行；先确认保留期符合审计要求。
 --
@@ -29,7 +28,7 @@
 --   · 本机 / 自建：psql "$DATABASE_URL" -f migrations/010_login_events_retention.sql
 --   ⚠ 必须**整段一次执行**（BEGIN … COMMIT 是一个事务）。
 --   ⚠ 顺序：001 → … → 009 → 010（本文件）；依赖 009 的 login_events 表。
---   ⚠ 迁移请用 SQL Editor 或 5432 直连，**不要**用 pooler 6543 跑（会话/事务状态问题）。
+--   ⚠ 迁移请用 SQL Editor 或 5432 直连，**不要**用 pooler 6543 跑。
 --
 --   ✅ 没执行时不会红屏：应用不依赖本函数；只是事件表没有自动清理。
 --
@@ -71,7 +70,7 @@ END $do$;
 -- 步骤 1：清理函数
 --   · 分批删除（默认 1 万行/批，最多 100 批）：避免一次大 DELETE 长时间持锁；
 --   · SET search_path 固定为 pg_catalog, public：函数体内全部用限定名，防 search_path 注入；
---   · 参数校验：keep_days < 1 直接抛错（拒绝"手滑传 0 清空全表"）。
+--   · 参数校验：keep_days < 1 直接抛错（拒绝「手滑传 0 清空全表」）。
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.prune_login_events(
     p_keep_days   integer DEFAULT 180,
@@ -172,9 +171,9 @@ END $do$;
 DO $do$
 DECLARE
     v_proc_count integer;
-    v_ret_type  text;
-    v_public_ok boolean;
-    v_cron_job  integer := -1;
+    v_ret_type   text;
+    v_public_ok  boolean;
+    v_cron_job   integer := -1;
 BEGIN
     -- 用 regprocedure 的规范文本比对（pg_get_function_identity_arguments 会带参数名，
     -- 例如 "p_keep_days integer, p_batch integer, ..."，不能直接和类型串比）
@@ -196,7 +195,7 @@ BEGIN
         RAISE EXCEPTION '核对②未通过：返回类型是 %（应为 bigint），事务已回滚', coalesce(v_ret_type, '<空>');
     END IF;
 
-    -- PUBLIC 不再能执行：直接看 ACL（grantee = 0 即 PUBLIC；默认函数 ACL 会给 PUBLIC EXECUTE）
+    -- PUBLIC 不再能执行（grantee = 0 即 PUBLIC；默认函数 ACL 会给 PUBLIC EXECUTE）
     SELECT bool_and(a.grantee <> 0)
       INTO v_public_ok
     FROM pg_proc p
