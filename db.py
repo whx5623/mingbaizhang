@@ -1170,6 +1170,25 @@ def _admin_chart_frame(df):
     return out
 
 
+def _fill_utc_days(df, days=ADMIN_CHART_DAYS):
+    """把图表数据补零到固定的 N 个 UTC 自然日。
+
+    为什么需要：没有样板的日期不会出现在结果里，折线图会少点、点距不均 ——
+    "过去 7 天只有 2 个点"很容易被读成"每天都差不多"。补零后 x 轴恒定 N 个日期，
+    缺数据的日期就是 0（对趋势图而言这是正确语义，不是伪造数据）。
+    """
+    df = _admin_chart_frame(df)
+    today_utc = datetime.now(timezone.utc).date()
+    labels = [(today_utc - timedelta(days=days - 1 - i)).isoformat() for i in range(days)]
+    counts = dict(zip(df["date"].astype(str).tolist(), df["count"].tolist()))
+    return pd.DataFrame(
+        {
+            "date": pd.Series(labels, dtype=object),
+            "count": pd.Series([int(counts.get(d, 0)) for d in labels], dtype="int64"),
+        }
+    )
+
+
 def get_admin_operate_data():
     """后台面板两张折线图 + 赞助用户数，返回 ``(reg_df, active_df, sponsor_count)``。
 
@@ -1299,7 +1318,7 @@ def get_admin_operate_data():
         sponsor_sql = text("SELECT COUNT(DISTINCT id) FROM users WHERE credits > 0")
         sponsor_count = conn.execute(sponsor_sql).scalar() or 0
 
-    return _admin_chart_frame(reg_df), _admin_chart_frame(active_df), int(sponsor_count)
+    return _fill_utc_days(reg_df), _fill_utc_days(active_df), int(sponsor_count)
 
 
 def get_login_daily_stats(days=ADMIN_CHART_DAYS):
@@ -1329,7 +1348,7 @@ def get_login_daily_stats(days=ADMIN_CHART_DAYS):
                     "[db] 登录趋势不可用：migrations/009_login_events.sql 尚未执行"
                     "（login_events 表不存在）。管理面板按空数据显示。"
                 )
-                return _admin_chart_frame(pd.DataFrame())
+                return _fill_utc_days(pd.DataFrame(), days)
             df = pd.read_sql(
                 text("""
                     SELECT (occurred_at AT TIME ZONE 'UTC')::date AS date,
@@ -1351,15 +1370,15 @@ def get_login_daily_stats(days=ADMIN_CHART_DAYS):
                 "（login_events 表不存在）。管理面板按空数据显示。",
                 exc,
             )
-            return _admin_chart_frame(pd.DataFrame())
+            return _fill_utc_days(pd.DataFrame(), days)
         logging.getLogger(__name__).error("[db] 登录趋势查询失败（非缺表）", exc_info=True)
-        return _admin_chart_frame(pd.DataFrame())
+        return _fill_utc_days(pd.DataFrame(), days)
     except (SQLAlchemyError, OSError, ValueError) as exc:
         # pd.read_sql 会把 DBAPI 异常包成 pandas.errors.DatabaseError（不是 SQLAlchemyError），
         # 它在 pandas 里继承自 ValueError，所以这里一并覆盖；用 error 级别，便于和"真的没数据"区分。
         logging.getLogger(__name__).error("[db] 登录趋势查询异常，按空数据处理", exc_info=True)
-        return _admin_chart_frame(pd.DataFrame())
-    return _admin_chart_frame(df)
+        return _fill_utc_days(pd.DataFrame(), days)
+    return _fill_utc_days(df, days)
 
 
 def get_admin_funnel_data():
