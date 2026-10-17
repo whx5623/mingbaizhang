@@ -6,6 +6,7 @@ from config import get_deepseek_api_key
 from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, check_user_exists, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data
 import requests
 import json
+import hashlib
 import os
 import tomllib
 
@@ -69,6 +70,10 @@ if "is_admin" not in st.session_state:
 def logout():
     st.session_state.user_id = None
     st.session_state.is_admin = False
+    st.session_state.pop("last_upload_sig", None)   # 换人登录后不能沿用上一个人的文件签名
+    st.session_state.pop("flash", None)             # 上一个人的提示（可能含商户名）不能带给下一个人
+    st.session_state["page"] = 0
+    st.session_state["chat_history"] = []           # 换人登录不应看到上一个人的 AI 聊天记录
     st.cache_data.clear()
 
 # ========== 未登录分支 ==========
@@ -183,7 +188,7 @@ with st.sidebar:
 
     st.session_state.monthly_budget = st.number_input("每月预算", min_value=0.0, value=st.session_state.monthly_budget, step=50.0)
     st.session_state.monthly_living = st.number_input("每月生活费（元）", min_value=0.0, value=st.session_state.monthly_living, step=50.0)
-    st.session_state.save_target = st.number_input("每月存钱目标（元）", min_value=0.0, value=st.session_state.save_target, step=50.0)
+    st.session_state.save_target = st.number_input("目标存款（元）", min_value=0.0, value=st.session_state.save_target, step=50.0)
     st.session_state.city_level = st.selectbox("所在城市", ["一线", "二线", "三线"], index=["一线", "二线", "三线"].index(st.session_state.city_level))
     st.divider()
 
@@ -241,27 +246,145 @@ if budget > 0:
     elif month_expense > budget * 0.8:
         st.warning(f"⚠️ 注意：本月支出已达预算的 {percent:.1f}%！")
 
+# 计算本月结余（本月收入 - 本月支出），空数据时 sum() 返回 0，不会抛异常
+month_income = df_current_month[df_current_month["type"] == "收入"]["amount"].sum()
+month_balance = month_income - month_expense
+save_target = st.session_state.save_target
+
 # Page Title
 st.title("明白账 - 财务健康看板")
 
+# flash 消息：提交后写入 session_state，跨 rerun 在这里显示一次（success / warning 双态）
+flash = st.session_state.pop("flash", None)
+if flash:
+    if flash.get("level") == "warning":
+        st.warning(flash["msg"])
+    else:
+        st.success(flash["msg"])
+
+# 目标存款达成提示（HTML 中只拼接数字与固定文案，不拼接用户输入字符串）
+if save_target > 0 and month_balance >= save_target:
+    st.success(f"🎉 恭喜！本月结余 {month_balance:.2f} 元，已达成目标存款 {save_target:.2f} 元，继续保持！")
+elif save_target > 0:
+    diff = save_target - month_balance
+    st.markdown(
+        '<div style="background:#f5f5f5;border-left:4px solid #b0b0b0;color:#666;'
+        'border-radius:8px;padding:10px 14px;font-size:14px;">'
+        f"💪 继续努力！本月结余 {month_balance:.2f} 元，距离目标存款 {save_target:.2f} 元还差 {diff:.2f} 元。"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        '<div style="background:#f5f5f5;border-left:4px solid #b0b0b0;color:#666;'
+        'border-radius:8px;padding:10px 14px;font-size:14px;">'
+        "💡 请在侧边栏设置目标存款金额，我会帮你盯着本月结余。"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
 # Upload section
 st.subheader("上传账单")
-uploaded_file = st.file_uploader("上传账单文件", type=['csv'])
+uploaded_file = st.file_uploader("上传账单文件", type=['csv'], key=f"uploader_{st.session_state.user_id}")
 if uploaded_file is not None:
-    try:
-        df_upload = pd.read_csv(uploaded_file, encoding="utf-8-sig")
-        required_cols = ["date", "merchant", "amount", "payment_method", "type"]
-        missing_cols = [col for col in required_cols if col not in df_upload.columns]
-        if missing_cols:
-            st.error(f"文件缺少必要列：{','.join(missing_cols)}")
-        else:
-            import_csv_to_bills(st.session_state.user_id, df_upload)
-            st.cache_data.clear()
-            st.session_state.page = 0
-            st.success("账单上传成功！页面即将刷新")
-            st.rerun()
-    except Exception as e:
-        st.error(f"读取文件失败：{str(e)}")
+    # 文件级去重：st.file_uploader 的值跨 rerun 保留，imported>0 分支里的 st.rerun()
+    # 会让脚本重跑并再次读到同一个文件 → 无限「导入→rerun→再导入」循环。
+    # 签名 = 用户ID + 文件名 + 字节数 + 内容哈希：
+    #   - 带 user_id：换人登录后不沿用上一个人的签名，同名同大小的另一份文件照常导入；
+    #   - 带内容哈希：同名同大小但内容不同的文件不会被误判成「已处理过」而静默不导入。
+    # 签名只在真正写库成功后落位（见 imported > 0 分支），读取/校验/导入失败都不留签名，用户可立即重试。
+    upload_sig = f"{st.session_state.user_id}:{uploaded_file.name}:{uploaded_file.size}:{hashlib.sha256(uploaded_file.getvalue()).hexdigest()[:16]}"
+    if st.session_state.get("last_upload_sig") == upload_sig:
+        st.info(f"文件「{uploaded_file.name}」本次已处理过；如需重新导入同一文件，请修改内容或改名后重新上传。")
+    else:
+        df_upload = None
+        try:
+            df_upload = pd.read_csv(uploaded_file, encoding="utf-8-sig")
+            required_cols = ["date", "merchant", "amount", "payment_method", "type"]
+            missing_cols = [col for col in required_cols if col not in df_upload.columns]
+            if missing_cols:
+                st.error(f"文件缺少必要列：{','.join(missing_cols)}")
+                df_upload = None  # 缺列不进入导入分支，也不写签名
+        except Exception as e:
+            st.error(f"读取文件失败：{str(e)}")
+            df_upload = None
+
+        if df_upload is not None:
+            try:
+                ret = import_csv_to_bills(st.session_state.user_id, df_upload)
+                imported = ret.get("imported", 0)
+                skipped = ret.get("skipped", []) or []
+                total = ret.get("total", len(df_upload))
+
+                # 跳过明细最多展示 5 条，避免刷屏
+                detail = "；".join(f"第{s['row']}行 {s['reason']}" for s in skipped[:5])
+                if len(skipped) > 5:
+                    detail += f"；另有 {len(skipped) - 5} 行未列出"
+
+                if imported == 0:
+                    # 一行都没写成功：数据层完全没动库，页面数据也没变 → 就地警告，不 rerun、不清缓存
+                    # 不写签名：用户可以改文件后用同一个文件名直接重传
+                    msg = f"未导入任何账单（共 {total} 行均无效），原有账单未改动。"
+                    if detail:
+                        msg += f"跳过明细：{detail}"
+                    st.warning(msg)
+                else:
+                    # 真正写库成功之后才记签名：此时库已被替换，再处理一次就会重复导入
+                    st.session_state["last_upload_sig"] = upload_sig
+                    st.cache_data.clear()
+                    st.session_state.page = 0
+                    if skipped:
+                        st.session_state["flash"] = {
+                            "level": "warning",
+                            "msg": f"已导入 {imported} 行，跳过 {len(skipped)} 行（原有账单已被替换）。跳过明细：{detail}",
+                        }
+                    else:
+                        st.session_state["flash"] = {
+                            "level": "success",
+                            "msg": f"成功导入 {imported} 行账单（原有账单已被替换）",
+                        }
+                    st.rerun()
+            except Exception as e:
+                # 导入（写库）失败：不写签名，用户可以立刻重试同一个文件
+                st.error(f"导入失败：{str(e)}")
+
+# 手动记账
+submitted = False  # 先初始化，避免 expander 将来被条件包裹时 submitted 未定义
+with st.expander("手动记一笔", expanded=False):
+    with st.form("manual_add_bill_form", clear_on_submit=True):
+        row1_col1, row1_col2 = st.columns(2)
+        with row1_col1:
+            bill_date = st.date_input("日期", value=date.today())
+        with row1_col2:
+            merchant = st.text_input("商户", placeholder="例如：食堂、蜜雪冰城", max_chars=100)
+        row2_col1, row2_col2 = st.columns(2)
+        with row2_col1:
+            amount = st.number_input("金额（元）", min_value=0.0, step=1.0, format="%.2f")
+        with row2_col2:
+            bill_type = st.selectbox("类型", ["支出", "收入"])
+        submitted = st.form_submit_button("保存这笔")
+
+# 提交逻辑放在 expander 外，避免校验/错误提示被折叠面板收起；
+# 成功提示用 session_state flash 传递，跨 rerun 在页面顶部展示一次
+if submitted:
+    merchant = merchant.strip()
+    if not bill_date:
+        st.warning("请选择日期")
+    elif not merchant:
+        st.warning("请填写商户名称")
+    elif amount <= 0:
+        st.warning("金额必须大于 0")
+    elif bill_date > date.today():
+        st.warning("记账日期不能晚于今天")
+    else:
+        try:
+            add_bill(st.session_state.user_id, bill_date.strftime("%Y-%m-%d"), merchant, float(amount), "手动录入", bill_type)
+            st.session_state["flash"] = {"level": "success", "msg": f"已记录：{bill_date.strftime('%Y-%m-%d')} {merchant} ¥{amount:.2f}（{bill_type}）"}
+            st.cache_data.clear()          # 清缓存，保证下面的指标/图表/提示条立刻更新
+            st.session_state.page = 0      # 回到第一页，新账单按日期倒序通常在最前
+            st.rerun()                     # 刷新页面，成功提示由顶部 flash 显示
+        except Exception as exc:
+            st.error(f"保存失败：{exc}")
 
 # Metric cards
 st.subheader("收支概览")
