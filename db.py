@@ -451,44 +451,6 @@ def _is_duplicate_username_error(exc) -> bool:
     return _USERNAME_UNIQUE_CONSTRAINT in str(getattr(exc, "orig", exc))
 
 
-def create_user(username, password):
-    """新建用户，返回新用户 id。
-
-    **password 必须是明文**：本函数内部调用 hash_password() 做 bcrypt 哈希后入库。
-    如果调用方传进来的已经是 bcrypt 哈希（$2a$/$2b$/$2y$/$2x$ 的 60 字符串），
-    直接 ValueError 拒绝 —— 否则会“对哈希再哈希一次”，用户从此永远登不上，
-    而且原密码不可恢复（库里只留下哈希的哈希）。
-
-    错误契约（与 register_user **完全一致**，两个入口不能有两套口径）：
-    - 密码类型/长度不合规、或传了已哈希的值 → ValueError，向上抛；
-    - 用户名已存在（users_username_key 冲突）→ ValueError(DUPLICATE_USERNAME_MESSAGE)；
-    - 其它 IntegrityError（外键、连接、权限等）→ 原样向上抛。
-      绝不一律吞成 None：那会把真故障伪装成“注册失败”，运维永远查不出原因。
-    """
-    global engine
-    from sqlalchemy.exc import IntegrityError
-    if is_bcrypt_hash(password):
-        raise ValueError("请不要传入已哈希的值，create_user 只接受明文密码")
-    ph = hash_password(password)  # 明文不落库；ValueError/TypeError 直接向上抛
-    with engine.connect() as conn:
-        try:
-            # last_login 用 now()：**注册即视为一次登录**，否则刚注册的用户在后台漏斗的
-            # “7 天登录用户”里会缺一天（注册完只是进了首页、没有第二次登录动作）。
-            # now() 返回 timestamptz（绝对时刻），写进 TIMESTAMPTZ 列不需要任何换算，
-            # 与 verify_user/_touch_last_login 写的是同一个时钟口径。
-            # ⚠ 绝不能换成 Python 的 datetime.now()：那是 naive 值，会被按目标列/会话的
-            #   时区去解释，本机 UTC+8 写出来的值到 UTC 的库里就差 8 小时。
-            stmt = text("INSERT INTO users (username, password_hash, last_login) VALUES (:un, :ph, now()) RETURNING id;")
-            result = conn.execute(stmt, {"un": username, "ph": ph})
-            row = result.fetchone()
-            conn.commit()
-            return row[0] if row else None
-        except IntegrityError as exc:
-            conn.rollback()
-            if _is_duplicate_username_error(exc):
-                raise ValueError(DUPLICATE_USERNAME_MESSAGE) from exc
-            raise
-
 def _touch_last_login(user_id):
     """登录成功后把 users.last_login 写成数据库当前时间（now()）。
 
@@ -621,13 +583,20 @@ _LOGIN_FAILURES_SINCE_SUCCESS_SQL = """
           AND occurred_at >= now() - make_interval(mins => :mins)
     ), last_ok AS (
         SELECT coalesce(max(id), -1) AS last_success_id
-        FROM recent WHERE event = 'success'
+        FROM recent WHERE event = :ev_success
     )
     SELECT count(*) FILTER (
-               WHERE event = 'failure' AND id > (SELECT last_success_id FROM last_ok)
+               WHERE event = :ev_failure AND id > (SELECT last_success_id FROM last_ok)
            ) AS failures_since_success
     FROM recent
 """
+
+
+def _login_event_params(**extra):
+    """事件取值走常量参数，避免 SQL 里出现 'success'/'failure' 字面量与常量各写一遍。"""
+    params = {"ev_success": LOGIN_EVENT_SUCCESS, "ev_failure": LOGIN_EVENT_FAILURE}
+    params.update(extra)
+    return params
 
 
 def record_login_failure(username, user_id) -> bool:
@@ -647,12 +616,12 @@ def record_login_failure(username, user_id) -> bool:
         with engine.begin() as conn:
             conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(:un))"), {"un": un})
             conn.execute(
-                text("INSERT INTO login_events (user_id, username, event) VALUES (:uid, :un, 'failure')"),
-                {"uid": user_id, "un": un},
+                text("INSERT INTO login_events (user_id, username, event) VALUES (:uid, :un, :ev)"),
+                {"uid": user_id, "un": un, "ev": LOGIN_EVENT_FAILURE},
             )
             row = conn.execute(
                 text(_LOGIN_FAILURES_SINCE_SUCCESS_SQL),
-                {"un": un, "mins": LOGIN_WINDOW_MINUTES},
+                _login_event_params(un=un, mins=LOGIN_WINDOW_MINUTES),
             ).fetchone()
         return int(row[0] or 0) >= LOGIN_MAX_FAILURES
     except ProgrammingError as exc:
@@ -683,7 +652,7 @@ def login_is_throttled(username) -> bool:
         with engine.connect() as conn:
             row = conn.execute(
                 text(_LOGIN_FAILURES_SINCE_SUCCESS_SQL),
-                {"un": un, "mins": LOGIN_WINDOW_MINUTES},
+                _login_event_params(un=un, mins=LOGIN_WINDOW_MINUTES),
             ).fetchone()
     except ProgrammingError as exc:
         if _is_undefined_table(exc):
@@ -1366,14 +1335,14 @@ def get_login_daily_stats(days=ADMIN_CHART_DAYS):
                     SELECT (occurred_at AT TIME ZONE 'UTC')::date AS date,
                            COUNT(DISTINCT COALESCE(user_id::text, 'name:' || coalesce(username, ''))) AS count
                     FROM login_events
-                    WHERE event = 'success'
+                    WHERE event = :ev_success
                       AND occurred_at >= :start
                       AND occurred_at < :end
                     GROUP BY 1
                     ORDER BY 1
                 """),
                 conn,
-                params={"start": start_dt, "end": end_dt},
+                params=_login_event_params(start=start_dt, end=end_dt),
             )
     except ProgrammingError as exc:
         if _is_undefined_table(exc):
@@ -1426,7 +1395,7 @@ def get_admin_funnel_data():
 def register_user(username, password):
     """注册用户。password 是**明文**，内部哈希后入库。
 
-    错误契约（app.py 依赖它；与 create_user 保持一致）：
+    错误契约（app.py 依赖它）：
     - 用户名已存在 → ValueError("该用户名已被占用，请换一个或直接登录")。
       **必须是 ValueError + 面向用户的中文文案**：app.py 的注册分支会
       `except ValueError as e: st.error(str(e))` 把文案直接展示给用户；
@@ -1441,7 +1410,7 @@ def register_user(username, password):
     ph = hash_password(password)  # 先校验再连库：不合法的密码连事务都不用开
     with engine.connect() as conn:
         try:
-            # 同 create_user：注册即视为一次登录，last_login = now()（数据库时钟，timestamptz）。
+            # 注册即视为一次登录，last_login = now()（数据库时钟，timestamptz）。
             # 不要改成 datetime.now()：naive 值会按会话时区被解释，应用机 UTC+8 / 库 UTC 直接差 8 小时。
             stmt = text("INSERT INTO users (username, password_hash, last_login) VALUES (:username, :password_hash, now()) RETURNING id;")
             result = conn.execute(stmt, {"username": username, "password_hash": ph})

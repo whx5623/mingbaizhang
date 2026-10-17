@@ -5,7 +5,7 @@ streamlit==1.65.0
 pandas==3.0.6
 requests==2.34.2
 plotly==7.1.0
-# psycopg2-binary：db.py 的 register_user / create_user 靠 exc.orig.diag.constraint_name
+# psycopg2-binary：db.py 的 register_user 靠 exc.orig.diag.constraint_name
 # 区分“用户名重复（users_username_key）”和别的 IntegrityError —— 约束名是唯一
 # 可靠的判据（错误文本会随 PG 版本/语言变化）。这条能力来自 psycopg2 的 diag 接口。
 psycopg2-binary==2.9.13
