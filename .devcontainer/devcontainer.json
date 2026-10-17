@@ -17,7 +17,12 @@
       ]
     }
   },
-  "updateContentCommand": "[ -f packages.txt ] && sudo apt update && sudo apt upgrade -y && sudo xargs apt install -y <packages.txt; [ -f requirements.txt ] && pip3 install --user -r requirements.txt; pip3 install --user streamlit; echo '✅ Packages installed and Requirements met'",
+  // 依赖版本由 requirements.txt 唯一决定（其中 streamlit==1.65.0 等已锁死）。
+  // 原来这里末尾还有一句 `pip3 install --user streamlit`（不带版本），会把锁定的
+  // streamlit 覆盖成最新版 → Codespaces 与本地/云端跑的不是同一个版本，故删除。
+  // 基础镜像 3.11：requirements 里 pandas 3.0.6 / sqlalchemy 2.1.4 都要求 >=3.11，
+  // 与锁定的整套版本兼容（本地在 3.14 上验证过，两端都满足 >=3.11 的下限）。
+  "updateContentCommand": "[ -f packages.txt ] && sudo apt update && sudo apt upgrade -y && sudo xargs apt install -y <packages.txt; [ -f requirements.txt ] && python -m pip install --user -r requirements.txt; echo '✅ Packages installed and Requirements met'",
   "postAttachCommand": {
     "server": "streamlit run app.py --server.enableCORS false --server.enableXsrfProtection false"
   },

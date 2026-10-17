@@ -169,12 +169,27 @@ if not user_exists:
     st.rerun()
 st.session_state.is_admin = user_is_admin
 
+# 管理员统计结果缓存：面板一次要跑 3 条（运营数据）+ 4 条（漏斗）SQL，
+# 而侧边栏任何输入/按钮都会触发整脚本 rerun —— 不缓存的话管理员点一下就要等 7 条查询。
+# 60 秒内复用上一次结果（聚合数据，短暂陈旧可接受；注册/登录变化 60 秒内会自然刷新）。
+# ⚠ 只缓存统计，**鉴权不缓存**：get_user_auth_state 每轮都实时查，
+#   撤销管理员必须立刻生效（见上面 user_is_admin 那段）。
+@st.cache_data(ttl=60, show_spinner=False)
+def load_admin_operate_data_cached():
+    return get_admin_operate_data()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_admin_funnel_data_cached():
+    return get_admin_funnel_data()
+
+
 # ========== 管理员面板 ==========
 if st.session_state.is_admin:
     st.header("管理员面板")
     try:
         st.subheader("运营数据")
-        reg_7df, active_7df, sponsor_user_count = get_admin_operate_data()
+        reg_7df, active_7df, sponsor_user_count = load_admin_operate_data_cached()
         col_m1, col_m2, col_m3 = st.columns(3)
         with col_m1:
             st.metric("近 7 个自然日新增注册", reg_7df["count"].sum())
@@ -204,7 +219,7 @@ if st.session_state.is_admin:
 
         st.subheader("用户漏斗分析")
         st.caption("注册/活跃按 UTC 自然日统计；登录用户按滚动 168 小时统计，两者口径不同。")
-        total_reg, bill_user_count, login_7d_user, ai_user_count = get_admin_funnel_data()
+        total_reg, bill_user_count, login_7d_user, ai_user_count = load_admin_funnel_data_cached()
         activate_rate = bill_user_count / total_reg * 100 if total_reg > 0 else 0
         retain_rate = login_7d_user / total_reg * 100 if total_reg > 0 else 0
         ai_usage_rate = ai_user_count / total_reg * 100 if total_reg > 0 else 0
