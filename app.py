@@ -3,7 +3,7 @@ import pandas as pd
 from streamlit_echarts import st_echarts
 from datetime import datetime, date, timedelta
 from config import get_deepseek_api_key
-from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, check_user_exists, add_feedback, add_user_credits, is_user_admin, get_admin_operate_data, get_admin_funnel_data
+from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, get_user_auth_state, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data
 import requests
 import json
 import hashlib
@@ -100,8 +100,8 @@ if st.session_state.user_id is None:
                 else:
                     if uid:
                         st.session_state.user_id = uid
-                        # 不在这里查 is_admin：紧接的 st.rerun() 会在下一次 run 开头由下方"每次 run 统一复检"重算，
-                        # 此处赋值没人读，纯多一次查询
+                        # 不在这里查管理员标记：紧接的 st.rerun() 会在下一次 run 开头的
+                        # 统一鉴权里重算，此处赋值没人读，纯多一次查询
                         st.rerun()
                     else:
                         # “用户不存在”和“密码错误”共用一句提示，避免用户名枚举
@@ -148,18 +148,26 @@ if st.session_state.user_id is None:
                     st.error("注册失败：系统繁忙，请稍后再试")
     st.stop()
 
-# 校验用户有效性
-if not check_user_exists(st.session_state.user_id):
+# 纵深防御：先清掉上一轮可能残留的管理员标记，只有本次鉴权成功才重新赋 True
+st.session_state.is_admin = False
+
+# 一次查询同时拿到「用户是否存在」与「是否管理员」，避免两次往返之间的 TOCTOU
+try:
+    user_exists, user_is_admin = get_user_auth_state(st.session_state.user_id)
+except Exception as exc:
+    print(f"[auth] 鉴权查询失败：{type(exc).__name__}: {exc}")   # 细节只进服务端日志
+    st.error("登录状态校验失败，请稍后刷新重试")
+    # 鉴权失败时下方侧边栏（含"退出登录"）不会渲染，这里就地给一个出口，
+    # 否则 user_id 仍在、登录页也进不去，用户只能手动清 cookie
+    if st.button("退出登录"):
+        logout()
+        st.rerun()
+    st.stop()
+if not user_exists:
     st.warning("当前用户不存在，请重新登录")
     logout()
     st.rerun()
-
-# 每次 rerun 都按数据库的真实标记刷新一次，避免撤销管理员后旧会话仍能看到面板
-try:
-    st.session_state.is_admin = is_user_admin(st.session_state.user_id)
-except Exception as exc:
-    print(f"[admin] 鉴权检查失败：{type(exc).__name__}: {exc}")
-    st.session_state.is_admin = False
+st.session_state.is_admin = user_is_admin
 
 # ========== 管理员面板 ==========
 if st.session_state.is_admin:
@@ -255,16 +263,17 @@ with st.sidebar:
 
     st.divider()
     if st.button("一键加载演示数据（答辩专用）"):
-        if st.session_state.get("user_id") and check_user_exists(st.session_state.user_id):
-            ok = insert_demo_bills(st.session_state.user_id)
-            if ok:
-                st.cache_data.clear()
-                st.success("演示数据加载成功")
-                st.rerun()
-            else:
-                st.error("用户校验失败，无法插入演示数据")
-        else:
-            st.warning("请先登录或注册")
+        # 用户有效性已在本次 run 开头的统一鉴权里校验过（不存在会被踢出、根本到不了这里），
+        # 所以此处不再单独查一次库；数据层的日期校验可能抛 ValueError，这里兜住避免红屏
+        try:
+            insert_demo_bills(st.session_state.user_id)
+            st.cache_data.clear()
+            # 成功提示走 flash：紧跟 rerun 的 st.success 会被吞掉（同下方注册分支）
+            st.session_state["flash"] = {"level": "success", "msg": "演示数据加载成功"}
+            st.rerun()
+        except Exception as exc:
+            print(f"[demo] 演示数据加载失败：{type(exc).__name__}: {exc}")
+            st.error("演示数据加载失败，请稍后再试")
     if st.button("退出登录"):
         logout()
         st.rerun()

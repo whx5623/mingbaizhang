@@ -31,8 +31,8 @@ def init_db():
                 -- 管理员标记：与 migrations/006_user_admin_flag.sql 逐字同口径
                 -- （BOOLEAN NOT NULL DEFAULT FALSE，默认最小权限）。
                 -- 同样**只对新建库生效**：CREATE TABLE IF NOT EXISTS 对已存在的表什么都不做，
-                -- 老库补这一列必须执行 migrations/006；没执行时 is_user_admin() 走
-                -- ProgrammingError 分支返回 False（面板隐藏），不会红屏。
+                -- 老库补这一列必须执行 migrations/006；没执行时 get_user_auth_state() 走
+                -- ProgrammingError(pgcode=42703) 降级分支返回 (存在, False)（面板隐藏），不会红屏。
                 is_admin BOOLEAN NOT NULL DEFAULT FALSE
             );
         """))
@@ -163,6 +163,110 @@ def _normalize_amount(amount, bill_type):
     if abs(value) > MAX_ABS_AMOUNT:
         raise ValueError(f"金额超出上限 {MAX_ABS_AMOUNT}")
     return value + 0.0  # + 0.0 把 -0.0 归一成 0.0（避免页面显示 "-0.00"），其余值不受影响
+
+
+# ---------------------------------------------------------------------------
+# 账单日期归一 + 校验
+# ---------------------------------------------------------------------------
+# 背景：bills.date 是 VARCHAR/TEXT（**不是 DATE**），而读取侧全程靠"字符串"工作：
+#   · app.py 的分页：           ORDER BY date DESC
+#   · 管理员活跃图：            WHERE date >= :start_text AND date < :end_text
+#   · pandas 归期：             pd.to_datetime(..., errors="coerce")
+# 这三处只有在值是**零填充 ISO 'YYYY-MM-DD'** 时才成立（位数固定 → 字典序 == 日期序）。
+# 一旦库里混进 '2026/10/1' / '2026-1-5' / '' / 'abc'，后果都是**静默**的：
+#   · 活跃图少算：实测 '2026/10/1' >= '2026-10-11' 为 False → 该行被当成"不在窗口内"，
+#     不报错、不告警，图上就是凭空少一天；
+#   · 分页排序错乱：字典序把 '2026-1-5' 排在 '2026-10-17' 之后；
+#   · pd.to_datetime(errors="coerce") 把解析不了的行变成 NaT 直接丢掉。
+# 所以写入侧必须把格式钉死（本段），数据库侧另有 007_bill_date_check.sql 的
+# CHECK 约束兜底 —— 它挡的是**绕过本模块**的写入（手工 SQL、别的脚本、别的服务）。
+# 历史数据不在这里迁移（不改存储类型、不改老值），涉不涉及由 007 的前置校验决定。
+# ---------------------------------------------------------------------------
+
+# 与 migrations/007_bill_date_check.sql 的 CHECK 正则**同口径**：
+#   Python 侧  _ISO_DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)
+#   SQL 侧     date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+# 两边写法不同但**承认同一组字符**（4 位 ASCII 数字 - 2 位 - 2 位，且位数固定、零填充）。
+# SQL 侧刻意写 [0-9] 而不是 \d：PostgreSQL 的 \d 是"数字类"而 Python 的 \d（不加 re.ASCII）
+# 是"所有 Unicode 十进制数字"，写 [0-9] 让两边的字符集一眼就能对上，也顺带让
+# 007 里的形状核对不必再处理反斜杠转义。
+# 两个刻意的 Python 写法：
+#   ① re.ASCII：Python 的 \d 默认匹配**所有 Unicode 十进制数字**（'٢٠٢٦-١٠-٠١' 也会命中），
+#      不加这个标志，"4 位数字"的判断就成了"4 位任意语言的数字"，与 SQL 侧口径漂移。
+#   ② fullmatch 而不是 re.match(r"^...$")：Python 的 "$" 允许串尾多出一个 "\n"
+#      （re.match(r"^\d{4}-\d{2}-\d{2}$", "2026-10-01\n") 会命中），PostgreSQL 的 ~ 不会。
+#      同一个值在两边判定相反，就是"库里合规、代码判非法"的幽灵数据。
+_ISO_DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)
+
+
+def _is_missing_value(raw) -> bool:
+    """None / 空串 / 纯空白 / NaN(NaT) → "没给值"。
+
+    单独抽成一个函数，是为了让**校验**和**给用户的原因文案**共用同一个判据：
+    否则会出现"校验按空值拒、文案却说'格式非法：nan'"这种自相矛盾的提示
+    （CSV 里日期列缺失时，pandas 给的是 float('nan') 而不是 None / ""）。
+    """
+    if raw is None:
+        return True
+    if isinstance(raw, str):
+        return not raw.strip()  # str.strip() 默认连全角空格 \u3000 一起吃掉
+    try:
+        return bool(pd.isna(raw))  # float('nan') / pd.NaT / pd.NA
+    except (TypeError, ValueError):  # 不可判定的容器/自定义对象 → 当作"有值"
+        return False
+
+
+def _normalize_bill_date(raw) -> str:
+    """把账单日期收敛成严格的 ISO 'YYYY-MM-DD' 字符串；任何非法输入一律 ValueError。
+
+    为什么"钉死格式"而不是"尽力解析成 ISO"（这是本函数最重要的设计取舍）：
+      bills.date 是字符串列，读取侧三处（分页 ORDER BY、活跃图字符串窗口、
+      pd.to_datetime）都只认零填充 ISO。如果这里做"顺手帮你转一下"
+      （'2026/10/1' → '2026-10-01'），写入侧就会长期存在两种格式，
+      而"能不能转"这件事只在**写入那一刻**成立 —— 读取侧永远要再赌一次。
+      所以：**要么是严格 ISO，要么直接拒绝**，让错误在写入处暴露。
+
+    校验分三步（顺序固定，报错文案只有两种）：
+      ① None / 空串 / 纯空白 / NaN → ValueError("账单日期不能为空")
+      ② str(raw).strip() 后必须整串匹配 ^\\d{4}-\\d{2}-\\d{2}$（正则是**廉价**的一步，
+         先做它，避免把任意脏串喂给 strptime）；
+      ③ datetime.strptime(s, "%Y-%m-%d") 校验**真实日历日**：'2026-02-30'、'2026-13-01'
+         这类"格式对、日子不存在"的值必须被拒（它们能通过 ②，会让活跃图凭空多一个
+         永远不会出现的日期）。失败与 ② 给**同一条**文案 —— 对用户来说
+         "2026-02-30 不是合法日期"和"2026/10/1 格式不对"是同一件事：日期写错了。
+
+    返回值：**strip 后的原字符串**（不擅自改格式：能走到这里的已经是标准 ISO）。
+    非法时抛 ValueError（中文文案），由调用方决定上抛还是跳过该行。
+    """
+    if _is_missing_value(raw):
+        raise ValueError("账单日期不能为空")
+    text = str(raw).strip()
+    if not _ISO_DATE_PATTERN.fullmatch(text):
+        raise ValueError(f"账单日期格式必须是 YYYY-MM-DD：{raw!r}")
+    try:
+        datetime.strptime(text, "%Y-%m-%d")
+    except ValueError as exc:
+        # 格式对但日子不存在（2026-02-30 / 2026-13-01 / 2025-02-29）
+        raise ValueError(f"账单日期格式必须是 YYYY-MM-DD：{raw!r}") from exc
+    return text
+
+
+def _describe_date_error(raw_date) -> str:
+    """把日期校验失败翻译成一句中文原因（给 CSV 导入的 skipped 明细用）。
+
+    与 _normalize_bill_date 的判据一一对应，只是把"错在哪一步"说清楚：
+      · 没给值            → 账单日期不能为空
+      · 格式不对          → 日期格式非法：'2026/10/1'
+      · 格式对但日子不存在 → 日期不存在（不是真实日历日）：'2026-02-30'
+    （不能用 str(ValueError)：那会把两条不同成因都糊成一句，运维看不出是
+      "用户写了 2026/10/1" 还是"二月三十号"。）
+    """
+    if _is_missing_value(raw_date):
+        return "账单日期不能为空"
+    text = str(raw_date).strip()
+    if not _ISO_DATE_PATTERN.fullmatch(text):
+        return f"日期格式非法：{raw_date!r}"
+    return f"日期不存在（不是真实日历日）：{raw_date!r}"
 
 
 def _normalize_type_column(df):
@@ -432,17 +536,18 @@ def verify_user(username, password):
     _touch_last_login(user_id)  # 内部吞异常：写失败也不影响登录
     return user_id
 
-def check_user_exists(user_id):
-    global engine
-    with engine.connect() as conn:
-        stmt = text("SELECT COUNT(id) FROM users WHERE id = :uid")
-        cnt = conn.execute(stmt, {"uid": user_id}).scalar() or 0
-        return cnt > 0
-
 def add_bill(user_id, date, merchant, amount, payment_method, type):
     global engine
-    # AI 记账路径：类型乱归一律抛 ValueError（app.py 已有 except Exception 兜底提示）。
-    # 先定类型、再用同一个 _normalize_amount 收敛金额符号，与 CSV 导入路径口径一致。
+    # 参数名 date 是历史遗留（遮蔽了 datetime.date），本函数里不再用 date 类型，只当值用。
+    #
+    # 三项校验全部放在**开连接之前**：非法入参连库都不碰。
+    # ① 日期：必须是严格 ISO 'YYYY-MM-DD'（bills.date 是 VARCHAR，靠 ISO 字典序排序，
+    #    格式必须钉死；见 _normalize_bill_date 的长注释和 007 的 CHECK 兜底）。
+    #    这是 AI 记账 path 的主要风险面：func_args.get("date", ...) 取到什么就是什么。
+    # ② 类型：乱归一律抛 ValueError（app.py 已有 except Exception 兜底提示）。
+    # ③ 金额：同一套 _normalize_amount 收敛符号+两位小数，与 CSV 导入路径口径一致。
+    # 三者都是 ValueError 向上抛，由 app.py 的 except 显示成中文文案。
+    bill_date = _normalize_bill_date(date)
     bill_type = normalize_bill_type(type, strict=True)
     amt = _normalize_amount(amount, bill_type)
     with engine.connect() as conn:
@@ -452,7 +557,7 @@ def add_bill(user_id, date, merchant, amount, payment_method, type):
         """)
         conn.execute(stmt, {
             "uid": user_id,
-            "dt": date,
+            "dt": bill_date,
             "mer": merchant,
             "amt": amt,
             "pm": payment_method,
@@ -504,7 +609,11 @@ def insert_demo_bills(user_id):
             bill_type = normalize_bill_type(row["type"], strict=True)
             conn.execute(stmt, {
                 "uid": user_id,
-                "dt": row["date"],
+                # 日期也过同一个校验：本表数据全部是 ISO（幂等、结果不变），
+                # 接入的目的是把"以后有人改 demo_data"钉在和 add_bill / CSV 完全相同的
+                # 口径上 —— 否则"示例数据"就成了唯一能绕过格式校验的后门。
+                # 就算将来写错了，异常也会让 with 块回滚，DELETE 不会留下半成品。
+                "dt": _normalize_bill_date(row["date"]),
                 "mer": row["merchant"],
                 # 走同一个金额口径：这里数据本就是正的，abs 不会改变结果
                 "amt": _normalize_amount(row["amount"], bill_type),
@@ -560,6 +669,10 @@ def import_csv_to_bills(user_id, df):
 
     行为（与改版前保持一致，只是把信息从 print 提到返回值）：
     - 先整表校验、再删旧写新：坏行只跳过自己，不影响其它行；
+    - 日期列过 _normalize_bill_date：空值 / 非 ISO 格式 / 不存在的日子 → 跳过该行，
+      原因写进 skipped（"账单日期不能为空" / "日期格式非法：'2026/10/1'" /
+      "日期不存在（不是真实日历日）：'2026-02-30'"）。**不整批失败**：
+      CSV 是用户手写的，一行写错不该让另外 99 行也导不进来；
     - 有有效行时才 DELETE 旧账单 + 批量插入；
     - 一条有效行都没有时**完全不碰库**（imported=0，库里原账单原样保留）；
     - 服务端 print 告警保留（便于排查），但页面要用信息一律走返回值。
@@ -580,6 +693,18 @@ def import_csv_to_bills(user_id, df):
     rows = []
     for position, (idx, r) in enumerate(df.iterrows()):
         row_no = _excel_row_number(idx, position)  # 用户在 Excel 里看到的行号
+        # 日期先校验（最便宜、也最容易出错的一列）：
+        # **坏日期只跳过这一行，不整批失败** —— CSV 是用户手写的，一行写错不该让
+        # 另外 99 行导不进来，也不该让"导入"这个动作变成全有或全无。
+        # 原因文案按成因分开（空值 / 格式非法 / 日子不存在），见 _describe_date_error。
+        raw_date = r.get("date")
+        try:
+            bill_date = _normalize_bill_date(raw_date)
+        except ValueError:
+            reason = _describe_date_error(raw_date)
+            result["skipped"].append({"row": row_no, "reason": reason})
+            print(f"[import_csv_to_bills] 第 {row_no} 行 {reason}，已跳过该行")
+            continue
         # 顺序很重要：先定类型，再按类型收敛符号。
         # 反过来（先 abs 再定类型）会把「收入 -100」翻成 +100 的收入 → 结余虚高。
         try:
@@ -598,7 +723,7 @@ def import_csv_to_bills(user_id, df):
             continue
         rows.append({
             "uid": user_id,
-            "dt": r.get("date"),
+            "dt": bill_date,
             "mer": r.get("merchant"),
             "amt": amt,
             "pm": r.get("payment_method"),
@@ -650,31 +775,99 @@ def add_user_credits(user_id, delta):
 # 背景：app.py 的管理面板代码一直都在，但 st.session_state.is_admin 从来只有 False，
 # 面板等于死代码。把"谁是管理员"落到 users.is_admin（migrations/006_user_admin_flag.sql），
 # 由下面这个函数回答 —— 页面不再自己猜，也不再把管理员身份写死在代码/配置里。
+#
+# 为什么把"用户是否存在"和"是否管理员"合并成**一次查询**（get_user_auth_state）：
+#   改版前 app.py 每轮 run 要问两次（两次各是 db 里的一个函数）：
+#       第 1 次：SELECT COUNT(id) FROM users WHERE id = :uid     -- 只回答"在不在"
+#       第 2 次：SELECT COALESCE(is_admin, FALSE) ...            -- 只回答"是不是管理员"
+#   两个问题各开一个连接、各发一条 SQL，而且**中间存在 TOCTOU 窗口**：第 1 次说"存在"、
+#   第 2 次执行前用户被删掉（或反过来），页面就会拿着一个已不存在的 user_id 继续渲染，
+#   或者把一个刚被撤销管理员的人当成管理员过一个 rerun。
+#   （那两个旧函数在本批次已按 reviewer 要求删除：全仓 0 调用点。全仓 grep 过
+#     app.py / db_init.py / seed_knowledge.py / migrations，无人引用。）
+#   合并成一条 `SELECT id, COALESCE(is_admin, FALSE) FROM users WHERE id = :uid` 之后：
+#     · 一次往返（省掉一次连接建立/归还 + 一次网络 RT）；
+#     · 两个答案来自**同一个快照/同一行**，不可能互相矛盾（行在 == 用户存在）；
+#     · app.py 只需要一次 try/except。
 # ---------------------------------------------------------------------------
 
-def is_user_admin(user_id) -> bool:
-    """该用户当前是不是管理员。**永不抛异常**，任何失败都落成 False（fail-closed）。
+# 鉴权查询降级时的告警去重：**按 pgcode 分别记一次**（不是"全局只报一次"）。
+#   · 42703（undefined_column = 006 没执行）：用 log.warning，**每个 pgcode 只报一次**。
+#     app.py 每轮 rerun 都会问一次鉴权，一次交互可能触发好几轮；不去重就会被同一条
+#     warning 刷屏（每次点击 +N 行），运维反而看不到真正的信号。
+#   · 其它 pgcode（42501 权限不足 / 42P01 表不见 / 语法类等）：用 log.error 且**不抑制**，
+#     每次都要报 —— 那不是一个"等运维跑迁移"的已知状态，而是**代码/环境 bug**，
+#     抑制它等于把 bug 藏起来。
+# ⚠ 这里刻意是 set 而不是一个 bool：旧实现用一个布尔同时管 42703 和"其它"，
+#   于是只要先出现过一次"其它"（比如权限抖动），后来真正的"缺列"就再也不会告警，
+#   运维永远看不到"请执行 006"。按 pgcode 分桶之后，两种告警互不影响。
+_ADMIN_WARNED_CODES: set[str] = set()
+
+# 缺列（006 未执行）的 SQLSTATE。抽成常量，免得下面的判据与告警文案各写一份字符串。
+_PGCODE_UNDEFINED_COLUMN = "42703"
+
+
+def _pg_sqlstate(exc, default=None):
+    """从 SQLAlchemy 的 ProgrammingError 里挖出 SQLSTATE（兼容 psycopg2 / psycopg3）。
+
+    为什么要"兼容"而不是直接 `exc.orig.pgcode`：
+      · psycopg2（本项目当前驱动，SQLAlchemy 2.1 下的 psycopg2 2.9.13）把 SQLSTATE
+        暴露成 **exc.orig.pgcode**；
+      · psycopg3 没有 pgcode 属性，叫 **exc.orig.sqlstate**；
+      · 两边都有 exc.orig.diag.sqlstate（DBAPI 标准位置），但它可能不存在（非 psycopg 驱动）。
+    三级回退再落到 default：拿到 None 时调用方会走"未知 pgcode"分支（log.error、不抑制），
+    绝不会因为取不到 code 就把真故障静默成"无权限"。
+    用 getattr 串起来（而不是 try/except 或 isinstance 分支）是因为这些属性都可能是
+    None 或干脆不存在，getattr(..., None) + or 链最省事，也不会因为某个中间层是 None 而抛。
+    """
+    orig = getattr(exc, "orig", None)
+    return (
+        getattr(orig, "pgcode", None)                       # psycopg2
+        or getattr(orig, "sqlstate", None)                  # psycopg3
+        or getattr(getattr(orig, "diag", None), "sqlstate", None)  # DBAPI diag
+        or default
+    )
+
+
+def get_user_auth_state(user_id) -> tuple[bool, bool]:
+    """一次查询回答两个问题：返回 ``(exists, is_admin)``，两个都是**真 bool**。
 
     契约（app.py 依赖它，改签名/改语义前先看 app.py 的调用点）：
-    - 返回值必须是**真正的 bool**：True / False。不返回 None、不返回 1/0、
-      也不返回 numpy.bool_ —— 调用方可能写 `is True` 或把它塞进 JSON，
-      非 bool 在那里会静默出错。
-    - 用户不存在（user_id 不存在 / 为 None / 会话里的 id 已过期被删）→ False。
-      **不区分"用户不存在"和"不是管理员"**：调用方只要一个布尔，
-      而 `WHERE id = :uid` 查不到行本身就等于"没有任何权限"。
-    - migrations/006 未执行（is_admin 列不存在）→ False + 一条 warning。
-      **这是刻意的降级**：鉴权失败只能落成"无权限"，绝不能落成"有权限"。
-      也正因为这里吞掉了 ProgrammingError，006 之前管理面板只是"看不见"，
-      不会像 005 忘了执行那样把页面搞红屏（普通记账功能完全不引用 is_admin）。
-    - 其余异常（库不可用、连接超时、权限不足、engine 还没 init_db）→ False + warning。
+    - 返回 `(bool, bool)`：不返回 None、不返回 1/0、不返回 numpy.bool_ ——
+      调用方可能写 `is True` 或把它塞进 JSON，非 bool 在那里会静默出错。
+    - 用户不存在（id 不存在 / 为 None / 会话里的 id 已过期被删）→ ``(False, False)``。
+      "不存在"必须是 False，**不能**退化成 True：页面靠它决定是否 logout。
+    - migrations/006 未执行（is_admin 列不存在）→ **优雅降级**：
+      退回 `SELECT id FROM users WHERE id = :uid`，返回 ``(存在?, False)``，
+      并打一条告警（用模块级 _ADMIN_WARNED_CODES 按 pgcode 分桶：缺列那种只报一次，
+      其它 pgcode 每次都报 —— 见下面两档说明）。
+      降级方向是刻意的：鉴权失败只能落成"无权限"，绝不能落成"有权限"，
+      但"用户在不在"这件事仍然要答对（否则会把正常用户踢下线）。
+      告警按 pgcode 分两档（判据见 _pg_sqlstate，兼容 psycopg2 的 .pgcode 与
+      psycopg3 的 .sqlstate/.diag.sqlstate）：
+        · ``42703``（undefined_column）→ ``log.warning``，文案指向"请执行 006"，
+          **同一个 pgcode 只报一次**（否则每轮 rerun 刷屏）；
+        · 其它 pgcode / 取不到 pgcode → ``log.error``，**每次都报、绝不抑制**。
+          那不是一个"等运维跑迁移"的已知状态，而是 bug/环境故障（权限、表不见、
+          SQL 拼错）；一句"请执行 006"只会把运维引到错路上，而抑制它等于把 bug 藏起来。
+      **告警一律打在降级查询之后**：降级查询本身也失败时异常直接上抛，
+      日志里就不会留下一条"已降级成功"的误导记录（旧顺序是先报降级、后失败）。
+    - 其余 `SQLAlchemyError` / `OSError` / 未知异常：**一律向上抛，不吞**。
+      这是与"旧版薄封装（已删）"最重要的语义变化：旧版把所有异常都吞成 False，
+      于是"连不上库"和"这个用户不是管理员"在页面上长得一模一样 ——
+      库抖一下，全体用户都被当成"无权限"（更糟的是如果被当成"不存在"，
+      就直接把人踢下线）。连不上库是环境故障，必须让调用方看见（app.py 外层
+      有 try/except，会停止渲染并提示，而不是静默降权）。
     - 只读、单条语句、不写库、**不做缓存**：管理员一被撤销，下一次调用立刻生效
-      （app.py 每次 rerun 都会重新问一次，见 app.py 里两处 is_user_admin 调用）。
+      （app.py 每次 rerun 都会重新问一次）。
 
     SQL 为什么这么写：
-    - `SELECT COALESCE(is_admin, FALSE) FROM users WHERE id = :uid`
-      COALESCE 是第二层保险：006 已把该列建成 NOT NULL，理论上不会出现 NULL；
-      但鉴权路径上多一层兜底的成本是零，收益是"绝不让三值逻辑漏进调用方"
-      （NULL → None，`if None:` 恰好是 False，可这种"恰好正确"经不起重构）。
+    - `SELECT id, COALESCE(is_admin, FALSE) FROM users WHERE id = :uid`
+      · 取 id 是为了让"有没有这一行"和"is_admin 是什么"来自**同一次执行**，
+        避免再发一条 COUNT 查询（也就是本轮要消灭的 TOCTOU）；
+      · COALESCE 是第二层保险：006 已把该列建成 NOT NULL，理论上不会有 NULL；
+        但鉴权路径上多一层兜底成本为零，收益是"绝不让三值逻辑漏进调用方"
+        （NULL → None，`if None:` 恰好是 False，可这种"恰好正确"经不起重构）。
     - 表名**不带** `public.` 前缀：与本文件其余 SQL 统一（靠 search_path 找 public.users）。
     """
     global engine
@@ -682,32 +875,63 @@ def is_user_admin(user_id) -> bool:
     try:
         with engine.connect() as conn:
             row = conn.execute(
-                text("SELECT COALESCE(is_admin, FALSE) FROM users WHERE id = :uid"),
+                text("SELECT id, COALESCE(is_admin, FALSE) FROM users WHERE id = :uid"),
                 {"uid": user_id},
             ).fetchone()
-    except ProgrammingError:
-        # 最常见的真实成因：migrations/006_user_admin_flag.sql 还没执行，
-        # users.is_admin 不存在 → UndefinedColumn（SQLAlchemy 侧是 ProgrammingError）。
-        # 这条 warning 就是给运维的提示，别让用户看到。
-        log.warning(
-            "[db] 管理员鉴权失败：is_admin 列不存在，请先执行 "
-            "migrations/006_user_admin_flag.sql（users.is_admin 缺失）。"
-            "本次按“无权限”处理，管理面板对所有人隐藏。"
-        )
-        return False
-    except (SQLAlchemyError, OSError):
-        # 库不可用 / 连接超时 / 权限不足（含驱动层 OSError）→ 同样按无权限处理。
-        log.warning("[db] 管理员鉴权查询失败（库不可用或连接异常），按无权限处理", exc_info=True)
-        return False
-    except Exception:
-        # 兜底：engine 还没 init_db（None → AttributeError）、user_id 是不可绑定的类型等。
-        # 鉴权路径上**任何**未知错误都不许冒到页面，更不许变成"通过"。
-        log.warning("[db] 管理员鉴权出现未知异常，按无权限处理", exc_info=True)
-        return False
+    except ProgrammingError as exc:
+        # 两条分支都要"降级"（否则用户会被当不存在而被踢下线），差别只在**怎么报**。
+        #
+        # ⚠ 顺序很重要：**先**跑降级查询，**再**打告警。
+        #   旧顺序是先 log.warning("已降级…") 再去执行降级查询；万一降级查询也失败
+        #   （权限不足 / 表不见 / 连接断了），异常虽然照样上抛，但日志里已经多了一条
+        #   "已降级成功"的记录 —— 排障的人会被这条误导（以为问题只在 is_admin 上）。
+        #   现在降级查询失败就直接上抛，一条告警都不留：日志与实际行为一致。
+        # 这里**故意不捕获**降级查询的异常：它也失败说明库真的有问题，交给调用方。
+        with engine.connect() as conn:
+            fallback = conn.execute(
+                text("SELECT id FROM users WHERE id = :uid"), {"uid": user_id}
+            ).fetchone()
 
-    if row is None:
-        return False  # 用户不存在 == 没有权限
-    return bool(row[0])
+        pgcode = _pg_sqlstate(exc)  # 兼容 psycopg2(.pgcode) / psycopg3(.sqlstate)
+        if pgcode == _PGCODE_UNDEFINED_COLUMN:  # 42703 undefined_column = 006 没执行
+            # 按 pgcode 分桶，**每个 code 只报一次**：这是"等运维跑迁移"的已知状态，
+            # 但 app.py 每轮 rerun 都会问一次，不去重就会刷屏。
+            if _PGCODE_UNDEFINED_COLUMN not in _ADMIN_WARNED_CODES:
+                _ADMIN_WARNED_CODES.add(_PGCODE_UNDEFINED_COLUMN)
+                log.warning(
+                    "[db] 鉴权查询降级：users.is_admin 列不存在（pgcode=42703），"
+                    "可能未执行 migrations/006_user_admin_flag.sql。"
+                    "本次退回“只查用户是否存在”，管理员一律按 False 处理"
+                    "（管理面板对所有人隐藏）。此告警只打一次，避免每轮 rerun 刷屏；"
+                    "请执行 006 让管理面板恢复。",
+                    exc_info=True,
+                )
+        else:
+            # 其它 pgcode = **bug / 环境故障**，不是"没跑迁移"：每次都要报（log.error）。
+            # 用 log.error 而不是 warning：warning 在多数日志配置里会被忽略，
+            # 而这条恰恰是"必须有人来看"的那一类。
+            log.error(
+                "[db] 鉴权查询失败（ProgrammingError，pgcode=%r，不是缺列 42703），"
+                "本次退回“只查用户是否存在”，管理员按 False 处理。"
+                "请检查鉴权 SQL、数据库对象权限与连接状态。**此告警不抑制，每次都会报**。",
+                pgcode,
+                exc_info=True,
+            )
+        return (bool(fallback is not None), False)
+
+    # 注意用 `row is not None` 而不是 `if row:`：Row 的真值来自长度，
+    # 一行 `(0, False)` 虽然非空却是"合法但全 False"的答案，别让真值判断混进来。
+    return (bool(row is not None), bool(row[1]) if row is not None else False)
+
+
+# 备注（本批次已删除两个死符号，别再写回来）：
+#   · 「只查用户是否存在」的薄封装：全仓 0 调用点。app.py 每轮 rerun 用的是
+#     get_user_auth_state()（一次查询同时给出"存在"与"是否管理员"，没有 TOCTOU），
+#     单独的存在性查询没有用户；留着只会让下一个人多写一条 COUNT。
+#   · 「只返回 is_admin」的薄封装：同样是 0 调用点，而且它是个**陷阱** ——
+#     名字读起来像"不抛异常的布尔判断"，实际会从 get_user_auth_state 把异常抛出去
+#     （连不上库 ≠ 没有权限）。同一个问题有两个语义不同的入口，迟早有人用错那个。
+#   需要权限一律调用 get_user_auth_state(user_id)[1]，需要存在性用 [0]。
 
 
 # 后台图表的时间窗口：**含今天在内共 7 个自然日**（UTC）。
