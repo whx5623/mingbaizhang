@@ -1,5 +1,7 @@
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
 import pandas as pd
+import logging
 import math
 import re
 import bcrypt
@@ -20,7 +22,12 @@ def init_db():
                 password_hash VARCHAR(255) NOT NULL,
                 credits INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_login TIMESTAMP NULL
+                -- 必须是 TIMESTAMPTZ，与 migrations/005_last_login.sql 逐字同口径。
+                -- naive TIMESTAMP 存的是“没有时区的墙上时间”，含义取决于读写时会话的 TimeZone，
+                -- 时区一变历史值整体平移；timestamptz 存绝对时刻，跨环境稳定。
+                -- （这条 CREATE TABLE 只对**新库**生效；老库补列必须跑 005，
+                --   005 的核对会用 data_type = 'timestamp with time zone' 拦下历史遗留的错误类型。）
+                last_login TIMESTAMPTZ NULL
             );
         """))
         conn.execute(text("""
@@ -320,7 +327,13 @@ def create_user(username, password):
     ph = hash_password(password)  # 明文不落库；ValueError/TypeError 直接向上抛
     with engine.connect() as conn:
         try:
-            stmt = text("INSERT INTO users (username, password_hash) VALUES (:un, :ph) RETURNING id;")
+            # last_login 用 now()：**注册即视为一次登录**，否则刚注册的用户在后台漏斗的
+            # “7 天登录用户”里会缺一天（注册完只是进了首页、没有第二次登录动作）。
+            # now() 返回 timestamptz（绝对时刻），写进 TIMESTAMPTZ 列不需要任何换算，
+            # 与 verify_user/_touch_last_login 写的是同一个时钟口径。
+            # ⚠ 绝不能换成 Python 的 datetime.now()：那是 naive 值，会被按目标列/会话的
+            #   时区去解释，本机 UTC+8 写出来的值到 UTC 的库里就差 8 小时。
+            stmt = text("INSERT INTO users (username, password_hash, last_login) VALUES (:un, :ph, now()) RETURNING id;")
             result = conn.execute(stmt, {"un": username, "ph": ph})
             row = result.fetchone()
             conn.commit()
@@ -331,6 +344,59 @@ def create_user(username, password):
                 raise ValueError(DUPLICATE_USERNAME_MESSAGE) from exc
             raise
 
+def _touch_last_login(user_id):
+    """登录成功后把 users.last_login 写成数据库当前时间（now()）。
+
+    **本函数永不抛异常**：last_login 只服务于后台漏斗（运营指标），
+    绝不能因为它把“密码正确”的登录变成“登录失败”—— 一个报表字段不值得挡住用户。
+
+    几个刻意的写法：
+    - 独立连接 + 独立提交：bcrypt 校验（约 200~300ms、纯 CPU）已经在调用方做完，
+      这里只发一条 UPDATE。**不要把 bcrypt 计算夹进这个事务**，否则一次慢哈希
+      （或 UPDATE 的锁等待）就会让 users 行的写锁被意外长时间持有。
+    - 用数据库的 now() 而不是 Python 的 datetime.now()：now() 返回 timestamptz（绝对时刻），
+      写进 last_login（TIMESTAMPTZ）不需要任何换算；以数据库为唯一时钟，
+      应用机的时区/时钟漂移进不来（本机 UTC+8、库 TimeZone=UTC，写 naive 本地时间就会错 8 小时）。
+    - 表名**不带** `public.` 前缀：与本文件其余 SQL（`SELECT ... FROM users`、
+      `UPDATE users SET credits = ...`、`INSERT INTO users ...`）统一成一种写法，
+      统一靠 search_path 找到 public.users。混用 `public.users` 与 `users` 的代价是：
+      一旦某个会话/角色把 search_path 改了，只有写 `users` 的那几句会打到别的 schema 上，
+      而这种差异在测试库里永远不会暴露。
+    - 异常分两类，都只降级成告警、不影响登录：
+        · ProgrammingError：几乎只有一种成因 —— migrations/005_last_login.sql 还没执行，
+          列不存在，UPDATE 里的 last_login 直接 UndefinedColumn；
+        · 其余 SQLAlchemyError / OSError：库暂时不可写、连接超时、权限不足等（含驱动层 OSError）。
+      用 logging.warning(..., exc_info=True) 而不是 print：运维能拿到 logger 名和完整栈，
+      也方便以后接日志系统（这里不调 basicConfig，交给应用/进程自己配置 handler）。
+    """
+    global engine
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(
+                text("UPDATE users SET last_login = now() WHERE id = :uid"),
+                {"uid": user_id},
+            )
+            rowcount = result.rowcount
+            conn.commit()
+        if rowcount == 0:
+            # 连上了、写成功，但一行都没命中：id 不存在（用户被删了 / session 里的 id 过期）。
+            # 不算错误，但要留痕，否则“漏斗里这个人怎么没有登录记录”查不出来。
+            logging.getLogger(__name__).warning(
+                "[db] last_login 未更新：users.id=%r 不存在（rowcount=0），本次登录未记录", user_id
+            )
+    except ProgrammingError:
+        # 最常见的真实成因：005 还没执行。这条告警就是给运维的提示，别让用户看到。
+        logging.getLogger(__name__).warning(
+            "[db] last_login 写入失败：可能是 migrations/005_last_login.sql 尚未执行"
+            "（users.last_login 列不存在，UndefinedColumn）。登录本身不受影响。",
+            exc_info=True,
+        )
+    except (SQLAlchemyError, OSError):
+        logging.getLogger(__name__).warning(
+            "[db] last_login 更新失败（库不可写 / 连接异常），不影响登录", exc_info=True
+        )
+
+
 def verify_user(username, password):
     """校验登录。password 是**明文**；通过返回 user id，否则 None。
 
@@ -339,6 +405,11 @@ def verify_user(username, password):
     - 用户名不存在时也照样跑一次 bcrypt 校验（对一个惰性生成的假哈希），让两种失败分支
       耗时接近，减少“响应快 = 用户不存在”的时序侧信道。假哈希只在本进程内存里，
       不对应任何真实账号与密码。
+    - **校验通过后写 last_login（= now()）**，这是后台漏斗「7 天登录用户/留存率」的
+      唯一数据来源。写入发生在 bcrypt 校验**之后**、并在独立连接里提交，
+      失败也不影响登录（见 _touch_last_login）。
+    - 本函数里没有任何把 Python 时间写进 last_login 的路径：时间一律由数据库的 now()
+      （timestamptz）产生，写入 TIMESTAMPTZ 列免换算。
     """
     global engine, _TIMING_DUMMY_HASH
     stmt = text("SELECT id, password_hash FROM users WHERE username = :un")
@@ -349,7 +420,11 @@ def verify_user(username, password):
             _TIMING_DUMMY_HASH = hash_password("timing-dummy-not-a-real-credential")
         verify_password(password, _TIMING_DUMMY_HASH)
         return None
-    return row[0] if verify_password(password, row[1]) else None
+    if not verify_password(password, row[1]):
+        return None
+    user_id = row[0]
+    _touch_last_login(user_id)  # 内部吞异常：写失败也不影响登录
+    return user_id
 
 def check_user_exists(user_id):
     global engine
@@ -592,8 +667,6 @@ def get_admin_operate_data():
 
 def get_admin_funnel_data():
     global engine
-    end_date = date.today()
-    start_7d = end_date - timedelta(days=7)
     with engine.connect() as conn:
         total_reg_sql = text("SELECT COUNT(id) FROM users")
         total_reg = conn.execute(total_reg_sql).scalar() or 0
@@ -601,12 +674,27 @@ def get_admin_funnel_data():
         bill_user_sql = text("SELECT COUNT(DISTINCT user_id) FROM bills")
         bill_user_count = conn.execute(bill_user_sql).scalar() or 0
 
-        login_7d_sql = text("SELECT COUNT(DISTINCT id) FROM users WHERE DATE(last_login) >= :start")
-        login_7d_user = conn.execute(login_7d_sql, {"start": start_7d}).scalar() or 0
+        # 时间窗口整段下沉到数据库，不用 Python 算日期、也不再传 :start 参数。
+        #   · 窗口 = 精确的过去 7×24 小时（滚动窗口），不是“7 个自然日”；
+        #   · now() 返回 timestamptz，last_login 也是 TIMESTAMPTZ，比较是两个**绝对时刻**
+        #     的先后 —— 用数据库时钟，与应用机时区（本机 UTC+8）和库的会话 TimeZone
+        #     （UTC）都无关，应用机时区漂移不会把窗口算歪。
+        #   · 不要写 DATE(last_login)：把函数包在列上会让 idx_users_last_login 失效
+        #     （B-tree 用不上 DATE(col) 这种表达式，除非另建表达式索引），而这条语句
+        #     是后台面板每次刷新都要跑的；而且 DATE() 的结果依赖会话 TimeZone，
+        #     同一行在不同时区下会落进“不同的那一天”。
+        #   · now() 是 STABLE 函数，规划器会把它当常量求值，右侧不影响索引使用。
+        #   · NULL（老用户 / 迁移后还没登录过）不满足 >=，天然被排除，正是我们要的口径。
+        login_7d_sql = text(
+            "SELECT COUNT(DISTINCT id) FROM users WHERE last_login >= now() - interval '7 days'"
+        )
+        login_7d_user = conn.execute(login_7d_sql).scalar() or 0
 
         ai_user_sql = text("SELECT COUNT(DISTINCT user_id) FROM chat_history")
         ai_user_count = conn.execute(ai_user_sql).scalar() or 0
     return total_reg, bill_user_count, login_7d_user, ai_user_count
+
+
 def register_user(username, password):
     """注册用户。password 是**明文**，内部哈希后入库。
 
@@ -625,7 +713,9 @@ def register_user(username, password):
     ph = hash_password(password)  # 先校验再连库：不合法的密码连事务都不用开
     with engine.connect() as conn:
         try:
-            stmt = text("INSERT INTO users (username, password_hash) VALUES (:username, :password_hash) RETURNING id;")
+            # 同 create_user：注册即视为一次登录，last_login = now()（数据库时钟，timestamptz）。
+            # 不要改成 datetime.now()：naive 值会按会话时区被解释，应用机 UTC+8 / 库 UTC 直接差 8 小时。
+            stmt = text("INSERT INTO users (username, password_hash, last_login) VALUES (:username, :password_hash, now()) RETURNING id;")
             result = conn.execute(stmt, {"username": username, "password_hash": ph})
             row = result.fetchone()
             conn.commit()
