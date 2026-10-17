@@ -542,6 +542,178 @@ def _touch_last_login(user_id):
         )
 
 
+# ---------------------------------------------------------------------------
+# 登录事件与失败限流（migrations/009_login_events.sql）
+#
+# 为什么需要一张事件表：users.last_login 只是「最后一次登录」的覆盖式快照 ——
+#   它算不出每日登录趋势/留存曲线，也回答不了「最近有没有人在暴力试密码」。
+#   009 建 login_events(user_id, username, event, occurred_at) 记下每次尝试。
+#
+# 限流口径：同一用户名在 LOGIN_WINDOW_MINUTES 分钟内失败达 LOGIN_MAX_FAILURES 次，
+#   且这段时间里没有成功登录 → 暂时拒绝继续尝试。
+#   按**用户名**计数而不是客户端 IP：Streamlit 侧拿不到可信 IP，硬凑一个反而
+#   给人「我们有 IP 级防护」的错觉；按用户名计数会让攻击者能锁定某个账号（DoS），
+#   但配合成功后清零与窗口自然过期，代价可接受，且不给用户枚举提供额外信息。
+#
+# 两张表都可能"还没建"（009 未执行）：所有读写都 fail-open（限流不生效、埋点静默），
+#   绝不能让一张统计表把登录流程弄挂。
+# ---------------------------------------------------------------------------
+
+LOGIN_MAX_FAILURES = 5
+LOGIN_WINDOW_MINUTES = 15
+LOGIN_EVENT_SUCCESS = "success"
+LOGIN_EVENT_FAILURE = "failure"
+
+_WARNED_LOGIN_TABLE: set[str] = set()
+
+
+class LoginThrottled(Exception):
+    """登录尝试过于频繁。app.py 捕获它给用户一句中文提示（不是程序故障）。"""
+
+
+def _is_undefined_table(exc) -> bool:
+    """42P01 = undefined_table（009 未执行时最典型的报错）。"""
+    return _pg_sqlstate(exc) == "42P01"
+
+
+def _warn_login_table_once(message, exc=None):
+    if "missing" in _WARNED_LOGIN_TABLE:
+        return
+    _WARNED_LOGIN_TABLE.add("missing")
+    logging.getLogger(__name__).warning(message, exc_info=exc is not None)
+
+
+def record_login_event(username, user_id, event):
+    """记录一次登录**成功**事件。**永不抛异常**：埋点失败不能把登录搞挂。
+
+    失败事件请走 record_login_failure()（它把「插入 + 计数」放在同一事务里）。
+    """
+    if event not in (LOGIN_EVENT_SUCCESS, LOGIN_EVENT_FAILURE):
+        raise ValueError(f"非法的登录事件类型：{event!r}")
+    un = (username or "").strip() or None
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("INSERT INTO login_events (user_id, username, event) VALUES (:uid, :un, :ev)"),
+                {"uid": user_id, "un": un, "ev": event},
+            )
+            conn.commit()
+    except ProgrammingError as exc:
+        if _is_undefined_table(exc):
+            _warn_login_table_once(
+                "[db] 登录事件写入失败：migrations/009_login_events.sql 尚未执行"
+                "（login_events 表不存在）。登录本身不受影响。",
+                exc,
+            )
+        else:
+            logging.getLogger(__name__).warning("[db] 登录事件写入失败（ProgrammingError）", exc_info=True)
+    except (SQLAlchemyError, OSError):
+        logging.getLogger(__name__).warning("[db] 登录事件写入失败（库不可写 / 连接异常）", exc_info=True)
+
+
+# 限流计数 SQL：只数「最后一次成功登录之后」的失败（按 id 判定先后，不用 occurred_at ——
+# now() 是事务开始时刻，并发可同微秒、时钟回拨会让先后错乱；id 单调无歧义）。
+_LOGIN_FAILURES_SINCE_SUCCESS_SQL = """
+    WITH recent AS (
+        SELECT id, event
+        FROM login_events
+        WHERE username = :un
+          AND occurred_at >= now() - make_interval(mins => :mins)
+    ), last_ok AS (
+        SELECT coalesce(max(id), -1) AS last_success_id
+        FROM recent WHERE event = 'success'
+    )
+    SELECT count(*) FILTER (
+               WHERE event = 'failure' AND id > (SELECT last_success_id FROM last_ok)
+           ) AS failures_since_success
+    FROM recent
+"""
+
+
+def record_login_failure(username, user_id) -> bool:
+    """原子登记一次失败，并返回「登记之后是否已达限流阈值」。
+
+    为什么必须原子：若先 count 再 insert（两条连接），N 个并发请求会同时看到 4 次失败
+    而全部放行 —— 单窗口实际尝试次数会变成 5 + 并发度。这里用
+    `pg_advisory_xact_lock(hashtext(username))` 把同一用户名的「插入 + 计数」串行化，
+    锁随事务结束自动释放（xact 级），不会泄漏到连接池里的后续会话。
+
+    表未建 / 库异常 → 返回 False（fail-open），与 login_is_throttled 一致。
+    """
+    un = (username or "").strip()
+    if not un:
+        return False
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(:un))"), {"un": un})
+            conn.execute(
+                text("INSERT INTO login_events (user_id, username, event) VALUES (:uid, :un, 'failure')"),
+                {"uid": user_id, "un": un},
+            )
+            row = conn.execute(
+                text(_LOGIN_FAILURES_SINCE_SUCCESS_SQL),
+                {"un": un, "mins": LOGIN_WINDOW_MINUTES},
+            ).fetchone()
+        return int(row[0] or 0) >= LOGIN_MAX_FAILURES
+    except ProgrammingError as exc:
+        if _is_undefined_table(exc):
+            _warn_login_table_once(
+                "[db] 登录失败事件未记录：migrations/009_login_events.sql 尚未执行"
+                "（login_events 表不存在）。按“不限流”处理。",
+                exc,
+            )
+            return False
+        logging.getLogger(__name__).warning("[db] 登记登录失败事件失败", exc_info=True)
+        return False
+    except (SQLAlchemyError, OSError):
+        logging.getLogger(__name__).warning("[db] 登记登录失败事件失败（库不可用）", exc_info=True)
+        return False
+
+
+def login_is_throttled(username) -> bool:
+    """最近 LOGIN_WINDOW_MINUTES 分钟内「最后一次成功登录之后」的失败数是否已达上限。
+
+    表未建 / 库不可用时一律返回 False（fail-open）：限流是防滥用，
+    不该因为一张统计表没建就把所有用户挡在门外。
+    """
+    un = (username or "").strip()
+    if not un:
+        return False
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(_LOGIN_FAILURES_SINCE_SUCCESS_SQL),
+                {"un": un, "mins": LOGIN_WINDOW_MINUTES},
+            ).fetchone()
+    except ProgrammingError as exc:
+        if _is_undefined_table(exc):
+            _warn_login_table_once(
+                "[db] 登录限流未生效：migrations/009_login_events.sql 尚未执行"
+                "（login_events 表不存在）。按“不限制”处理。",
+                exc,
+            )
+            return False
+        logging.getLogger(__name__).warning("[db] 登录限流查询失败", exc_info=True)
+        return False
+    except (SQLAlchemyError, OSError):
+        logging.getLogger(__name__).warning("[db] 登录限流查询失败（库不可用）", exc_info=True)
+        return False
+
+    # 只统计「最后一次成功登录之后」的失败：成功一次就重新计数，
+    # 否则用户被自己历史上的失败长期拖累，限流会变成账号锁定。
+    return int(row[0] or 0) >= LOGIN_MAX_FAILURES
+
+
+def login_events_available() -> bool:
+    """login_events 表是否存在（009 是否执行）。管理面板据此显式提示「限流/趋势未启用」。"""
+    global engine
+    try:
+        with engine.connect() as conn:
+            return conn.execute(text("SELECT to_regclass('public.login_events') IS NOT NULL")).scalar() is True
+    except (SQLAlchemyError, OSError):
+        return False
+
+
 def verify_user(username, password):
     """校验登录。password 是**明文**；通过返回 user id，否则 None。
 
@@ -555,8 +727,22 @@ def verify_user(username, password):
       失败也不影响登录（见 _touch_last_login）。
     - 本函数里没有任何把 Python 时间写进 last_login 的路径：时间一律由数据库的 now()
       （timestamptz）产生，写入 TIMESTAMPTZ 列免换算。
+    - **限流**：进入本函数先查 login_is_throttled()，命中抛 LoginThrottled（app.py 展示中文文案）。
+      放在 bcrypt 之前，命中时不再消耗一次慢哈希。
+    - **登录事件**：成功/失败都写一条 login_events（用户名不存在也记 failure，避免用限流状态
+      反推账号是否存在）。009 未执行时埋点静默降级、限流不生效，登录照常。
     """
     global engine, _TIMING_DUMMY_HASH
+    username = (username or "").strip()
+    # 库里不可能有 >50 的用户名（users.username 是 VARCHAR(50)）：提前拒绝，
+    # 既省一次查询，也避免把超长串写进 login_events（否则「超长名」会被截断后记到别人名下）。
+    if not username or len(username) > 50:
+        return None
+    # 限流放在 bcrypt 之前：命中时直接拒绝，省掉一次 200~300ms 的慢哈希
+    # （也顺带削弱暴力尝试的成本优势）。命中时抛 LoginThrottled，由 app.py 给中文提示。
+    if login_is_throttled(username):
+        raise LoginThrottled(f"登录尝试过于频繁，请 {LOGIN_WINDOW_MINUTES} 分钟后再试")
+
     stmt = text("SELECT id, password_hash FROM users WHERE username = :un")
     with engine.connect() as conn:
         row = conn.execute(stmt, {"un": username}).fetchone()
@@ -564,11 +750,17 @@ def verify_user(username, password):
         if _TIMING_DUMMY_HASH is None:
             _TIMING_DUMMY_HASH = hash_password("timing-dummy-not-a-real-credential")
         verify_password(password, _TIMING_DUMMY_HASH)
+        # 不存在的用户名也记失败：否则攻击者可以用「有没有被限流」反推账号是否存在。
+        # 失败事件走原子登记（插入 + 计数在同一个事务里，串行化同一用户名的并发尝试）。
+        record_login_failure(username, None)
         return None
     if not verify_password(password, row[1]):
+        record_login_failure(username, row[0])
         return None
     user_id = row[0]
-    _touch_last_login(user_id)  # 内部吞异常：写失败也不影响登录
+    # 成功登录：埋点 + 写 last_login（两者都内部吞异常，不影响本次登录）
+    record_login_event(username, user_id, LOGIN_EVENT_SUCCESS)
+    _touch_last_login(user_id)
     return user_id
 
 def add_bill(user_id, date, merchant, amount, payment_method, type):
@@ -1141,6 +1333,66 @@ def get_admin_operate_data():
     return _admin_chart_frame(reg_df), _admin_chart_frame(active_df), int(sponsor_count)
 
 
+def get_login_daily_stats(days=ADMIN_CHART_DAYS):
+    """最近 N 个 UTC 自然日的**每日登录用户数**（distinct user_id），来自 login_events。
+
+    与「近 7 天登录用户」的口径区别：后者是滚动 168 小时的去重总数（回答"有多少人回来过"），
+    这里按 UTC 自然日分桶画趋势（回答"每天有多少人登录"）。
+    去重键用 COALESCE(user_id, username)：009 的外键是 ON DELETE SET NULL，
+    删号后历史事件仍在（不会让过去的趋势柱凭空回缩）。
+    009 未执行（表不存在）时返回带列名的空 DataFrame，页面不会红屏。
+    """
+    global engine
+    today_utc = datetime.now(timezone.utc).date()
+    start_dt = datetime(
+        today_utc.year, today_utc.month, today_utc.day, tzinfo=timezone.utc
+    ) - timedelta(days=days - 1)
+    end_dt = datetime(
+        today_utc.year, today_utc.month, today_utc.day, tzinfo=timezone.utc
+    ) + timedelta(days=1)
+    try:
+        with engine.connect() as conn:
+            # 先探测表是否存在：pd.read_sql 会把 DBAPI 异常包成 pandas.errors.DatabaseError，
+            # 不是 SQLAlchemy 的 ProgrammingError —— 直接查会漏掉 except ProgrammingError，
+            # 让「009 没执行」变成整块面板降级。这里先探测，缺表就干净地返回空 DataFrame。
+            if conn.execute(text("SELECT to_regclass('public.login_events')")).scalar() is None:
+                _warn_login_table_once(
+                    "[db] 登录趋势不可用：migrations/009_login_events.sql 尚未执行"
+                    "（login_events 表不存在）。管理面板按空数据显示。"
+                )
+                return _admin_chart_frame(pd.DataFrame())
+            df = pd.read_sql(
+                text("""
+                    SELECT (occurred_at AT TIME ZONE 'UTC')::date AS date,
+                           COUNT(DISTINCT COALESCE(user_id::text, 'name:' || coalesce(username, ''))) AS count
+                    FROM login_events
+                    WHERE event = 'success'
+                      AND occurred_at >= :start
+                      AND occurred_at < :end
+                    GROUP BY 1
+                    ORDER BY 1
+                """),
+                conn,
+                params={"start": start_dt, "end": end_dt},
+            )
+    except ProgrammingError as exc:
+        if _is_undefined_table(exc):
+            _warn_login_table_once(
+                "[db] 登录趋势不可用：migrations/009_login_events.sql 尚未执行"
+                "（login_events 表不存在）。管理面板按空数据显示。",
+                exc,
+            )
+            return _admin_chart_frame(pd.DataFrame())
+        logging.getLogger(__name__).error("[db] 登录趋势查询失败（非缺表）", exc_info=True)
+        return _admin_chart_frame(pd.DataFrame())
+    except (SQLAlchemyError, OSError, ValueError) as exc:
+        # pd.read_sql 会把 DBAPI 异常包成 pandas.errors.DatabaseError（不是 SQLAlchemyError），
+        # 它在 pandas 里继承自 ValueError，所以这里一并覆盖；用 error 级别，便于和"真的没数据"区分。
+        logging.getLogger(__name__).error("[db] 登录趋势查询异常，按空数据处理", exc_info=True)
+        return _admin_chart_frame(pd.DataFrame())
+    return _admin_chart_frame(df)
+
+
 def get_admin_funnel_data():
     global engine
     with engine.connect() as conn:
@@ -1195,9 +1447,14 @@ def register_user(username, password):
             result = conn.execute(stmt, {"username": username, "password_hash": ph})
             row = result.fetchone()
             conn.commit()
-            return row[0] if row else None
+            new_id = row[0] if row else None
         except IntegrityError as exc:
             conn.rollback()
             if _is_duplicate_username_error(exc):
                 raise ValueError(DUPLICATE_USERNAME_MESSAGE) from exc
             raise
+    # 注册成功 = 一次登录（last_login 已在 INSERT 里写了 now()），登录事件也补一条，
+    # 否则「每日登录用户」曲线会把新注册用户漏掉。埋点失败不影响注册。
+    if new_id:
+        record_login_event(username, new_id, LOGIN_EVENT_SUCCESS)
+    return new_id

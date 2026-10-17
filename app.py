@@ -3,7 +3,7 @@ import pandas as pd
 from streamlit_echarts import st_echarts
 from datetime import datetime, date, timedelta
 from config import get_deepseek_api_key
-from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, get_user_auth_state, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data
+from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, get_user_auth_state, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data, get_login_daily_stats, login_events_available, LoginThrottled
 import requests
 import json
 import hashlib
@@ -92,6 +92,9 @@ if st.session_state.user_id is None:
             else:
                 try:
                     uid = verify_user(login_name, password)
+                except LoginThrottled as exc:
+                    # 业务状态（失败次数过多），不是程序故障：直接把中文文案给用户
+                    st.error(str(exc))
                 except Exception as exc:
                     # 数据库连不上等程序性错误：详情只写服务端日志，页面给通用文案
                     # （异常里可能带 host/port/SQL/参数，绝不能出现在未认证页面）
@@ -184,6 +187,11 @@ def load_admin_funnel_data_cached():
     return get_admin_funnel_data()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def load_admin_login_stats_cached():
+    return get_login_daily_stats()
+
+
 # ========== 管理员面板 ==========
 if st.session_state.is_admin:
     st.header("管理员面板")
@@ -215,6 +223,19 @@ if st.session_state.is_admin:
             "tooltip": {"trigger": "axis"}
         }
         st_echarts(active_option, height=300)
+
+        st.subheader("近 7 个自然日每日登录用户")
+        if not login_events_available():
+            st.warning("登录事件表未建（请执行 migrations/009_login_events.sql）：登录限流与登录趋势当前不可用。")
+        login_7df = load_admin_login_stats_cached()
+        login_option = {
+            "xAxis": {"type": "category", "data": login_7df["date"].tolist()},
+            "yAxis": {"type": "value"},
+            "series": [{"type": "line", "data": login_7df["count"].tolist()}],
+            "tooltip": {"trigger": "axis"}
+        }
+        st_echarts(login_option, height=300)
+        st.caption("登录趋势来自 login_events（009 执行后开始记录）；日期按 UTC 自然日分桶（北京时间 08:00 换日）；009 执行前该图为空属正常。")
         st.divider()
 
         st.subheader("用户漏斗分析")
