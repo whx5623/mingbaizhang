@@ -1,19 +1,20 @@
 # requirements.txt
-streamlit
-pandas
-requests
-plotly
+# 全部直接依赖锁定到本地实测版本：迁移/校验逻辑依赖具体行为（bcrypt 超长密码抛错、
+# pandas dtype 策略、streamlit 的 st.rerun 语义），不锁版本会让"本地通过、云端不同"。
+streamlit==1.65.0
+pandas==3.0.6
+requests==2.34.2
+plotly==7.1.0
 # psycopg2-binary：db.py 的 register_user / create_user 靠 exc.orig.diag.constraint_name
 # 区分“用户名重复（users_username_key）”和别的 IntegrityError —— 约束名是唯一
-# 可靠的判据（错误文本会随 PG 版本/语言变化）。这条能力来自 psycopg2 的 diag 接口，
-# 版本本次不动。
-psycopg2-binary
-sqlalchemy
+# 可靠的判据（错误文本会随 PG 版本/语言变化）。这条能力来自 psycopg2 的 diag 接口。
+psycopg2-binary==2.9.13
+sqlalchemy==2.1.4
 # bcrypt 必须锁版本：fail-closed 的口径依赖它的具体行为，不能随环境漂移。
 # · 5.0.0 对 >72 字节的密码输入**直接抛 ValueError**（旧版是静默截断到 72 字节），
 #   db.py::hash_password / verify_password 和 migrations/004 的策略就是按这个行为设计的；
 # · 不锁版本 → “超长密码到底报错还是截断”会随机器/时间改变，
 #   生产与本地判定不一致，004 的“>72 字节硬拦截”也会失去可复现性。
 bcrypt==5.0.0
-streamlit-echarts
-supabase
+streamlit-echarts==0.7.0
+supabase==2.32.0

@@ -9,11 +9,37 @@ from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from datetime import datetime, date, timedelta, timezone
 
 engine = None
+_initialized = False
 
 def init_db():
-    global engine
+    """懒加载：engine 只建一次、建表 DDL 只跑一次。
+
+    app.py 每次 Streamlit rerun 都会调用 init_db()；若每次都 create_engine，
+    等于每次重建连接池 —— 既浪费，也让 pool_pre_ping（应对 pooler 回收空闲连接）
+    彻底落空（跨 rerun 根本没有可复用的池）。
+    """
+    global engine, _initialized
+    if _initialized:
+        return
     from config import DATABASE_URL
-    engine = create_engine(DATABASE_URL)
+    # hide_parameters=True：SQLAlchemy 默认会把**绑定参数的值**拼进 StatementError /
+    # 引擎日志里，而本文件多处 log.exception(..., exc_info=True)；users 相关语句里带着
+    # password_hash（bcrypt 哈希）和注册/改密时的明文参数 —— 默认配置下会随异常进日志。
+    # 这个开关只改"异常与日志的渲染"，不影响 SQL 执行、参数绑定和结果。
+    # （注意：它挡不住 PG 服务端报错文本里自带的键值，如 Key (username)=(alice)，属缓解非彻底脱敏。）
+    # pool_pre_ping=True：Supabase pooler（6543 / transaction 模式）会回收空闲连接，
+    # 池里可能躺着已断开的连接；取用前先探活（SELECT 1），失效就丢弃换新，
+    # 避免用户偶发拿到一条死连接、直接吃到 OperationalError。
+    # connect_args options：把**每条连接**的会话时区钉成 UTC。
+    #   为什么必须钉：created_at 在 008 执行前还是 naive timestamp，此时 tz-aware 参数
+    #   与 naive 列比较会按**会话时区**解释列；若不钉死，"库/角色恰好是 UTC"就成了正确性前提。
+    #   钉死之后，无论 pooler 把连接交到哪个后端、库默认时区是什么，应用侧口径都稳定。
+    engine = create_engine(
+        DATABASE_URL,
+        hide_parameters=True,
+        pool_pre_ping=True,
+        connect_args={"options": "-c timezone=UTC"},
+    )
     with engine.connect() as conn:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS users (
@@ -21,7 +47,15 @@ def init_db():
                 username VARCHAR(50) UNIQUE NOT NULL,
                 password_hash VARCHAR(255) NOT NULL,
                 credits INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                -- 必须与 migrations/008_users_created_at_tz.sql 逐字同口径：
+                -- timestamptz 存**绝对时刻**；naive TIMESTAMP 存的是"没有时区的墙上时间"，
+                -- 含义取决于读写时会话的 TimeZone，时区一变历史值整体平移。
+                -- ⚠ 这条 CREATE TABLE 只对**新库**生效：CREATE TABLE IF NOT EXISTS
+                --   对已存在的表什么都不做；老库把列改成 timestamptz 必须执行 008
+                --   （008 幂等、可回滚，且转换前后逐值相等）。
+                --   NOT NULL 同理只约束新库；老库历史列仍是 nullable（现网 12 行全部非 NULL，
+                --   没有需要补数据的行）。
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 -- 必须是 TIMESTAMPTZ，与 migrations/005_last_login.sql 逐字同口径。
                 -- naive TIMESTAMP 存的是“没有时区的墙上时间”，含义取决于读写时会话的 TimeZone，
                 -- 时区一变历史值整体平移；timestamptz 存绝对时刻，跨环境稳定。
@@ -60,6 +94,7 @@ def init_db():
             );
         """))
         conn.commit()
+    _initialized = True
 
 # ---------------------------------------------------------------------------
 # 账单类型归一化
@@ -995,19 +1030,23 @@ def get_admin_operate_data():
       要改口径就两处一起改、并同步这两段 docstring；**不要**只把这里的 ADMIN_CHART_DAYS
       调成 7 之外的数去"凑"漏斗的数字 —— 那会让"过去 7 天"的标题和实际柱数对不上。
 
-    为什么参数是 Python 的 **naive UTC datetime**（实测过，见下）：
-      · users.created_at 是 naive timestamp（存的是 UTC 墙钟，见 init_db 的建表语句），
-        用 naive datetime 去比较就是"同一把尺子"，不需要任何时区换算；
-      · 传 tz-aware datetime 反而引入隐患：timestamp(无时区) 列与 timestamptz 值比较时，
-        库会按**会话 TimeZone** 把列解释成绝对时刻，结果就随会话时区漂移；
-        而本库会话 TimeZone=UTC（SHOW TimeZone 核实过），所以两种写法在**这里**结果相同 ——
-        但只有 naive 边界值的含义是固定的，因此选 naive。
+    为什么边界是 **tz-aware UTC datetime**、分桶要 `(created_at AT TIME ZONE 'UTC')::date`：
+      · users.created_at 现在是 **timestamptz**（migrations/008）：列里存的是绝对时刻，
+        读出来按会话时区渲染。既然列是绝对时刻，参数也必须给绝对时刻 ——
+        用 `datetime(..., tzinfo=timezone.utc)` 构造边界，比较的是两个瞬间的先后，
+        与应用机时区（本机 UTC+8）、库的会话 TimeZone 都无关；
+      · 分桶 `(created_at AT TIME ZONE 'UTC')::date`：先把 timestamptz 折回 UTC 墙钟
+        （得到 naive），再截成日期。**这一步不经过会话 TimeZone**，所以同一行在
+        UTC+8 / UTC-5 的会话里永远落进同一个 UTC 自然日；
       · "今天"必须取**UTC 的今天**：`datetime.now(timezone.utc).date()`。
         不能用本机的 `date.today()`：本机是 UTC+8，UTC 16:00 之后本机已经是"明天"，
-        窗口会整体错一天，而库里所有时间都是 UTC。
-      · 左闭右开 `>= :start AND < :end`，不是 BETWEEN：BETWEEN 对 timestamp 是闭区间，
-        会把"明天 00:00:00.000"那一瞬间也算进今天；右开区间让边界成为常量，
-        也保留 created_at 上索引的可用性（函数不包列）。
+        窗口会整体错一天，而库里所有时间都是 UTC；
+      · 左闭右开 `>= :start AND < :end`，不是 BETWEEN：右开让"明天 00:00:00.000"那一瞬间
+        落进下一天；边界是常量、函数不包列 —— 说明：users.created_at 上**目前没有索引**
+        （users 只有 pkey / username unique / idx_users_last_login），现在是顺序扫描；
+        这样写是为了将来真给它建普通 B-tree 时也能直接用上，不需要表达式索引；
+      · 窗口仍是**含今天在内共 ADMIN_CHART_DAYS(7) 个 UTC 自然日**：
+            [今天(UTC) 00:00 - 6 天, 明天(UTC) 00:00)
 
     为什么活跃数用**字符串比较**而不是 DATE(date)：
       bills.date 是 VARCHAR/TEXT（'YYYY-MM-DD'，由 app.py 的 `date.strftime('%Y-%m-%d')`
@@ -1038,38 +1077,44 @@ def get_admin_operate_data():
       以后若要导非 ISO 数据，请在导入时归一，或给 date 列加 CHECK 约束 ——
       **不要**指望这条查询替你报警。（给写入侧补格式校验是另一件事，不在本条注释范围内。）
 
-    注册数为什么是 `created_at::date`（**不是** `(created_at AT TIME ZONE 'UTC')::date`）：
-      created_at 是 naive timestamp（存的是 UTC 墙钟），`created_at::date` 是**naive 截断**：
-      直接砍掉时分秒，**与会话 TimeZone 无关**，和 WHERE 里的 naive 边界（:start / :end）
-      用的是同一把尺子 —— 筛选与分桶同源，两者不可能互相错位。
-      反过来看 `(created_at AT TIME ZONE 'UTC')::date`：它先把 naive 值贴 UTC 标签变成
-      timestamptz，再 timestamptz→date；**后一步会按会话 TimeZone 折日**。
-      于是同一句 SQL 里 WHERE 与会话时区无关、分桶却与会话时区有关：会话时区非 UTC 时
-      （例如 TimeZone='Asia/Shanghai'），"进不进窗口"和"落到哪一天"用了两个不同的基准，
-      边界附近的行会被分到错的日期、甚至落到窗口外同一天的两个桶里 → 图上偏一天。
-      所以这里必须是 `created_at::date`：把两边都钉死在 naive UTC 上。
-      （实测：会话 TimeZone=UTC 时两种写法结果完全相同 —— 但那只是因为 UTC 恰好是
-      "贴标签"与"折日"的同一个时区，**不是**等价写法，别改回去。）
+    注册数为什么按 UTC 折日（`(created_at AT TIME ZONE 'UTC')::date`），而不是 `created_at::date`：
+      · 对 timestamptz 直接用 `created_at::date` 是 **timestamptz→date**，那一步按
+        **会话 TimeZone** 折日 —— 同一个时刻在 UTC+8 会话里可能已经算"明天"，
+        图上的日期桶会随环境漂移；
+      · 先 `AT TIME ZONE 'UTC'` 把绝对时刻折回 UTC 墙钟（naive），再 `::date` 是
+        naive 截断（与会话时区无关）。它与 WHERE 里的 tz-aware UTC 边界是**同一个基准**，
+        筛选与分桶同源，边界附近的行不会偏一天；
+      · 这也依赖 migrations/008：老库的列还是 naive timestamp。**过渡态要求会话时区是 UTC**
+        —— 这一点已由 init_db 的 `connect_args={"options": "-c timezone=UTC"}` 在应用侧钉死，
+        不再依赖"库 / 角色恰好是 UTC"；008 执行后则连推理都不需要，列本身就是绝对时刻。
     """
     global engine
     today_utc = datetime.now(timezone.utc).date()
-    # 窗口边界：naive UTC 的 "今天-N 天零点" 与 "明天零点"
-    start_dt = datetime(today_utc.year, today_utc.month, today_utc.day) - timedelta(
-        days=ADMIN_CHART_DAYS - 1
-    )
-    end_dt = datetime(today_utc.year, today_utc.month, today_utc.day) + timedelta(days=1)
+    # 窗口边界：**tz-aware UTC** 的「今天-N 天零点」与「明天零点」。
+    # 显式带 tzinfo=timezone.utc：users.created_at 是 timestamptz（绝对时刻），
+    # 参数也必须是绝对时刻 —— 比较的是两个瞬间，与应用机时区、会话 TimeZone 无关。
+    # 不要写 datetime(...)（naive）：naive 参数和 timestamptz 列比较时会按会话时区
+    # 解释，窗口就随环境漂移了（本库会话 TimeZone=UTC 只是恰好对）。
+    start_dt = datetime(
+        today_utc.year, today_utc.month, today_utc.day, tzinfo=timezone.utc
+    ) - timedelta(days=ADMIN_CHART_DAYS - 1)
+    end_dt = datetime(
+        today_utc.year, today_utc.month, today_utc.day, tzinfo=timezone.utc
+    ) + timedelta(days=1)
     # 活跃图用字符串边界：ISO 'YYYY-MM-DD' 字典序 == 日期序，避免对 VARCHAR 列做 cast
     start_text = start_dt.strftime("%Y-%m-%d")
     end_text = end_dt.strftime("%Y-%m-%d")
 
     with engine.connect() as conn:
-        # 注册数：按 UTC 自然日分桶。WHERE 用常量边界（不包函数），保留 created_at 索引可用性；
-        # 分桶用 created_at::date（**naive 截断，与会话时区无关**），与 WHERE 的 naive 边界同源；
-        # 不要写成 (created_at AT TIME ZONE 'UTC')::date —— 那一步 timestamptz→date 会按会话
-        # TimeZone 折日，会话时区非 UTC 时 WHERE 与分桶基准不一致，边界附近的行会偏一天。
-        # GROUP BY 1 / ORDER BY 1 直接引用 SELECT 的第一个表达式，避免重复写一遍转日期表达式。
+        # 注册数：按 **UTC 自然日**分桶。
+        # · WHERE 用 tz-aware UTC 常量边界（函数不包列）——users.created_at 目前**没有索引**
+        #   （只有 pkey/username unique/idx_users_last_login），现在就是顺序扫描；
+        #   这样写只是为将来建普通 B-tree 时不至于用不上；
+        # · 分桶先 `AT TIME ZONE 'UTC'` 折回 UTC 墙钟、再 `::date` 截断，与会话时区无关，
+        #   与 WHERE 是同一个基准（这是本轮的核心口径，别改回 created_at::date）；
+        # · GROUP BY 1 / ORDER BY 1 直接引用 SELECT 的第一个表达式，避免重复写转日期表达式。
         reg_sql = text("""
-            SELECT created_at::date AS date, COUNT(*) AS count
+            SELECT (created_at AT TIME ZONE 'UTC')::date AS date, COUNT(*) AS count
             FROM users
             WHERE created_at >= :start AND created_at < :end
             GROUP BY 1

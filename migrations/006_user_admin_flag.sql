@@ -1,5 +1,6 @@
 -- =============================================================================
 -- 006_user_admin_flag.sql
+-- 注：2026-10-17 仅更新注释（函数改名），SQL 未改动，本脚本已于生产执行。
 -- 项目：明白账（Streamlit + pandas + SQLAlchemy + PostgreSQL/Supabase）
 --
 -- 【用途】
@@ -15,7 +16,7 @@
 --       也就没人去核对它里面那些只在"面板可达"时才会暴露的问题
 --       （重复定义、DATE() 包列、date 对象直接塞给 echarts）。
 --   本脚本负责"定义管理员"这一半；另一半在 db.py（同一次发布的代码）：
---     · 新增 is_user_admin(user_id) -> bool  鉴权查询的唯一入口（默认无权限）；
+--     · 新增 get_user_auth_state(user_id) -> (存在, 是否管理员)  鉴权查询的唯一入口（默认无权限）；
 --     · 修 get_admin_operate_data()          删掉重复定义（后者覆盖前者、返回 3 个 int，
 --                                            而 app.py 按 DataFrame 用 ["count"] → TypeError）
 --                                            并把 SQL 改成可索引、不依赖逐行 cast 的写法。
@@ -72,7 +73,7 @@
 --     看到那个 username 且只有它，才算设置成功；空的就说明没生效，回去查库/schema/拼写。
 --
 --   ⚠ 不要把 password_hash 之类带进任何巡检/导出的 SELECT —— 管理名单只需要 username。
---   ⚠ 撤销之后什么时候生效，取决于 app.py：它每次 rerun 都会重新问一次 is_user_admin
+--   ⚠ 撤销之后什么时候生效，取决于 app.py：它每次 rerun 都会重新问一次 get_user_auth_state
 --     （db.py 这一侧不缓存任何管理员身份）；所以撤销对"下一次交互/刷新"生效，
 --     而不是立刻掐断一个正在浏览的会话。要立刻踢人，请让对方重新登录。
 --
@@ -111,8 +112,8 @@
 --   因此：加列必须由人执行本文件。
 --
 -- 【没执行时的行为 —— 优雅降级，不是红屏】
---   db.py 的 is_user_admin() 捕获 ProgrammingError（列不存在），记一条 warning
---   （"is_admin 列不存在，请先执行 migrations/006_user_admin_flag.sql"）并返回 False：
+--   db.py 的 get_user_auth_state() 捕获 ProgrammingError（列不存在），记一条 warning
+--   （"is_admin 列不存在，请先执行 migrations/006_user_admin_flag.sql"）并返回 (存在, False)：
 --     · 页面不会报错、不会红屏；管理面板对所有人不可见（等价于"没有管理员"）；
 --     · 普通记账/统计功能完全不受影响（它们不引用 is_admin）。
 --   这是刻意的取舍：鉴权失败只能落成"无权限"，绝不能落成"有权限"。
@@ -164,7 +165,7 @@
 -- =============================================================================
 --   ALTER TABLE public.users DROP COLUMN IF EXISTS is_admin;
 --   （自动提交即可；会连带丢掉已经指定的管理员名单 —— 回滚前先想清楚要不要留名单。）
---   DROP 之后 db.py 的 is_user_admin() 会走 ProgrammingError 分支返回 False（管理面板隐藏），
+--   DROP 之后 db.py 的 get_user_auth_state() 会走 ProgrammingError 分支返回 (存在, False)（管理面板隐藏），
 --   不需要同步改代码，也不会红屏。
 -- =============================================================================
 
