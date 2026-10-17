@@ -79,32 +79,71 @@ def logout():
 # ========== 未登录分支 ==========
 if st.session_state.user_id is None:
     st.title("明白账 - 登录 / 注册")
-    username = st.text_input("用户名")
-    password = st.text_input("密码", type="password")
+    # 用户名：库里是 VARCHAR(50)，前端先卡住长度，避免提交后被数据库截断/报错
+    username = st.text_input("用户名", max_chars=50, placeholder="3-50 个字符")
+    # 密码：长度规则与 db 层 bcrypt 的硬限制保持一致（8 位起，UTF-8 72 字节封顶）
+    password = st.text_input("密码", type="password", help="至少 8 位；最长 72 字节（约 24 个汉字）")
     col1, col2 = st.columns(2)
     with col1:
         if st.button("登录"):
-            uid = verify_user(username, password)
-            if uid:
-                st.session_state.user_id = uid
-                st.rerun()
-            else:
-                st.error("用户名或密码错误")
-    with col2:
-        if st.button("注册"):
-            if not username or not password:
-                st.warning("用户名和密码不能为空")
+            login_name = (username or "").strip()  # 入库时不含首尾空格，登录也要对齐
+            if not login_name or not password:
+                st.warning("请输入用户名和密码")
             else:
                 try:
-                    new_uid = register_user(username, password)
+                    uid = verify_user(login_name, password)
+                except Exception as exc:
+                    # 数据库连不上等程序性错误：详情只写服务端日志，页面给通用文案
+                    # （异常里可能带 host/port/SQL/参数，绝不能出现在未认证页面）
+                    print(f"[login] 登录异常：{type(exc).__name__}: {exc}")
+                    st.error("登录失败：服务暂时不可用，请稍后再试")
+                else:
+                    if uid:
+                        st.session_state.user_id = uid
+                        st.rerun()
+                    else:
+                        # “用户不存在”和“密码错误”共用一句提示，避免用户名枚举
+                        st.error("用户名或密码错误")
+    with col2:
+        if st.button("注册"):
+            # 全部校验都在调用 db 之前完成：任何一条不过就绝不写库
+            reg_name = (username or "").strip()
+            # 密码的 UTF-8 字节数提前安全计算：孤立代理字符（如 "\ud800"）会让 encode 抛
+            # UnicodeEncodeError，若在按钮回调里没兜住就是整页红屏 traceback
+            try:
+                pw_bytes = len(password.encode("utf-8"))
+            except UnicodeEncodeError:
+                pw_bytes = None
+            if not reg_name:
+                st.warning("用户名不能为空")
+            elif len(reg_name) > 50:
+                st.warning("用户名不能超过 50 个字符")
+            elif not password:
+                st.warning("密码不能为空")
+            elif len(password) < 8:
+                st.warning("密码至少 8 位")
+            elif pw_bytes is None:
+                st.warning("密码包含无法处理的字符，请换一个")
+            elif pw_bytes > 72:
+                st.warning("密码过长：最长 72 字节（约 24 个汉字）")
+            else:
+                try:
+                    new_uid = register_user(reg_name, password)
                     if new_uid:
+                        # 成功提示走 flash：紧跟 rerun 的 st.success 会被吞掉
+                        # 文案固定，不拼接用户名：flash 用 markdown 渲染，用户名可控会变成 [点我](http://evil)
+                        st.session_state["flash"] = {"level": "success", "msg": "注册成功，已自动登录"}
                         st.session_state.user_id = new_uid
-                        st.success("注册成功，已自动登录")
                         st.rerun()
                     else:
                         st.error("注册失败，未获取用户ID")
+                except ValueError as e:
+                    # 数据层主动抛的中文业务错误（密码不合规 / 用户名已被占用），可以直接展示
+                    st.error(str(e))
                 except Exception as e:
-                    st.error(f"注册失败：{str(e)}")
+                    # 其它异常可能含 SQL / 参数（如 bcrypt hash），只进服务端日志
+                    print(f"[register] 注册异常：{type(e).__name__}: {e}")
+                    st.error("注册失败：系统繁忙，请稍后再试")
     st.stop()
 
 # 校验用户有效性

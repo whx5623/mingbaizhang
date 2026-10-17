@@ -1,6 +1,8 @@
 from sqlalchemy import create_engine, text
 import pandas as pd
 import math
+import re
+import bcrypt
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from datetime import datetime, date, timedelta
 
@@ -190,22 +192,164 @@ def _normalize_amount_column(df):
     return df
 
 
-def create_user(username, password_hash):
-    global engine
-    with engine.connect() as conn:
-        stmt = text("INSERT INTO users (username, password_hash) VALUES (:un, :ph) RETURNING id;")
-        result = conn.execute(stmt, {"un": username, "ph": password_hash})
-        row = result.fetchone()
-        conn.commit()
-        return row[0] if row else None
+# ---------------------------------------------------------------------------
+# 密码哈希（bcrypt）
+# 历史问题：users.password_hash 里存的是**明文**，登录时用 SQL 做明文等值比较
+# （WHERE password_hash = :ph）。一次拖库 = 全量密码泄露，且用户往往跨站复用密码。
+# 现在：库里只存 bcrypt 哈希（$2b$12$ + 22 字符 salt + 31 字符 digest = 60 字符），
+# 明文只在内存里出现一瞬，比较改由 bcrypt.checkpw 做恒定时间的哈希比对。
+# ---------------------------------------------------------------------------
 
-def verify_user(username, password_hash):
+BCRYPT_ROUNDS = 12  # 2^12 次迭代；单次校验约 200~300ms，是“挡暴力破解”和“用户能忍”的折中
+
+# 密码最小长度：**下沉到 db 层**。app.py 的 UI 校验保留（它只是提前拦一次、给页面
+# 一句 warning），但真正的口径在这里 —— 任何绕过 UI 的调用路径（脚本、REPL、
+# 将来的 API、别的服务）都必须受同一条规则约束。
+MIN_PASSWORD_LEN = 8
+
+# 与 migrations/004_password_bcrypt.sql 里的 CHECK 约束保持**逐字同口径**：
+#     \$2[abxy]\$[0-9]{2}\$[./A-Za-z0-9]{53}
+# 前缀四种都认：pgcrypto 生成 $2a$、Python bcrypt 生成 $2b$、老系统有 $2y$、
+# pyca bcrypt 5.0.0 实测也能校验 $2x$；两位 cost + 53 个 [./A-Za-z0-9] 字符
+# （22 salt + 31 digest），合计恰好 60 字符。
+# 两个刻意的写法：
+#   ① 用 re.fullmatch 而不是 "^...$"：Python 的 "$" 允许串尾多出一个 "\n"
+#      （re.match(r"...$", h + "\n") 会命中），而 PostgreSQL 的 ~ 不会 ——
+#      同一个值在两边判定相反，会造成“库里合规、代码判非法”的幽灵账号。
+#   ② 字符类写 [0-9] 而不是 \d：SQL 侧没有 \d 的统一写法，两边必须承认同一组字符。
+_BCRYPT_PATTERN = re.compile(r"\$2[abxy]\$[0-9]{2}\$[./A-Za-z0-9]{53}")
+
+# verify_user 在“用户名不存在”分支上用来抹平时序差异的假哈希（惰性生成，仅存内存）。
+_TIMING_DUMMY_HASH = None
+
+
+def is_bcrypt_hash(value) -> bool:
+    r"""判断一个值是否已经是合法的 bcrypt 哈希字符串（用于迁移幂等 / fail-closed 判定）。
+
+    用 fullmatch：整串必须恰好 60 字符，**末尾多一个换行也算不合格**
+    （与 004 的 SQL 正则 `^\$2[abxy]\$[0-9]{2}\$[./A-Za-z0-9]{53}$` 同口径）。
+    """
+    if not isinstance(value, str):
+        return False
+    return bool(_BCRYPT_PATTERN.fullmatch(value))
+
+
+def hash_password(password: str) -> str:
+    """把明文密码哈希成 bcrypt 字符串（每次调用盐随机，同一密码结果不同）。
+
+    - password 必须是 str：库里历史数据是文本，传 bytes/int 一律拒绝，避免“看起来写了其实写错了”；
+    - 空串 / 纯空白 → ValueError：注册一个空密码等于把账号白送；
+    - 字符数 < MIN_PASSWORD_LEN(8) → ValueError：与 app.py 的提示同口径，但这里是**硬约束**，
+      绕过 UI 的调用路径同样拦得住；
+    - UTF-8 编码后 > 72 字节 → ValueError：这是 bcrypt 的**硬限制**（超出部分会被丢弃）。
+      绝不能静默截断 —— 用户以为设了长密码，实际只有前 72 字节生效，且后面的差异
+      会让 verify 莫名失败。中文 1 字 3 字节，72 字节约 24 个汉字。
+    - 超过 72 字节也不要“先 sha256 再 bcrypt”，那会引入新的兼容口径，本次不做。
+
+    检查顺序固定为：类型 → 判空 → 最小长度 → 字节上限。
+    （先判空再判长度：纯空白串给“密码不能为空”，比给“至少 8 位”更贴近用户实际做错的事。）
+    """
+    if not isinstance(password, str):
+        raise TypeError(f"密码必须是 str，收到 {type(password).__name__}")
+    if not password.strip():
+        raise ValueError("密码不能为空")
+    if len(password) < MIN_PASSWORD_LEN:
+        raise ValueError(f"密码至少 {MIN_PASSWORD_LEN} 位")
+    pw_bytes = password.encode("utf-8")
+    if len(pw_bytes) > 72:
+        raise ValueError("密码长度不能超过 72 字节（约 24 个汉字）")
+    return bcrypt.hashpw(pw_bytes, bcrypt.gensalt(rounds=BCRYPT_ROUNDS)).decode("utf-8")
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    """校验明文密码是否匹配库里的哈希。**失败一律返回 False，绝不抛异常给上层。**
+
+    关键取舍（fail closed）：stored_hash 不是 bcrypt 格式（例如迁移还没跑的遗留明文、
+    或者被写入的空串/NULL 占位）时，直接拒绝登录并打一条中文告警。
+    绝不能退化成“明文等值比较”兜底 —— 那样只要还有人没迁移，明文比对这条攻击面
+    就永远活着；宁可让老用户暂时登不上，由运维把它们跑完 004。
+    """
+    if not is_bcrypt_hash(stored_hash):
+        print("[db] 检测到非 bcrypt 密码，拒绝登录；请先执行 migrations/004_password_bcrypt.sql")
+        return False
+    try:
+        if not isinstance(password, str):
+            return False
+        return bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8"))
+    except Exception as exc:  # bcrypt 对超长/畸形输入会抛 ValueError，一律当“校验失败”
+        print(f"[db] 密码校验异常，按校验失败处理：{exc}")
+        return False
+
+
+_USERNAME_UNIQUE_CONSTRAINT = "users_username_key"
+DUPLICATE_USERNAME_MESSAGE = "该用户名已被占用，请换一个或直接登录"
+
+
+def _is_duplicate_username_error(exc) -> bool:
+    """判断一个 IntegrityError 是不是 users.username 唯一约束冲突。
+
+    判据优先用 **约束名**（psycopg2 的 exc.orig.diag.constraint_name）：错误文本会随
+    PostgreSQL 版本、区域语言变化（"duplicate key value violates unique constraint"），
+    拿文本当判据迟早会失效。拿不到 diag 时才退回文本里找约束名。
+    """
+    diag = getattr(getattr(exc, "orig", None), "diag", None)
+    name = getattr(diag, "constraint_name", None)
+    if name is not None:
+        return name == _USERNAME_UNIQUE_CONSTRAINT
+    return _USERNAME_UNIQUE_CONSTRAINT in str(getattr(exc, "orig", exc))
+
+
+def create_user(username, password):
+    """新建用户，返回新用户 id。
+
+    **password 必须是明文**：本函数内部调用 hash_password() 做 bcrypt 哈希后入库。
+    如果调用方传进来的已经是 bcrypt 哈希（$2a$/$2b$/$2y$/$2x$ 的 60 字符串），
+    直接 ValueError 拒绝 —— 否则会“对哈希再哈希一次”，用户从此永远登不上，
+    而且原密码不可恢复（库里只留下哈希的哈希）。
+
+    错误契约（与 register_user **完全一致**，两个入口不能有两套口径）：
+    - 密码类型/长度不合规、或传了已哈希的值 → ValueError，向上抛；
+    - 用户名已存在（users_username_key 冲突）→ ValueError(DUPLICATE_USERNAME_MESSAGE)；
+    - 其它 IntegrityError（外键、连接、权限等）→ 原样向上抛。
+      绝不一律吞成 None：那会把真故障伪装成“注册失败”，运维永远查不出原因。
+    """
     global engine
+    from sqlalchemy.exc import IntegrityError
+    if is_bcrypt_hash(password):
+        raise ValueError("请不要传入已哈希的值，create_user 只接受明文密码")
+    ph = hash_password(password)  # 明文不落库；ValueError/TypeError 直接向上抛
     with engine.connect() as conn:
-        stmt = text("SELECT id FROM users WHERE username = :un AND password_hash = :ph")
-        res = conn.execute(stmt, {"un": username, "ph": password_hash})
-        row = res.fetchone()
-        return row[0] if row else None
+        try:
+            stmt = text("INSERT INTO users (username, password_hash) VALUES (:un, :ph) RETURNING id;")
+            result = conn.execute(stmt, {"un": username, "ph": ph})
+            row = result.fetchone()
+            conn.commit()
+            return row[0] if row else None
+        except IntegrityError as exc:
+            conn.rollback()
+            if _is_duplicate_username_error(exc):
+                raise ValueError(DUPLICATE_USERNAME_MESSAGE) from exc
+            raise
+
+def verify_user(username, password):
+    """校验登录。password 是**明文**；通过返回 user id，否则 None。
+
+    - 只按 username 取 id + password_hash，**比较交给 bcrypt**（SQL 里不再出现密码）；
+    - “用户不存在”和“密码错误”都返回 None，由调用方给同一句提示，避免用户名枚举；
+    - 用户名不存在时也照样跑一次 bcrypt 校验（对一个惰性生成的假哈希），让两种失败分支
+      耗时接近，减少“响应快 = 用户不存在”的时序侧信道。假哈希只在本进程内存里，
+      不对应任何真实账号与密码。
+    """
+    global engine, _TIMING_DUMMY_HASH
+    stmt = text("SELECT id, password_hash FROM users WHERE username = :un")
+    with engine.connect() as conn:
+        row = conn.execute(stmt, {"un": username}).fetchone()
+    if row is None:
+        if _TIMING_DUMMY_HASH is None:
+            _TIMING_DUMMY_HASH = hash_password("timing-dummy-not-a-real-credential")
+        verify_password(password, _TIMING_DUMMY_HASH)
+        return None
+    return row[0] if verify_password(password, row[1]) else None
 
 def check_user_exists(user_id):
     global engine
@@ -463,19 +607,34 @@ def get_admin_funnel_data():
         ai_user_sql = text("SELECT COUNT(DISTINCT user_id) FROM chat_history")
         ai_user_count = conn.execute(ai_user_sql).scalar() or 0
     return total_reg, bill_user_count, login_7d_user, ai_user_count
-def register_user(username, password_hash):
+def register_user(username, password):
+    """注册用户。password 是**明文**，内部哈希后入库。
+
+    错误契约（app.py 依赖它；与 create_user 保持一致）：
+    - 用户名已存在 → ValueError("该用户名已被占用，请换一个或直接登录")。
+      **必须是 ValueError + 面向用户的中文文案**：app.py 的注册分支会
+      `except ValueError as e: st.error(str(e))` 把文案直接展示给用户；
+      其它异常则只进服务端日志、页面上给“系统繁忙”。
+    - 密码不合法（空/纯空白/少于 8 位/超过 72 字节）→ ValueError **向上抛**，
+      同样由 app.py 的 `except ValueError` 展示成一句可读的中文提示。
+    - 其它 IntegrityError（外键、权限、连接等）→ 原样上抛，由 app.py 的
+      `except Exception` 兜成通用提示 + 服务端日志。绝不吞成 None。
+    """
     global engine
     from sqlalchemy.exc import IntegrityError
+    ph = hash_password(password)  # 先校验再连库：不合法的密码连事务都不用开
     with engine.connect() as conn:
         try:
             stmt = text("INSERT INTO users (username, password_hash) VALUES (:username, :password_hash) RETURNING id;")
-            result = conn.execute(stmt, {"username": username, "password_hash": password_hash})
+            result = conn.execute(stmt, {"username": username, "password_hash": ph})
             row = result.fetchone()
             conn.commit()
             return row[0] if row else None
-        except IntegrityError:
+        except IntegrityError as exc:
             conn.rollback()
-            return None
+            if _is_duplicate_username_error(exc):
+                raise ValueError(DUPLICATE_USERNAME_MESSAGE) from exc
+            raise
 def get_admin_operate_data():
     global engine
     from sqlalchemy import text
