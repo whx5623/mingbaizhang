@@ -70,7 +70,8 @@ if "is_admin" not in st.session_state:
 def logout():
     st.session_state.user_id = None
     st.session_state.is_admin = False
-    st.session_state.pop("last_upload_sig", None)   # 换人登录后不能沿用上一个人的文件签名
+    st.session_state.pop("last_upload_sig", None)        # 换人登录后不能沿用上一个人的文件签名
+    st.session_state.pop("last_screenshot_sig", None)     # 截图签名同理：换人后同一张图应能重新识别
     st.session_state.pop("flash", None)             # 上一个人的提示（可能含商户名）不能带给下一个人
     st.session_state["page"] = 0
     st.session_state["chat_history"] = []           # 换人登录不应看到上一个人的 AI 聊天记录
@@ -571,6 +572,79 @@ if len(st.session_state.chat_history) == 0:
 
 for msg in st.session_state.chat_history:
     st.chat_message(msg["role"]).write(msg["content"])
+
+# 📸 截图记账：放在聊天输入框上方，聊天本身的逻辑不变
+screenshot_file = st.file_uploader(
+    "📸 上传账单截图，自动记账",
+    type=["png", "jpg", "jpeg"],
+    key=f"screenshot_uploader_{st.session_state.user_id}",
+)
+st.caption("支持 png/jpg，单张 ≤5MB；识别后会自动记一笔")
+if screenshot_file is not None:
+    # 防重复提交：file_uploader 的值跨 rerun 保留，成功后的 st.rerun() 会让同一张图
+    # 再跑一遍 → 重复记账。签名 = 用户ID + 图片内容哈希，同一张图只处理一次。
+    screenshot_bytes = screenshot_file.getvalue()
+    screenshot_sig = f"{st.session_state.user_id}:{hashlib.sha256(screenshot_bytes).hexdigest()}"
+    if st.session_state.get("last_screenshot_sig") == screenshot_sig:
+        st.info("这张截图已处理过；如需重新识别，请换一张或刷新页面")
+    elif screenshot_file.size > 5 * 1024 * 1024:
+        st.warning("图片超过 5MB，请压缩后再上传")
+    elif st.session_state.ai_daily_count >= 20:
+        # 截图识别也算一次 AI 调用：额度用完只提示，不调用、不计次
+        st.warning("今日免费额度已用完，请明天再来")
+    else:
+        try:
+            from ai_agent import BillImageError, extract_bill_from_image
+        except ImportError as exc:
+            # ai_agent 的识别函数未合入时优雅降级，避免整页红屏（细节只进服务端日志）
+            print(f"[screenshot] 截图识别模块不可用：{type(exc).__name__}: {exc}")
+            st.error("截图处理失败，请稍后再试")
+        else:
+            # 失败也计一次（避免反复上传刷额度）；但**不**落签名 —— 失败后允许用同一张图
+            # 直接重试（演示时网络抖动不应逼用户刷新页面）。签名只在成功入库后落位。
+            st.session_state.ai_daily_count += 1
+            try:
+                result = extract_bill_from_image(
+                    screenshot_bytes,
+                    screenshot_file.type or "image/png",
+                    ZHIPU_API_KEY,
+                )
+                add_bill(
+                    st.session_state.user_id,
+                    result["occurred_at"],
+                    result["merchant"],
+                    result["amount"],
+                    "截图识别",
+                    result["bill_type"],
+                )
+            except BillImageError as exc:
+                code = getattr(exc, "code", "")
+                if code == "not_bill":
+                    st.error("这张截图看起来不是账单，请换一张包含金额和商户的账单截图")
+                elif code == "blurry":
+                    st.error("图片太模糊，关键信息看不清，请上传更清晰的原图")
+                elif code == "ambiguous":
+                    st.error(str(exc))  # 后端给的已经是中文可操作提示
+                elif code == "no_api_key":
+                    st.error("未配置 ZHIPU_API_KEY，截图识别暂不可用")
+                else:
+                    # network / http / parse 及其它后端错误：细节只进服务端日志
+                    print(f"[screenshot] 截图识别失败（{code}）：{type(exc).__name__}: {exc}")
+                    st.error("识别服务暂时不可用，请稍后再试")
+            except Exception as exc:
+                print(f"[screenshot] 截图处理异常：{type(exc).__name__}: {exc}")
+                st.error("截图处理失败，请稍后再试")
+            else:
+                # 只有成功入库才落签名：同一张图后续 rerun 不会重复记账；
+                # 失败（网络/模糊/非账单…）不落签名，用户可以直接再点上传重试。
+                st.session_state["last_screenshot_sig"] = screenshot_sig
+                st.session_state["flash"] = {
+                    "level": "success",
+                    "msg": f"已识别您的截图，成功记入一笔{result['amount']:.2f}元{result['bill_type']}",
+                }
+                st.cache_data.clear()      # 让指标/图表/明细立刻反映新账单
+                st.session_state.page = 0  # 新账单按日期倒序，通常在第一页
+                st.rerun()
 
 user_input = st.chat_input("可以直接让我帮你记账，例如：今天喝奶茶花了15元")
 if user_input:

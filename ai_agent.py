@@ -1,9 +1,16 @@
 # ai_agent.py
-import requests
+import base64
 import json
+import logging
 import os
+import re
 import tomllib
+from datetime import datetime
+
+import requests
 from supabase import create_client, Client
+
+logger = logging.getLogger(__name__)
 
 
 def get_secret(key: str):
@@ -122,3 +129,429 @@ def get_ai_response(messages, api_key, zhipu_api_key, total_income, total_expens
     }
     resp = requests.post(url, headers=headers, json=payload, timeout=20)
     return resp
+
+
+# ============================================================================
+# 账单图片识别（智谱 GLM-4V 视觉模型，OpenAI 兼容接口）
+# ----------------------------------------------------------------------------
+# 设计约定：
+# · 所有“面向用户”的失败统一走 BillImageError(code, message)：
+#     - code    供页面做分支处理（not_bill / blurry / ambiguous / no_api_key /
+#               network / http / parse）；
+#     - message 是可直接渲染到页面的中文，必须带可操作建议；
+# · 绝不把 api key（或含 key 的响应体片段）写进异常 message / 日志；
+# · 日期解析失败**绝不**静默回退成“今天”，一律 ambiguous 让用户手填。
+# ============================================================================
+
+ZHIPU_VISION_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+# 默认 glm-4v-flash：低价/免费档，日常账单截图足够；
+# 识别不准时用 secrets 覆盖成 "glm-4v"（识别更准、单价更高），无需改代码：
+#   ZHIPU_VISION_MODEL = "glm-4v"
+DEFAULT_VISION_MODEL = "glm-4v-flash"
+
+MAX_BILL_IMAGE_BYTES = 5 * 1024 * 1024          # 5MB：base64 后约 6.7MB，接口上限内
+MAX_BILL_AMOUNT = 9_999_999_999.99              # 单笔金额上限，防止小数点/多单误识别
+ALLOWED_IMAGE_MIME_TYPES = frozenset(
+    {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+)
+
+VISION_SYSTEM_PROMPT = """你是严格的账单/小票信息抽取器，只做信息抽取，不做解读、不寒暄、不解释。
+请从用户提供的图片中抽取账单信息，并**只输出一个 JSON 对象**，不要输出 Markdown 代码块标记，不要输出 JSON 之外的任何文字。
+
+JSON 必须包含以下字段（字段名不可改、不可少）：
+{
+  "is_bill": true/false,      // 图片是否为账单/小票/支付记录（含金额与消费信息）
+  "blurry": true/false,       // 是否因模糊、过暗、反光、遮挡、截断导致关键信息（金额/日期/商户）看不清
+  "merchant": "商户名称",      // 识别不到给空串 ""
+  "amount": 0.00,             // 金额，必须是正数，不带货币符号、不加千分位、不做汇率换算
+  "paid_at": "YYYY-MM-DD",    // 支付/消费日期；识别不到给空串 ""
+  "type": "支出" 或 "收入",     // 退款/红包/入账/收益等为"收入"，其余为"支出"
+  "confidence": 0.0,          // 0~1 之间的整体置信度
+  "reason": "一句话说明"        // 判断依据，或看不清的原因
+}
+
+规则：
+1. 图片不是账单/小票/支付记录（例如风景、人像、聊天截图、普通文档）→ is_bill=false，其余字段可留空/空串。
+2. 任何关键信息因模糊/反光/遮挡/裁剪无法确认 → blurry=true，并在 reason 里写明看不清的部分。
+3. 金额一律取正数（支出也不要给负数）；只取本单应付/实付金额，不要相加多张单，不要自行换算。
+4. 日期统一成 YYYY-MM-DD；图片里只有“今天/昨天”等相对描述、没有绝对日期时，给空串 ""，不要猜。
+5. 不要编造商户、金额、日期；不确定就留空，并降低 confidence。
+6. 输出必须能被 json.loads 直接解析：不要中文引号、不要尾随逗号、不要在数字里带单位。"""
+
+VISION_USER_PROMPT = "请从这张账单截图里提取信息，严格按要求的 JSON 输出。"
+
+
+class BillImageError(Exception):
+    """账单图片识别失败。
+
+    code 取值：
+      not_bill   图片不是账单
+      blurry     图片关键信息看不清
+      ambiguous  信息缺失/不合规（商户、金额、日期等）
+      no_api_key 未配置智谱 API Key
+      network    网络异常（超时/连接失败）
+      http       接口返回非 200
+      parse      模型输出无法解析成约定 JSON
+
+    message 为面向用户的中文提示，可直接展示。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"BillImageError(code={self.code!r}, message={self.message!r})"
+
+
+def _normalize_image_mime(mime_type) -> str:
+    """把 'image/PNG; charset=binary' 归一化成 'image/png'；非字符串返回空串。"""
+    if not isinstance(mime_type, str):
+        return ""
+    return mime_type.split(";", 1)[0].strip().lower()
+
+
+def _sniff_image_mime(image_bytes: bytes):
+    """magic bytes 粗校验；只用于日志提醒，不参与失败判定。"""
+    head = image_bytes[:12]
+    if head.startswith(b"\x89PNG"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8"):
+        return "image/jpeg"
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _format_size(num_bytes: int) -> str:
+    return f"{num_bytes / 1024 / 1024:.2f}MB"
+
+
+def _coerce_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "1", "yes", "y", "是", "真"}:
+            return True
+        if text in {"false", "0", "no", "n", "否", "假", ""}:
+            return False
+    return default
+
+
+def _parse_amount(value):
+    """把 25.5 / "25.50" / "￥25.50元" / "1,200" 归一成 float；无法解析返回 None。"""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = re.sub(r"[^0-9.\-]", "", value)  # 去掉 ￥ ¥ $ , 元 空格 等
+        if not cleaned or cleaned in {"-", ".", "-."} or cleaned.count("-") > 1:
+            return None
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+    return None
+
+
+_CN_DATE_RE = re.compile(r"^\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*$")
+
+
+def _normalize_bill_date(value):
+    """严格归一化日期为 YYYY-MM-DD；无法确定返回 None（绝不回退成今天）。
+
+    支持："%Y-%m-%d"、"2026/10/1"，以及中文 "2026年10月1日"（先正则归一化）。
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    cn = _CN_DATE_RE.match(text)
+    if cn:
+        try:
+            return datetime.strptime(
+                f"{cn.group(1)}-{cn.group(2)}-{cn.group(3)}", "%Y-%m-%d"
+            ).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+    return None
+
+
+def _normalize_bill_type(value):
+    """归一化收入/支出；无法识别返回 None。"""
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if text in {"支出", "expense", "out", "pay", "支付", "付款"}:
+        return "支出"
+    if text in {"收入", "income", "in", "receive", "入账", "退款"}:
+        return "收入"
+    return None
+
+
+def _parse_bill_json(content: str) -> dict:
+    """先整体 json.loads；失败再抠 ```json ... ``` 代码块；仍失败 → parse。"""
+    try:
+        data = json.loads(content)
+        if isinstance(data, dict):
+            return data
+    except (ValueError, TypeError):
+        pass
+    fenced = re.search(
+        r"```(?:json)?\s*(.+?)```", content, flags=re.IGNORECASE | re.DOTALL
+    )
+    if fenced:
+        try:
+            data = json.loads(fenced.group(1).strip())
+            if isinstance(data, dict):
+                return data
+        except (ValueError, TypeError):
+            pass
+    raise BillImageError(
+        "parse",
+        "模型没有按约定的 JSON 格式返回结果，账单信息无法解析。"
+        "请先裁剪图片、只保留账单主体（商户/金额/日期）再上传，或重试一次。",
+    )
+
+
+def _extract_error_snippet(resp, api_key: str) -> str:
+    """截断响应体用于报错；先脱敏 api key，再压空白，最多 80 字。"""
+    try:
+        text = resp.text or ""
+    except Exception:  # pragma: no cover - 响应对象异常时不影响主流程
+        text = ""
+    text = str(text)
+    if api_key:
+        text = text.replace(api_key, "***")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:80]
+
+
+def extract_bill_from_image(image_bytes: bytes, mime_type: str, zhipu_api_key: str) -> dict:
+    """调用智谱 GLM-4V 从账单截图中抽取结构化信息。
+
+    返回::
+
+        {"merchant": str, "amount": float, "occurred_at": "YYYY-MM-DD",
+         "bill_type": "支出" | "收入", "confidence": float, "raw": str}
+
+    失败统一抛 BillImageError(code, message)，message 为可展示的中文。
+    raw 是模型原始输出，便于排查与页面“查看原始结果”。
+    """
+    # ---- 0) api key 检查：空 → no_api_key（且绝不回显 key 内容） ----
+    if not isinstance(zhipu_api_key, str) or not zhipu_api_key.strip():
+        raise BillImageError(
+            "no_api_key",
+            "未配置智谱 API Key。请在 .streamlit/secrets.toml 或环境变量里设置 "
+            "ZHIPU_API_KEY（形如 xxxxxxxx.xxxxxxxx，首尾不要带空格/引号），然后重试。",
+        )
+    api_key = zhipu_api_key.strip()
+
+    # ---- 1) 图片预处理：空/超大/mime 不合规 → ambiguous ----
+    if not isinstance(image_bytes, (bytes, bytearray)):
+        raise BillImageError(
+            "ambiguous",
+            "没有读取到图片内容。请重新选择图片后再次上传。",
+        )
+    if not image_bytes:
+        raise BillImageError(
+            "ambiguous",
+            "上传的图片是空的（0 字节）。请重新上传一张完整的账单截图或小票照片。",
+        )
+    if len(image_bytes) > MAX_BILL_IMAGE_BYTES:
+        raise BillImageError(
+            "ambiguous",
+            f"图片超过 5MB（当前 {_format_size(len(image_bytes))}），接口可能拒绝或超时。"
+            "请压缩图片，或裁剪成只含商户、金额、日期的区域后再上传。",
+        )
+    normalized_mime = _normalize_image_mime(mime_type)
+    if normalized_mime not in ALLOWED_IMAGE_MIME_TYPES:
+        raise BillImageError(
+            "ambiguous",
+            f"不支持的图片格式（{mime_type!r}）。目前只支持 PNG、JPEG/JPG、WEBP，"
+            "请把截图另存为其中一种格式后重试。",
+        )
+
+    sniffed_mime = _sniff_image_mime(bytes(image_bytes))
+    if sniffed_mime is None:
+        logger.warning("账单图片 magic bytes 未识别，按 mime=%s 继续", normalized_mime)
+    elif sniffed_mime != normalized_mime and not (
+        {sniffed_mime, normalized_mime} <= {"image/jpeg", "image/jpg"}
+    ):
+        logger.warning(
+            "账单图片 mime 与实际内容不一致: 声明=%s 实际=%s", normalized_mime, sniffed_mime
+        )
+
+    # ---- 2) 组装请求（OpenAI 兼容，image 走 base64 data URL） ----
+    vision_model = get_secret("ZHIPU_VISION_MODEL") or DEFAULT_VISION_MODEL
+    b64 = base64.b64encode(bytes(image_bytes)).decode("ascii")
+    payload = {
+        "model": vision_model,
+        "messages": [
+            {"role": "system", "content": VISION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{normalized_mime};base64,{b64}"},
+                    },
+                    {"type": "text", "text": VISION_USER_PROMPT},
+                ],
+            },
+        ],
+        "temperature": 0.1,
+        "max_tokens": 512,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ---- 3) 发请求：超时/连接失败 → network ----
+    try:
+        resp = requests.post(
+            ZHIPU_VISION_URL, headers=headers, json=payload, timeout=30
+        )
+    except requests.Timeout:
+        raise BillImageError(
+            "network",
+            "调用账单识别接口超时（30 秒）。请检查网络后重试；图片较大时先压缩/裁剪。",
+        ) from None
+    except requests.ConnectionError:
+        raise BillImageError(
+            "network",
+            "无法连接账单识别接口。请检查网络或代理设置，确认能访问 open.bigmodel.cn 后重试。",
+        ) from None
+    except requests.RequestException:
+        raise BillImageError(
+            "network",
+            "账单识别请求发送失败。请稍后重试；若持续失败，请检查网络或代理设置。",
+        ) from None
+
+    # ---- 4) 非 200 → http（带状态码 + 截断 body，且脱敏 key） ----
+    if resp.status_code != 200:
+        snippet = _extract_error_snippet(resp, api_key)
+        tail = f" 返回内容：{snippet}" if snippet else ""
+        raise BillImageError(
+            "http",
+            f"账单识别接口返回异常（HTTP {resp.status_code}）。"
+            f"请稍后重试；若为 401/403，请检查 ZHIPU_API_KEY 是否正确、是否开通视觉模型权限；"
+            f"若为 429/余额相关，请检查账户额度。{tail}",
+        )
+
+    # ---- 5) 取出模型文本并解析 JSON ----
+    try:
+        resp_data = resp.json()
+    except (ValueError, TypeError):
+        raise BillImageError(
+            "parse",
+            "账单识别接口返回的不是合法 JSON，无法解析。请稍后重试。",
+        ) from None
+    try:
+        content = resp_data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise BillImageError(
+            "parse",
+            "账单识别接口没有返回预期的内容结构，无法解析。请稍后重试。",
+        ) from None
+    if not isinstance(content, str) or not content.strip():
+        raise BillImageError(
+            "parse",
+            "模型没有返回任何内容，账单信息无法解析。请重试，或换一张更清晰的账单截图。",
+        )
+    content = content.strip()
+    data = _parse_bill_json(content)
+
+    # ---- 6) 业务校验（顺序固定：先 not_bill，再 blurry，最后字段级 ambiguous） ----
+    if not _coerce_bool(data.get("is_bill"), default=True):
+        raise BillImageError(
+            "not_bill",
+            "这张图片看起来不是账单/小票/支付截图。请上传包含商户、金额和日期的账单截图，"
+            "或直接手动记账。",
+        )
+    if _coerce_bool(data.get("blurry"), default=False):
+        reason = data.get("reason")
+        detail = (
+            f"（{str(reason).strip()[:60]}）"
+            if isinstance(reason, str) and reason.strip()
+            else ""
+        )
+        raise BillImageError(
+            "blurry",
+            f"图片关键信息看不清{detail}。请靠近账单重拍，保证金额、日期、商户名清晰无遮挡，"
+            "或裁剪到账单主体后再上传。",
+        )
+
+    merchant_raw = data.get("merchant")
+    merchant = merchant_raw.strip() if isinstance(merchant_raw, str) else ""
+    if not merchant:
+        raise BillImageError(
+            "ambiguous",
+            "没能识别出商户名称。请换一张更清晰的账单截图，或手动填写商户后保存。",
+        )
+
+    amount = _parse_amount(data.get("amount"))
+    if amount is None or amount <= 0:
+        raise BillImageError(
+            "ambiguous",
+            "没能识别出有效金额（金额缺失、为 0 或为负数）。请重拍账单，或手动填写金额后保存。",
+        )
+    if amount > MAX_BILL_AMOUNT:
+        raise BillImageError(
+            "ambiguous",
+            "识别到的金额超出合理范围（可能把多张单相加或小数点识别错了）。请核对后手动填写金额。",
+        )
+
+    paid_at_raw = data.get("paid_at")
+    if not isinstance(paid_at_raw, str) or not paid_at_raw.strip():
+        raise BillImageError(
+            "ambiguous",
+            "没能识别出消费日期。请手动选择日期后保存（系统不会自动用今天代替）。",
+        )
+    occurred_at = _normalize_bill_date(paid_at_raw)
+    if occurred_at is None:
+        raise BillImageError(
+            "ambiguous",
+            f"识别到的日期无法确定为 YYYY-MM-DD（原始值：「{paid_at_raw.strip()[:20]}」）。"
+            "请手动选择日期后保存。",
+        )
+
+    type_raw = data.get("type")
+    bill_type = _normalize_bill_type(type_raw)
+    if bill_type is None:
+        if "type" in data and str(type_raw).strip():
+            raise BillImageError(
+                "ambiguous",
+                "无法判断这笔是收入还是支出。请手动选择类型后保存。",
+            )
+        # 字段整体缺失时按常见场景（消费）兜底，并在 raw/confidence 中保留原样
+        bill_type = "支出"
+
+    confidence = _parse_amount(data.get("confidence"))
+    if confidence is None:
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, float(confidence)))
+
+    return {
+        "merchant": merchant,
+        "amount": round(float(amount), 2),
+        "occurred_at": occurred_at,
+        "bill_type": bill_type,
+        "confidence": round(confidence, 4),
+        "raw": content,
+    }
