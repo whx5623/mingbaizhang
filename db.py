@@ -225,3 +225,19 @@ def register_user(username, password_hash):
         except IntegrityError:
             conn.rollback()
             return None
+def get_admin_operate_data():
+    global engine
+    from sqlalchemy import text
+    from datetime import date, timedelta
+    end_date = date.today()
+    start_date = end_date - timedelta(days=6)
+    with engine.connect() as conn:
+        total_reg_sql = text("SELECT COUNT(id) FROM users")
+        total_reg = conn.execute(total_reg_sql).scalar() or 0
+
+        active_sql = text("SELECT COUNT(DISTINCT user_id) FROM bills WHERE DATE(date) BETWEEN :start AND :end")
+        active_7d = conn.execute(active_sql, {"start": start_date, "end": end_date}).scalar() or 0
+
+        sponsor_sql = text("SELECT COUNT(DISTINCT id) FROM users WHERE credits > 0")
+        sponsor_count = conn.execute(sponsor_sql).scalar() or 0
+    return total_reg, active_7d, sponsor_count
