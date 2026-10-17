@@ -6,7 +6,7 @@ import math
 import re
 import bcrypt
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 
 engine = None
 
@@ -27,7 +27,13 @@ def init_db():
                 -- 时区一变历史值整体平移；timestamptz 存绝对时刻，跨环境稳定。
                 -- （这条 CREATE TABLE 只对**新库**生效；老库补列必须跑 005，
                 --   005 的核对会用 data_type = 'timestamp with time zone' 拦下历史遗留的错误类型。）
-                last_login TIMESTAMPTZ NULL
+                last_login TIMESTAMPTZ NULL,
+                -- 管理员标记：与 migrations/006_user_admin_flag.sql 逐字同口径
+                -- （BOOLEAN NOT NULL DEFAULT FALSE，默认最小权限）。
+                -- 同样**只对新建库生效**：CREATE TABLE IF NOT EXISTS 对已存在的表什么都不做，
+                -- 老库补这一列必须执行 migrations/006；没执行时 is_user_admin() 走
+                -- ProgrammingError 分支返回 False（面板隐藏），不会红屏。
+                is_admin BOOLEAN NOT NULL DEFAULT FALSE
             );
         """))
         conn.execute(text("""
@@ -638,32 +644,233 @@ def add_user_credits(user_id, delta):
         conn.execute(stmt, {"delta": delta, "uid": user_id})
         conn.commit()
 
-def get_admin_operate_data():
-    global engine
-    end_date = date.today()
-    start_date = end_date - timedelta(days=6)
-    with engine.connect() as conn:
-        reg_sql = text("""
-            SELECT DATE(created_at) as date, COUNT(id) as count
-            FROM users
-            WHERE DATE(created_at) BETWEEN :start AND :end
-            GROUP BY DATE(created_at)
-            ORDER BY DATE(created_at)
-        """)
-        reg_df = pd.read_sql(reg_sql, conn, params={"start": start_date, "end": end_date})
+# ---------------------------------------------------------------------------
+# 管理员鉴权（唯一入口）
+# ---------------------------------------------------------------------------
+# 背景：app.py 的管理面板代码一直都在，但 st.session_state.is_admin 从来只有 False，
+# 面板等于死代码。把"谁是管理员"落到 users.is_admin（migrations/006_user_admin_flag.sql），
+# 由下面这个函数回答 —— 页面不再自己猜，也不再把管理员身份写死在代码/配置里。
+# ---------------------------------------------------------------------------
 
-        active_sql = text("""
-            SELECT DATE(date) as date, COUNT(DISTINCT user_id) as count
-            FROM bills
-            WHERE DATE(date) BETWEEN :start AND :end
-            GROUP BY DATE(date)
-            ORDER BY DATE(date)
+def is_user_admin(user_id) -> bool:
+    """该用户当前是不是管理员。**永不抛异常**，任何失败都落成 False（fail-closed）。
+
+    契约（app.py 依赖它，改签名/改语义前先看 app.py 的调用点）：
+    - 返回值必须是**真正的 bool**：True / False。不返回 None、不返回 1/0、
+      也不返回 numpy.bool_ —— 调用方可能写 `is True` 或把它塞进 JSON，
+      非 bool 在那里会静默出错。
+    - 用户不存在（user_id 不存在 / 为 None / 会话里的 id 已过期被删）→ False。
+      **不区分"用户不存在"和"不是管理员"**：调用方只要一个布尔，
+      而 `WHERE id = :uid` 查不到行本身就等于"没有任何权限"。
+    - migrations/006 未执行（is_admin 列不存在）→ False + 一条 warning。
+      **这是刻意的降级**：鉴权失败只能落成"无权限"，绝不能落成"有权限"。
+      也正因为这里吞掉了 ProgrammingError，006 之前管理面板只是"看不见"，
+      不会像 005 忘了执行那样把页面搞红屏（普通记账功能完全不引用 is_admin）。
+    - 其余异常（库不可用、连接超时、权限不足、engine 还没 init_db）→ False + warning。
+    - 只读、单条语句、不写库、**不做缓存**：管理员一被撤销，下一次调用立刻生效
+      （app.py 每次 rerun 都会重新问一次，见 app.py 里两处 is_user_admin 调用）。
+
+    SQL 为什么这么写：
+    - `SELECT COALESCE(is_admin, FALSE) FROM users WHERE id = :uid`
+      COALESCE 是第二层保险：006 已把该列建成 NOT NULL，理论上不会出现 NULL；
+      但鉴权路径上多一层兜底的成本是零，收益是"绝不让三值逻辑漏进调用方"
+      （NULL → None，`if None:` 恰好是 False，可这种"恰好正确"经不起重构）。
+    - 表名**不带** `public.` 前缀：与本文件其余 SQL 统一（靠 search_path 找 public.users）。
+    """
+    global engine
+    log = logging.getLogger(__name__)
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT COALESCE(is_admin, FALSE) FROM users WHERE id = :uid"),
+                {"uid": user_id},
+            ).fetchone()
+    except ProgrammingError:
+        # 最常见的真实成因：migrations/006_user_admin_flag.sql 还没执行，
+        # users.is_admin 不存在 → UndefinedColumn（SQLAlchemy 侧是 ProgrammingError）。
+        # 这条 warning 就是给运维的提示，别让用户看到。
+        log.warning(
+            "[db] 管理员鉴权失败：is_admin 列不存在，请先执行 "
+            "migrations/006_user_admin_flag.sql（users.is_admin 缺失）。"
+            "本次按“无权限”处理，管理面板对所有人隐藏。"
+        )
+        return False
+    except (SQLAlchemyError, OSError):
+        # 库不可用 / 连接超时 / 权限不足（含驱动层 OSError）→ 同样按无权限处理。
+        log.warning("[db] 管理员鉴权查询失败（库不可用或连接异常），按无权限处理", exc_info=True)
+        return False
+    except Exception:
+        # 兜底：engine 还没 init_db（None → AttributeError）、user_id 是不可绑定的类型等。
+        # 鉴权路径上**任何**未知错误都不许冒到页面，更不许变成"通过"。
+        log.warning("[db] 管理员鉴权出现未知异常，按无权限处理", exc_info=True)
+        return False
+
+    if row is None:
+        return False  # 用户不存在 == 没有权限
+    return bool(row[0])
+
+
+# 后台图表的时间窗口：**含今天在内共 7 个自然日**（UTC）。
+# 定义成常量而不是散落的魔法数字，是为了让下面 SQL 的 >= / < 与 docstring 永远同步：
+#   days=6 → [今天-6 00:00, 明天 00:00) = 7 个自然日（x 轴最多 7 个点，和标题“过去 7 天”对齐）
+#   days=7 → [今天-7 00:00, 明天 00:00) = 8 个自然日（图会比标题多一天）
+ADMIN_CHART_DAYS = 7
+
+
+def _admin_chart_frame(df):
+    """把后台图表的查询结果收敛成固定列名 ``["date", "count"]`` 的 DataFrame。
+
+    为什么必须显式收口（不是洁癖，是两条真实的崩法）：
+    - 0 行时列名不能丢：app.py 直接 `reg_7df["count"].sum()` / `reg_7df["date"].tolist()`，
+      列名没保住就是 KeyError → 管理面板红屏。而**活跃图必然是空结果**（库里 now bills 0 行）。
+    - `date` 统一输出 `'YYYY-MM-DD'` 字符串：调用方只拿它当 echarts 的 x 轴 category 标签，
+      而 `datetime.date` 对象**不是 JSON 可序列化的**（st_echarts 会把 options 原样序列化
+      给前端组件），传 date 对象会在面板可达的那一刻才炸 —— 正是这一轮要消灭的那类坑。
+      这里用 .map 而不是 pd.to_datetime：bills.date 是库里原样的 VARCHAR，非 ISO 的脏值
+      不该因为"画个图"就抛异常（转换成日期是另一件事）。
+    - `count` 统一 int64：PG 的 COUNT() 已经是 bigint，这里只是保证空结果时也是数值列，
+      `.sum()` 得到 0 而不是 object 拼接。
+    - 空表的 `date` 用 `dtype=object`，**不用** `dtype="str"`：`"str"` 是**pandas 相关的**
+      推断结果（pandas 2.x 里 `text` 列 map 出来是 object；pandas 3.x 默认 str dtype，
+      实测本 venv pandas 3.0.6 下 `Series(['x']).map(str).dtype == str`），而 requirements
+      没锁 pandas 版本 —— 用 `"str"` 会让"空表"这条路径的含义随环境变。
+      所以两条路径都显式钉成 `object`：空表这里 `pd.Series(dtype=object)`，非空那侧在
+      `.map(...)` 之后补 `.astype(object)`。这样无论 pandas 2 / 3，`df.dtypes` 都是
+      `{date: object, count: int64}`，调用方 `.tolist()` / JSON 序列化行为不随环境漂移。
+    """
+    if df is None or len(df) == 0:
+        return pd.DataFrame(
+            {"date": pd.Series(dtype=object), "count": pd.Series(dtype="int64")}
+        )
+    out = df.loc[:, ["date", "count"]].reset_index(drop=True)
+    out["date"] = out["date"].map(
+        lambda v: v.strftime("%Y-%m-%d") if hasattr(v, "strftime") else str(v)
+    ).astype(object)  # 与空表路径的 dtype=object 对齐（pandas 3 的 .map(str) 会给 str dtype）
+    out["count"] = out["count"].astype("int64")
+    return out
+
+
+def get_admin_operate_data():
+    """后台面板两张折线图 + 赞助用户数，返回 ``(reg_df, active_df, sponsor_count)``。
+
+    返回契约（app.py 按这个解包，见 `reg_7df, active_7df, sponsor_user_count = ...`）：
+      - reg_df    : DataFrame，列固定为 ``["date", "count"]``，按 UTC 自然日的注册数；
+      - active_df : DataFrame，列固定为 ``["date", "count"]``，按 UTC 自然日的活跃用户数
+                    （活跃 = 当天有账单的**去重**用户数）；
+      - sponsor_count : int，credits > 0 的用户数（模拟赞助）。
+      两个 DataFrame 都保证：列名固定、date 是 'YYYY-MM-DD' 字符串、0 行时仍然可用。
+
+    ⚠ 时间口径与 get_admin_funnel_data() **故意不同**，两处不要"对齐"成同一个数：
+      · 本函数 = **UTC 自然日窗口**，含今天在内共 ADMIN_CHART_DAYS(7) 个自然日：
+            [今天(UTC) 00:00 - 6 天, 明天(UTC) 00:00)
+        按"天"分桶是为了画趋势线（x 轴最多 7 个点）。
+      · get_admin_funnel_data() 的「7 天登录用户」= **滚动 7×24 小时**：
+            last_login >= now() - interval '7 days'
+        按"最近 168 小时"算，是为了回答"最近一周还有多少人回来过"。
+      同一时刻两者最多差一天，这是刻意的：一个是"日历周"，一个是"滑动周"。
+      要改口径就两处一起改、并同步这两段 docstring；**不要**只把这里的 ADMIN_CHART_DAYS
+      调成 7 之外的数去"凑"漏斗的数字 —— 那会让"过去 7 天"的标题和实际柱数对不上。
+
+    为什么参数是 Python 的 **naive UTC datetime**（实测过，见下）：
+      · users.created_at 是 naive timestamp（存的是 UTC 墙钟，见 init_db 的建表语句），
+        用 naive datetime 去比较就是"同一把尺子"，不需要任何时区换算；
+      · 传 tz-aware datetime 反而引入隐患：timestamp(无时区) 列与 timestamptz 值比较时，
+        库会按**会话 TimeZone** 把列解释成绝对时刻，结果就随会话时区漂移；
+        而本库会话 TimeZone=UTC（SHOW TimeZone 核实过），所以两种写法在**这里**结果相同 ——
+        但只有 naive 边界值的含义是固定的，因此选 naive。
+      · "今天"必须取**UTC 的今天**：`datetime.now(timezone.utc).date()`。
+        不能用本机的 `date.today()`：本机是 UTC+8，UTC 16:00 之后本机已经是"明天"，
+        窗口会整体错一天，而库里所有时间都是 UTC。
+      · 左闭右开 `>= :start AND < :end`，不是 BETWEEN：BETWEEN 对 timestamp 是闭区间，
+        会把"明天 00:00:00.000"那一瞬间也算进今天；右开区间让边界成为常量，
+        也保留 created_at 上索引的可用性（函数不包列）。
+
+    为什么活跃数用**字符串比较**而不是 DATE(date)：
+      bills.date 是 VARCHAR/TEXT（'YYYY-MM-DD'，由 app.py 的 `date.strftime('%Y-%m-%d')`
+      和 CSV 导入路径写入）。旧代码写的是 `DATE(date) BETWEEN :start AND :end`。**实测（本库 PG 17）**：
+        · `DATE(text)` / `DATE(varchar)` **不会**报 "function date(...) does not exist" ——
+          PG 会把 `date(x)` 解析成 I/O 转换 cast（等价 `x::date`），所以旧写法其实跑得通；
+        · 它真正的雷有两个：
+          ① 逐行解析字符串：只要**有一行**脏值（'abc'、空串），整条查询就抛
+             `invalid input syntax for type date`，管理面板整体红屏 —— 数据相关的雷，
+             平时不响，等某个 CSV 导进来才响；
+          ② 函数包在列上：date 列上**目前没有索引**（bills 只有 bills_pkey 和
+             idx_bills_user_id），所以现在本来就是顺序扫描；但将来给 date 建普通 B-tree
+             索引时，`DATE(date)` 用不上它，只有额外建**表达式索引**才行。
+      ISO 'YYYY-MM-DD' 的字符串字典序 == 日期序（位数固定、零填充），实测
+      `'2026-10-16' >= '2026-10-11' AND '2026-10-16' < '2026-10-18'` 为真、
+      与日期比较同结果，所以 `date >= :start_text AND date < :end_text` 既正确、
+      零 cast、将来建的普通索引也能直接用。
+      ⚠ 代价是脏值变成**静默**的：非 ISO 行（如 '2026/10/1'）不报错、也不落进窗口
+      （实测 `'2026/10/1' >= '2026-10-11'` 为 False，即被当成"不在窗口内"）。
+      ⚠ **事实订正（别被"只有 ISO 来源"这种说法骗了）**：写入侧**当前不校验 date 格式**。
+      app.py 里 AI function calling 的 `func_args.get("date", ...)` 取到什么就入库什么，
+      CSV 导入路径的 `date` 也是如此 —— 都是**原样入库**，没有格式校验、没有归一；
+      真正被 strftime 格式化过的只有一条路径。所以"bills.date 里只可能是 ISO"**不成立**，
+      它会被人（模型/CSV）写成 '2026/10/1'、'10/01/2026'、'2026-10-1' 这类值。
+      本条查询的正确性因此依赖一个**外部约定**：`bills.date` 上的字符串比较==日期比较，
+      只有在值确实是零填充 ISO（'YYYY-MM-DD'）时才成立（字典序 == 日期序）。
+      这个约定数据库**没有**替你保证；非 ISO 值只会在活跃图里**静默**不入窗，不报警。
+      以后若要导非 ISO 数据，请在导入时归一，或给 date 列加 CHECK 约束 ——
+      **不要**指望这条查询替你报警。（给写入侧补格式校验是另一件事，不在本条注释范围内。）
+
+    注册数为什么是 `created_at::date`（**不是** `(created_at AT TIME ZONE 'UTC')::date`）：
+      created_at 是 naive timestamp（存的是 UTC 墙钟），`created_at::date` 是**naive 截断**：
+      直接砍掉时分秒，**与会话 TimeZone 无关**，和 WHERE 里的 naive 边界（:start / :end）
+      用的是同一把尺子 —— 筛选与分桶同源，两者不可能互相错位。
+      反过来看 `(created_at AT TIME ZONE 'UTC')::date`：它先把 naive 值贴 UTC 标签变成
+      timestamptz，再 timestamptz→date；**后一步会按会话 TimeZone 折日**。
+      于是同一句 SQL 里 WHERE 与会话时区无关、分桶却与会话时区有关：会话时区非 UTC 时
+      （例如 TimeZone='Asia/Shanghai'），"进不进窗口"和"落到哪一天"用了两个不同的基准，
+      边界附近的行会被分到错的日期、甚至落到窗口外同一天的两个桶里 → 图上偏一天。
+      所以这里必须是 `created_at::date`：把两边都钉死在 naive UTC 上。
+      （实测：会话 TimeZone=UTC 时两种写法结果完全相同 —— 但那只是因为 UTC 恰好是
+      "贴标签"与"折日"的同一个时区，**不是**等价写法，别改回去。）
+    """
+    global engine
+    today_utc = datetime.now(timezone.utc).date()
+    # 窗口边界：naive UTC 的 "今天-N 天零点" 与 "明天零点"
+    start_dt = datetime(today_utc.year, today_utc.month, today_utc.day) - timedelta(
+        days=ADMIN_CHART_DAYS - 1
+    )
+    end_dt = datetime(today_utc.year, today_utc.month, today_utc.day) + timedelta(days=1)
+    # 活跃图用字符串边界：ISO 'YYYY-MM-DD' 字典序 == 日期序，避免对 VARCHAR 列做 cast
+    start_text = start_dt.strftime("%Y-%m-%d")
+    end_text = end_dt.strftime("%Y-%m-%d")
+
+    with engine.connect() as conn:
+        # 注册数：按 UTC 自然日分桶。WHERE 用常量边界（不包函数），保留 created_at 索引可用性；
+        # 分桶用 created_at::date（**naive 截断，与会话时区无关**），与 WHERE 的 naive 边界同源；
+        # 不要写成 (created_at AT TIME ZONE 'UTC')::date —— 那一步 timestamptz→date 会按会话
+        # TimeZone 折日，会话时区非 UTC 时 WHERE 与分桶基准不一致，边界附近的行会偏一天。
+        # GROUP BY 1 / ORDER BY 1 直接引用 SELECT 的第一个表达式，避免重复写一遍转日期表达式。
+        reg_sql = text("""
+            SELECT created_at::date AS date, COUNT(*) AS count
+            FROM users
+            WHERE created_at >= :start AND created_at < :end
+            GROUP BY 1
+            ORDER BY 1
         """)
-        active_df = pd.read_sql(active_sql, conn, params={"start": start_date, "end": end_date})
+        reg_df = pd.read_sql(reg_sql, conn, params={"start": start_dt, "end": end_dt})
+
+        # 活跃数：bills.date 是 VARCHAR，**只用字符串比较**（不 cast、不 DATE()）。
+        # date 列原样输出（'YYYY-MM-DD' 字符串），调用方只拿它当 x 轴标签。
+        active_sql = text("""
+            SELECT date AS date, COUNT(DISTINCT user_id) AS count
+            FROM bills
+            WHERE date >= :start_text AND date < :end_text
+            GROUP BY date
+            ORDER BY date
+        """)
+        active_df = pd.read_sql(
+            active_sql, conn, params={"start_text": start_text, "end_text": end_text}
+        )
 
         sponsor_sql = text("SELECT COUNT(DISTINCT id) FROM users WHERE credits > 0")
         sponsor_count = conn.execute(sponsor_sql).scalar() or 0
-    return reg_df, active_df, sponsor_count
+
+    return _admin_chart_frame(reg_df), _admin_chart_frame(active_df), int(sponsor_count)
+
 
 def get_admin_funnel_data():
     global engine
@@ -725,19 +932,3 @@ def register_user(username, password):
             if _is_duplicate_username_error(exc):
                 raise ValueError(DUPLICATE_USERNAME_MESSAGE) from exc
             raise
-def get_admin_operate_data():
-    global engine
-    from sqlalchemy import text
-    from datetime import date, timedelta
-    end_date = date.today()
-    start_date = end_date - timedelta(days=6)
-    with engine.connect() as conn:
-        total_reg_sql = text("SELECT COUNT(id) FROM users")
-        total_reg = conn.execute(total_reg_sql).scalar() or 0
-
-        active_sql = text("SELECT COUNT(DISTINCT user_id) FROM bills WHERE DATE(date) BETWEEN :start AND :end")
-        active_7d = conn.execute(active_sql, {"start": start_date, "end": end_date}).scalar() or 0
-
-        sponsor_sql = text("SELECT COUNT(DISTINCT id) FROM users WHERE credits > 0")
-        sponsor_count = conn.execute(sponsor_sql).scalar() or 0
-    return total_reg, active_7d, sponsor_count

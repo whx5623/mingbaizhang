@@ -4,3 +4,4 @@ __pycache__/
 finance.db
 *.db
 .streamlit/secrets.toml
+.idea/
