@@ -914,42 +914,284 @@ with tab_dash:
                 # 只给一条红色文字提示，不把整块渲染成 error（会影响下方其它内容）
                 st.caption(f":red[⚠️ {_cat_name} 已超出预算，建议控制该类支出]")
 
-    # Bill table with pagination
+    # ===== 账单明细：基于全量 df 的本地筛选 + 本地分页 =====
+    # 说明：get_bills_paginated / get_total_bill_count 不再用于表格，但 import 保留
+    # （导入 / 截图记帐等旧逻辑仍在用 st.session_state.page）；图表与指标始终用全量 df。
     st.subheader("账单明细")
-    total_count = get_total_bill_count(st.session_state.user_id)
-    page_size = st.selectbox("每页条数", options=[10,20,50])
-    offset = st.session_state.page * page_size
-    paginated_df = get_bills_paginated(st.session_state.user_id, limit=page_size, offset=offset)
 
-    # 分类列只在迁移 012 执行后才存在：有列就在 merchant 之后展示，没列则原样展示并提示一次
-    if "category" in paginated_df.columns:
-        # 固定列序（category 紧跟 merchant），其余列保持原顺序补在后面，不依赖 db 返回顺序
-        base_cols = ["date", "merchant", "category", "amount", "payment_method", "type"]
-        display_cols = [col for col in base_cols if col in paginated_df.columns]
-        display_cols += [col for col in paginated_df.columns if col not in display_cols]
-        df_display = paginated_df[display_cols].copy()
-        # NULL / 空串 / 纯空白统一归一为「其他」，与 db 层口径保持一致
-        cat_series = df_display["category"].fillna("其他").astype(str).str.strip()
-        df_display["category"] = cat_series.where(cat_series != "", "其他")
-        st.dataframe(df_display, use_container_width=True)
+    # 筛选分页独立 state：不复用 st.session_state.page，避免与导入/截图记帐互相干扰
+    if "bill_filter_page" not in st.session_state:
+        st.session_state.bill_filter_page = 0
+    if "bill_page_size" not in st.session_state:
+        st.session_state.bill_page_size = 10
+
+    # ---- 筛选控件可选项（只从全量 df 取，空值/空白不入选项）----
+    _bill_has_category = "category" in df.columns
+    _bill_category_options = (
+        sorted({str(_v).strip() for _v in df["category"].dropna().unique() if str(_v).strip()})
+        if _bill_has_category
+        else []
+    )
+    _bill_payment_options = (
+        sorted({str(_v).strip() for _v in df["payment_method"].dropna().unique() if str(_v).strip()})
+        if "payment_method" in df.columns
+        else []
+    )
+
+    # 导入新数据后旧的多选值可能已不在新选项里：先收敛，避免 multiselect 报错
+    _saved_categories = st.session_state.get("bill_categories")
+    if _bill_has_category and _saved_categories:
+        _valid_categories = [c for c in _saved_categories if c in _bill_category_options]
+        if _valid_categories != list(_saved_categories):
+            st.session_state["bill_categories"] = _valid_categories
+    _saved_payments = st.session_state.get("bill_payments")
+    if _saved_payments:
+        _valid_payments = [p for p in _saved_payments if p in _bill_payment_options]
+        if _valid_payments != list(_saved_payments):
+            st.session_state["bill_payments"] = _valid_payments
+
+    # ---- 已启用筛选条件数：按维度计数，用于自动展开 + 提示 ----
+    def _bill_active_filter_count():
+        _count = 0
+        if str(st.session_state.get("bill_kw", "") or "").strip():
+            _count += 1
+        if st.session_state.get("bill_date_limit", False):
+            _count += 1
+        if st.session_state.get("bill_type", "全部") != "全部":
+            _count += 1
+        if _bill_has_category and st.session_state.get("bill_categories"):
+            _count += 1
+        if st.session_state.get("bill_payments"):
+            _count += 1
+        try:
+            _min_amount = float(st.session_state.get("bill_amount_min", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            _min_amount = 0.0
+        try:
+            _max_amount = float(st.session_state.get("bill_amount_max", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            _max_amount = 0.0
+        if _min_amount > 0 or _max_amount > 0:
+            _count += 1
+        return _count
+
+    _bill_active_count = _bill_active_filter_count()
+    if _bill_active_count:
+        st.caption(f"🔍 已启用 {_bill_active_count} 个筛选条件")
+
+    _bill_default_date_from = date(now.year, now.month, 1)
+    _bill_default_date_to = now.date()
+
+    # 默认折叠；任一筛选生效时 expanded 变为 True（state 跟踪下会重新展开）
+    with st.expander(
+        "🔍 高级筛选",
+        expanded=(_bill_active_count > 0),
+        key="bill_filter_expander",
+        on_change="rerun",
+    ):
+        _bill_kw = st.text_input(
+            "关键词（商户 / 分类）",
+            key="bill_kw",
+            placeholder="模糊匹配商户或分类，留空=不限",
+        )
+
+        _bill_date_limit = st.checkbox("限定日期范围", value=False, key="bill_date_limit")
+        if _bill_date_limit:
+            _bill_date_col1, _bill_date_col2 = st.columns(2)
+            with _bill_date_col1:
+                _bill_date_from = st.date_input(
+                    "开始日期", value=_bill_default_date_from, key="bill_date_from"
+                )
+            with _bill_date_col2:
+                _bill_date_to = st.date_input(
+                    "结束日期", value=_bill_default_date_to, key="bill_date_to"
+                )
+        else:
+            _bill_date_from = _bill_default_date_from
+            _bill_date_to = _bill_default_date_to
+
+        _bill_type_col, _bill_cat_col, _bill_pay_col = st.columns(3)
+        with _bill_type_col:
+            _bill_type = st.selectbox("类型", ["全部", "支出", "收入"], key="bill_type")
+        with _bill_cat_col:
+            if _bill_has_category:
+                _bill_categories = st.multiselect(
+                    "分类", options=_bill_category_options, key="bill_categories"
+                )
+            else:
+                _bill_categories = []
+        with _bill_pay_col:
+            _bill_payments = st.multiselect(
+                "支付方式", options=_bill_payment_options, key="bill_payments"
+            )
+
+        _bill_amt_min_col, _bill_amt_max_col, _bill_sort_col = st.columns(3)
+        with _bill_amt_min_col:
+            _bill_amount_min = st.number_input(
+                "最小金额（元）",
+                min_value=0.0,
+                value=0.0,
+                step=1.0,
+                format="%.2f",
+                key="bill_amount_min",
+                help="只看金额 ≥ 该值的账单；0 表示不限",
+            )
+        with _bill_amt_max_col:
+            _bill_amount_max = st.number_input(
+                "最大金额（元）",
+                min_value=0.0,
+                value=0.0,
+                step=1.0,
+                format="%.2f",
+                key="bill_amount_max",
+                help="只看金额 ≤ 该值的账单；0 表示不限",
+            )
+        with _bill_sort_col:
+            _bill_sort = st.selectbox(
+                "排序",
+                ["日期（新→旧）", "日期（旧→新）", "金额（高→低）", "金额（低→高）"],
+                key="bill_sort",
+            )
+
+        if st.button("重置筛选", key="bill_filter_reset"):
+            # 回调场景下按钮在同一轮已渲染完所有筛选控件，pop 后立刻 rerun 重建为默认值
+            for _reset_key in [
+                "bill_kw",
+                "bill_date_limit",
+                "bill_date_from",
+                "bill_date_to",
+                "bill_type",
+                "bill_categories",
+                "bill_payments",
+                "bill_amount_min",
+                "bill_amount_max",
+                "bill_sort",
+            ]:
+                st.session_state.pop(_reset_key, None)
+            st.session_state["bill_filter_page"] = 0
+            st.rerun()
+
+    # 每页条数变化 → 回到第一页（on_change 只改 state，不主动 rerun，避免死循环）
+    def _reset_bill_filter_page():
+        st.session_state["bill_filter_page"] = 0
+
+    page_size = st.selectbox(
+        "每页条数",
+        options=[10, 20, 50],
+        key="bill_page_size",
+        on_change=_reset_bill_filter_page,
+    )
+
+    # ---- 过滤逻辑（全部在本地 df 上完成，不改动 df 本身）----
+    filtered = df.copy()
+
+    _bill_kw = str(_bill_kw or "").strip()
+    if _bill_kw:
+        _merchant_hit = (
+            filtered["merchant"].fillna("").astype(str).str.contains(
+                _bill_kw, case=False, regex=False
+            )
+        )
+        if "category" in filtered.columns:
+            _category_hit = (
+                filtered["category"].fillna("").astype(str).str.contains(
+                    _bill_kw, case=False, regex=False
+                )
+            )
+            _keyword_mask = _merchant_hit | _category_hit
+        else:
+            _keyword_mask = _merchant_hit
+        filtered = filtered[_keyword_mask]
+
+    if _bill_date_limit:
+        _bill_date_start = pd.to_datetime(_bill_date_from, errors="coerce")
+        _bill_date_end = pd.to_datetime(_bill_date_to, errors="coerce")
+        if pd.notna(_bill_date_start) and pd.notna(_bill_date_end):
+            if _bill_date_start > _bill_date_end:
+                _bill_date_start, _bill_date_end = _bill_date_end, _bill_date_start
+            filtered = filtered[
+                (filtered["date_parsed"] >= _bill_date_start)
+                & (filtered["date_parsed"] < _bill_date_end + pd.Timedelta(days=1))
+            ]
+
+    if _bill_type != "全部":
+        # 直接用原值比较：空类型不会被算成支出
+        filtered = filtered[filtered["type"] == _bill_type]
+
+    if _bill_has_category and _bill_categories:
+        _bill_filter_cat = filtered["category"].fillna("其他").astype(str).str.strip()
+        _bill_filter_cat = _bill_filter_cat.where(_bill_filter_cat != "", "其他")
+        filtered = filtered[_bill_filter_cat.isin(_bill_categories)]
+
+    if _bill_payments:
+        _bill_filter_pay = filtered["payment_method"].fillna("").astype(str).str.strip()
+        filtered = filtered[_bill_filter_pay.isin(_bill_payments)]
+
+    if _bill_amount_min > 0:
+        filtered = filtered[filtered["amount"] >= float(_bill_amount_min)]
+    if _bill_amount_max > 0:
+        filtered = filtered[filtered["amount"] <= float(_bill_amount_max)]
+
+    if _bill_sort == "日期（新→旧）":
+        filtered = filtered.sort_values("date_parsed", ascending=False, kind="stable")
+    elif _bill_sort == "日期（旧→新）":
+        filtered = filtered.sort_values("date_parsed", ascending=True, kind="stable")
+    elif _bill_sort == "金额（高→低）":
+        filtered = filtered.sort_values("amount", ascending=False, kind="stable")
     else:
-        st.caption("提示：执行 migrations/012 后这里会显示消费分类")
-        st.dataframe(paginated_df, use_container_width=True)
+        filtered = filtered.sort_values("amount", ascending=True, kind="stable")
 
-    btn_left, btn_mid, btn_right = st.columns(3)
-    with btn_left:
-        if st.button("上一页"):
-            if st.session_state.page > 0:
-                st.session_state.page -= 1
-                st.rerun()
-    with btn_mid:
-        st.write(f"第 {st.session_state.page + 1} 页，共 {total_count} 条记录")
-    with btn_right:
-        max_page = (total_count -1) // page_size
-        if st.button("下一页"):
-            if st.session_state.page < max_page:
-                st.session_state.page +=1
-                st.rerun()
+    # ---- 汇总与展示 ----
+    _filtered_expense = float(filtered.loc[filtered["type"] == "支出", "amount"].sum())
+    _filtered_income = float(filtered.loc[filtered["type"] == "收入", "amount"].sum())
+    st.caption(
+        f"共 {len(df)} 笔 · 筛选出 {len(filtered)} 笔 · "
+        f"支出合计 ¥{_filtered_expense:.2f} · 收入合计 ¥{_filtered_income:.2f}"
+    )
+    st.caption("图表与指标仍基于全量数据；本表格为筛选结果")
+
+    if filtered.empty:
+        st.info("没有符合条件的账单，试试放宽筛选条件")
+    else:
+        _bill_total_pages = max(1, math.ceil(len(filtered) / int(page_size)))
+        _bill_page = int(st.session_state.get("bill_filter_page", 0) or 0)
+        _bill_page = max(0, min(_bill_page, _bill_total_pages - 1))  # 超界自动夹到 [1, 页数]
+        st.session_state.bill_filter_page = _bill_page
+        _bill_page_start = _bill_page * int(page_size)
+        _bill_page_df = filtered.iloc[_bill_page_start:_bill_page_start + int(page_size)]
+
+        # 展示口径与改造前一致：有 category 时固定列序（category 紧跟 merchant），
+        # 其余列补后；NULL/空串/纯空白归一为「其他」。date_parsed 仅用于筛选，不展示。
+        if "category" in _bill_page_df.columns:
+            base_cols = ["date", "merchant", "category", "amount", "payment_method", "type"]
+            display_cols = [col for col in base_cols if col in _bill_page_df.columns]
+            display_cols += [
+                col for col in _bill_page_df.columns
+                if col not in display_cols and col != "date_parsed"
+            ]
+            df_display = _bill_page_df[display_cols].copy()
+            _cat_series = df_display["category"].fillna("其他").astype(str).str.strip()
+            df_display["category"] = _cat_series.where(_cat_series != "", "其他")
+            st.dataframe(df_display, use_container_width=True)
+        else:
+            df_display = _bill_page_df[
+                [col for col in _bill_page_df.columns if col != "date_parsed"]
+            ]
+            st.caption("提示：执行 migrations/012 后这里会显示消费分类")
+            st.dataframe(df_display, use_container_width=True)
+
+        btn_left, btn_right = st.columns(2)
+        with btn_left:
+            if st.button("上一页", key="bill_filter_prev"):
+                if _bill_page > 0:
+                    st.session_state.bill_filter_page = _bill_page - 1
+                    st.rerun()
+        with btn_right:
+            if st.button("下一页", key="bill_filter_next"):
+                if _bill_page < _bill_total_pages - 1:
+                    st.session_state.bill_filter_page = _bill_page + 1
+                    st.rerun()
+        st.write(f"第 {_bill_page + 1} / {_bill_total_pages} 页")
 
     # ECharts 双图表
     st.subheader("支出可视化图表")
@@ -1062,6 +1304,14 @@ with tab_dash:
             file_name="明白账_诊断报告.txt",
             mime="text/plain"
         )
+
+    # 新增：导出「账单明细」当前筛选结果（不影响上面两个全量导出按钮）
+    st.download_button(
+        "导出当前筛选结果（CSV）",
+        data=filtered.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"bills_filtered_{current_month_str}.csv",
+        mime="text/csv",
+    )
 
 with tab_tools:
     # ---- 手动记一笔 ----
