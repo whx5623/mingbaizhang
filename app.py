@@ -1255,6 +1255,148 @@ with tab_tools:
                             st.session_state.pop("budget_plan", None)
                             st.rerun()
 
+    # ---- 🎤 语音记账（放在 AI 智能预算之后；后端契约：ai_agent.transcribe_audio / extract_bill_from_text）----
+    with st.container(border=True):
+        st.subheader("🎤 语音记账")
+        st.caption("按住麦克风说一句，例如：今天食堂花了 25 块（≤30 秒）")
+        _voice_audio = st.audio_input(
+            "录制语音", key=f"voice_input_{st.session_state.user_id}"
+        )
+        # 成功路径 rerun 前无法展示识别文本：把上一次结果常驻在卡片里（月份/用户变化不必清理）
+        _last_voice = st.session_state.get("last_voice_text")
+        if isinstance(_last_voice, dict) and _last_voice.get("text"):
+            st.caption(f"上次识别：{_last_voice['text']}")
+
+        if _voice_audio is not None:
+            _voice_bytes = _voice_audio.getvalue()
+            # 整段录音内容做签名：audio_input 的值跨 rerun 保留，成功后的 st.rerun() 会让同一段
+            # 录音再跑一遍 —— 只按「用户ID + 内容哈希」去重，绝不重复记账、也不重复调 API。
+            _voice_sig = (
+                f"{st.session_state.user_id}:{hashlib.sha256(_voice_bytes).hexdigest()}"
+            )
+            if st.session_state.get("last_voice_sig") == _voice_sig:
+                st.info("这段语音已处理过；如需重新记账，请再录一段")
+            elif st.session_state.ai_daily_count >= 20:
+                # 额度用完只提示：不转写、不解析、不写库，也不占用签名
+                st.warning("今日免费额度已用完，请明天再来")
+            else:
+                # 从这里开始这段录音就算「已处理」：失败也落签名，避免同一条录音每次 rerun 都
+                # 反复调用 API；用户重新录一段会得到新签名，可以立即重试。
+                st.session_state["last_voice_sig"] = _voice_sig
+                st.audio(_voice_bytes, format="audio/wav")  # 回放，方便用户确认录到的内容
+                st.caption(
+                    f"已收到录音（约 {_voice_audio.size / 16000:.1f} 秒，按 WAV 16kHz 粗略估算）"
+                )
+
+                # 额度口径（与截图记账保持一致）：too_long / too_big / empty_audio / no_api_key
+                # 属于**前置失败，不扣额度**；只要真正发起了转写（network / http / empty_text /
+                # 解析失败）就扣 1 次，避免同一段录音反复刷免费额度。
+                _voice_quota_charged = False
+                try:
+                    from ai_agent import (
+                        transcribe_audio,
+                        extract_bill_from_text,
+                        AudioTranscribeError,
+                        TextBillError,
+                    )
+                except ImportError as _voice_import_exc:
+                    # ai_agent 的语音函数未合入时优雅降级：细节只进服务端日志，不红屏
+                    print(
+                        f"[voice] 语音记账模块不可用："
+                        f"{type(_voice_import_exc).__name__}: {_voice_import_exc}"
+                    )
+                    st.info("🎤 语音已收到，但转写暂不可用，建议打字或上传截图记账")
+                else:
+                    try:
+                        _voice_text = transcribe_audio(
+                            _voice_bytes, "voice.wav", ZHIPU_API_KEY
+                        )
+                    except AudioTranscribeError as _voice_err:
+                        _voice_code = getattr(_voice_err, "code", "")
+                        if _voice_code == "too_long":
+                            # 时长限制属于前置校验：不记账、不扣额度
+                            st.warning("录音超过 30 秒，请说短一点再试")
+                        elif _voice_code == "too_big":
+                            st.warning("录音文件太大，请缩短录音")
+                        elif _voice_code == "empty_audio":
+                            st.warning("没有录到声音，请重新录制")
+                        elif _voice_code == "empty_text":
+                            # 已经真正调用过转写服务，只是没返回文字：扣 1 次
+                            st.session_state.ai_daily_count += 1
+                            _voice_quota_charged = True
+                            st.info("没听清，请再说一遍，尽量靠近麦克风")
+                        elif _voice_code == "no_api_key":
+                            st.error("未配置智谱 API Key，语音记账暂不可用")
+                        else:
+                            # network / http / 未知错误：兜底 C —— 录音已收到，但转写暂不可用；
+                            # 细节只 print 到服务端，页面绝不出现 traceback
+                            st.session_state.ai_daily_count += 1
+                            _voice_quota_charged = True
+                            print(
+                                f"[voice] 转写失败（{_voice_code}）："
+                                f"{type(_voice_err).__name__}: {_voice_err}"
+                            )
+                            st.info("🎤 语音已收到，但转写暂不可用，建议打字或上传截图记账")
+                    except Exception as _voice_err:
+                        # 未预期异常：页面只给通用文案；真正发起过转写就按口径扣 1 次
+                        if not _voice_quota_charged:
+                            st.session_state.ai_daily_count += 1
+                            _voice_quota_charged = True
+                        print(
+                            f"[voice] 转写异常：{type(_voice_err).__name__}: {_voice_err}"
+                        )
+                        st.error("语音处理失败，请稍后再试")
+                    else:
+                        # 转写成功：额度 +1（后续解析/入库失败也不退，与截图记账口径一致）
+                        st.session_state.ai_daily_count += 1
+                        _voice_quota_charged = True
+                        try:
+                            _voice_bill = extract_bill_from_text(
+                                _voice_text, get_deepseek_api_key()
+                            )
+                            add_bill(
+                                st.session_state.user_id,
+                                _voice_bill["occurred_at"],
+                                _voice_bill["merchant"],
+                                _voice_bill["amount"],
+                                "语音记账",
+                                _voice_bill["bill_type"],
+                            )
+                        except TextBillError as _bill_err:
+                            _bill_code = getattr(_bill_err, "code", "")
+                            if _bill_code in ("invalid_bill", "parse"):
+                                st.info(
+                                    f"识别为「{_voice_text}」，"
+                                    f"但没提取到完整账单（{_bill_err}），建议手动补全"
+                                )
+                            elif _bill_code in ("network", "http"):
+                                st.warning("账单解析服务暂时不可用，请稍后再试或手动记账")
+                            else:
+                                st.warning("语音已收到，但解析失败，建议手动记账")
+                        except Exception as _bill_exc:
+                            # 解析之后的写库失败等：AI 调用已消耗，额度不重复扣
+                            print(
+                                f"[voice] 语音记账失败："
+                                f"{type(_bill_exc).__name__}: {_bill_exc}"
+                            )
+                            st.error("语音处理失败，请稍后再试")
+                        else:
+                            # 成功：签名已在调用前落位，这里只补识别文本（跨 rerun 常驻展示）
+                            st.session_state["last_voice_text"] = {
+                                "text": _voice_text,
+                                "merchant": _voice_bill["merchant"],
+                            }
+                            st.session_state["flash"] = {
+                                "level": "success",
+                                "msg": (
+                                    f"已通过语音为您记账 {_voice_bill['amount']:.2f} 元"
+                                    f"（{_voice_bill['merchant']}）"
+                                ),
+                            }
+                            st.cache_data.clear()      # 让指标/图表/明细立刻反映新账单
+                            st.session_state.page = 0  # 新账单按日期倒序，通常在第一页
+                            st.rerun()
+
 with tab_ai:
     # AI Chat
     st.subheader("AI 金融导师")

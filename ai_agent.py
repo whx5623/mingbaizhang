@@ -1389,3 +1389,453 @@ def generate_budget_plan(stats: dict, total_budget: float, api_key: str) -> dict
         "是" if scaled else "否",
     )
     return plan
+
+
+# ============================================================================
+# 语音记账 ①：录音 → 文字（智谱 GLM-ASR 文件级转写）
+# ----------------------------------------------------------------------------
+# 设计约定（与上方 BillImageError 区块保持一致）：
+# · 所有“面向用户”的失败统一走 AudioTranscribeError(code, message)：
+#     - code    供页面做分支处理（no_api_key / empty_audio / too_big / too_long /
+#               network / http / empty_text）；
+#     - message 是可直接渲染到页面的中文，必须带可操作建议；
+# · 前置校验全部在**发请求之前**完成：没 key、没音频、太大、太长都不该白跑一次网络；
+# · 日志只记「大小 / 时长 / 状态码 / 字数」，绝不记 api key，也绝不记音频内容；
+# · WAV 时长解析失败（webm/ogg/损坏头）**不拦截**，交给服务端判（服务端也有 30 秒硬限制）。
+# ============================================================================
+
+ZHIPU_ASR_URL = "https://open.bigmodel.cn/api/paas/v4/audio/transcriptions"
+ASR_MODEL = "glm-asr-2512"
+MAX_AUDIO_BYTES = 25 * 1024 * 1024      # 25MB：接口单文件上限
+MAX_AUDIO_SECONDS = 30.0                # 30 秒：接口单段音频上限
+ASR_TIMEOUT = 30                        # 转写比纯文本接口慢，给 30 秒
+ASR_UPLOAD_FILENAME = "voice.wav"
+
+
+class AudioTranscribeError(Exception):
+    """语音转写失败。
+
+    code 取值：
+      no_api_key   未配置智谱 API Key（**未发请求**）
+      empty_audio  音频为空 / 不是 bytes（**未发请求**）
+      too_big      音频文件超过 25MB（**未发请求**）
+      too_long     WAV 时长超过 30 秒（**未发请求**）
+      network      网络异常（超时 / 连接失败 / 其它请求层异常）
+      http         接口返回非 200
+      empty_text   接口返回的 text 缺失或空白（等于“没听清”）
+
+    message 为面向用户的中文提示，可直接展示。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"AudioTranscribeError(code={self.code!r}, message={self.message!r})"
+
+
+def _wav_duration_seconds(audio_bytes: bytes):
+    """解析 WAV 头算时长：时长 = data_size / byte_rate。
+
+    返回秒数（float）；头不合法 / 不是 WAV（例如 webm）/ 解析失败一律返回 None，
+    由调用方决定“不拦截、交给服务端判”。
+    """
+    data = bytes(audio_bytes)
+    if len(data) < 12 or data[0:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return None
+
+    pos = 12
+    byte_rate = 0
+    data_size = None
+    while pos + 8 <= len(data):
+        chunk_id = data[pos:pos + 4]
+        chunk_size = int.from_bytes(data[pos + 4:pos + 8], "little")
+        body = pos + 8
+        if chunk_id == b"fmt ":
+            # fmt 结构：audio_format(2) channels(2) sample_rate(4) byte_rate(4) ...
+            if chunk_size < 16 or body + 16 > len(data):
+                return None
+            byte_rate = int.from_bytes(data[body + 8:body + 12], "little")
+        elif chunk_id == b"data":
+            if body > len(data):
+                return None
+            # 声明大小可能大于实际剩余长度（截断/伪造头）：以实际可读长度为准
+            data_size = min(chunk_size, len(data) - body)
+            break
+        # chunk 按偶数字节对齐（chunk_size 为奇数时补 1 字节）
+        pos = body + chunk_size + (chunk_size & 1)
+
+    if data_size is None or byte_rate <= 0:
+        return None
+    return data_size / float(byte_rate)
+
+
+def transcribe_audio(audio_bytes: bytes, filename: str = "voice.wav", zhipu_api_key: str = "") -> str:
+    """把一段录音转成文字（智谱文件级 ASR：POST /paas/v4/audio/transcriptions）。
+
+    参数顺序与默认值不可改（app.py 会按位置/关键字调用）：
+        transcribe_audio(audio_bytes, filename="voice.wav", zhipu_api_key="")
+
+    filename 只用于调用方语义兼容，**不参与**上传命名：服务端按扩展名判断音频容器格式，
+    浏览器 MediaRecorder 常给 "voice.webm"，原样透传会被按扩展名直接拒掉，
+    因此上传名固定为 voice.wav（见下方第 ⑤ 步注释）。
+
+    返回：识别文本（已 strip）。
+    失败：抛 AudioTranscribeError(code, message)，所有 code 见类文档。
+    """
+    # ---- ① key：空/纯空白直接拒绝，**不发请求** ----
+    if not isinstance(zhipu_api_key, str) or not zhipu_api_key.strip():
+        raise AudioTranscribeError(
+            "no_api_key",
+            "未配置 ZHIPU_API_KEY，语音记账暂不可用。请在 .streamlit/secrets.toml 里配置 "
+            "ZHIPU_API_KEY（形如 xxxxxxxx.xxxxxxxx，首尾不要带空格/引号）后重试。",
+        )
+    api_key = zhipu_api_key.strip()
+
+    # ---- ② 音频字节：类型 / 空值，**不发请求** ----
+    if not isinstance(audio_bytes, (bytes, bytearray)):
+        raise AudioTranscribeError(
+            "empty_audio",
+            "没有收到录音数据，请按住录音按钮、说完再松开，然后重试。",
+        )
+    raw = bytes(audio_bytes)
+    if not raw:
+        raise AudioTranscribeError(
+            "empty_audio",
+            "录音是空的（0 字节），请再说一遍，尽量靠近麦克风。",
+        )
+
+    # ---- ③ 体积：> 25MB 直接拒绝（接口硬限制），**不发请求** ----
+    if len(raw) > MAX_AUDIO_BYTES:
+        raise AudioTranscribeError(
+            "too_big",
+            f"录音文件太大（{_format_size(len(raw))}，接口上限 25MB），"
+            "请缩短录音到 30 秒以内再试。",
+        )
+
+    # ---- ④ 时长：能解析 WAV 头就按 30 秒拦；解析不了（webm 等）不拦，交给服务端判 ----
+    duration = _wav_duration_seconds(raw)
+    if duration is None:
+        # 不是标准 WAV（浏览器录的 webm/ogg、或头损坏）：本地算不出时长，
+        # 只记日志、继续上传，由服务端按它自己的 30 秒硬限制判定。
+        logger.info(
+            "音频头不是可解析的 WAV，跳过长时长前置校验（大小=%.2fKB）", len(raw) / 1024
+        )
+    elif duration > MAX_AUDIO_SECONDS:
+        raise AudioTranscribeError(
+            "too_long",
+            f"录音太长了（约 {duration:.1f} 秒，接口上限 30 秒），"
+            "请缩短到 30 秒以内再说一遍。",
+        )
+
+    # ---- ⑤ 上传文件名固定 voice.wav ----
+    # 注意：无论调用方传什么 filename（哪怕没有 .wav 后缀，或传的是 voice.webm），
+    # 上传名都统一成 voice.wav —— 服务端会按扩展名判断音频容器格式，
+    # 浏览器录制的 webm/ogg 若按原名上传会被直接拒绝（4xx），改名后由服务端解码。
+    upload_filename = ASR_UPLOAD_FILENAME
+    duration_text = f"{duration:.1f}s" if duration is not None else "未知"
+
+    # ---- ⑥ 发请求：multipart，文件级转写 ----
+    logger.info("语音转写请求（大小=%.2fKB，时长=%s）", len(raw) / 1024, duration_text)
+    try:
+        resp = requests.post(
+            ZHIPU_ASR_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": (upload_filename, raw, "audio/wav")},
+            data={"model": ASR_MODEL, "stream": "false"},
+            timeout=ASR_TIMEOUT,
+        )
+    except requests.Timeout:
+        logger.warning("语音转写超时（大小=%.2fKB，时长=%s）", len(raw) / 1024, duration_text)
+        raise AudioTranscribeError("network", "语音识别超时，请检查网络后重试。") from None
+    except requests.ConnectionError:
+        logger.warning("语音转写连接失败（大小=%.2fKB）", len(raw) / 1024)
+        raise AudioTranscribeError("network", "网络连接失败，请检查网络或代理设置后重试。") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：日志只记异常类型，避免把 headers / key 带出去
+        logger.warning("语音转写请求失败（大小=%.2fKB，异常=%s）", len(raw) / 1024, type(exc).__name__)
+        raise AudioTranscribeError("network", "语音识别请求发送失败，请稍后重试。") from None
+
+    # ---- ⑦ 非 200 → http（状态码 + 截断 body，body 先脱敏 key 再截断 80 字） ----
+    if resp.status_code != 200:
+        snippet = _extract_error_snippet(resp, api_key)
+        tail = f" 返回内容：{snippet}" if snippet else ""
+        logger.warning("语音转写接口返回 HTTP %s（大小=%.2fKB）", resp.status_code, len(raw) / 1024)
+        raise AudioTranscribeError(
+            "http",
+            f"语音识别接口返回异常（HTTP {resp.status_code}）。请稍后重试；"
+            f"若为 401/403，请检查 ZHIPU_API_KEY 是否正确、是否开通语音模型权限；"
+            f"若为 429/余额相关，请检查账户额度。{tail}",
+        )
+
+    # ---- ⑧ 解析：非 JSON / text 缺失或空白 → empty_text（等于“没听清”） ----
+    try:
+        resp_data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("语音转写响应不是合法 JSON（大小=%.2fKB）", len(raw) / 1024)
+        raise AudioTranscribeError(
+            "empty_text", "没听清，请再说一遍，尽量靠近麦克风。"
+        ) from None
+    text_value = resp_data.get("text") if isinstance(resp_data, dict) else None
+    if not isinstance(text_value, str) or not text_value.strip():
+        logger.warning(
+            "语音转写返回空文本（大小=%.2fKB，状态码=%s）", len(raw) / 1024, resp.status_code
+        )
+        raise AudioTranscribeError(
+            "empty_text", "没听清，请再说一遍，尽量靠近麦克风。"
+        )
+    text = text_value.strip()
+    logger.info(
+        "语音转写成功（大小=%.2fKB，时长=%s，字数=%d）",
+        len(raw) / 1024,
+        duration_text,
+        len(text),
+    )
+    return text
+
+
+# ============================================================================
+# 语音记账 ②：口述文字 → 结构化账单（DeepSeek Chat，只输出 JSON）
+# ----------------------------------------------------------------------------
+# · 失败统一走 TextBillError(code, message)，code ∈
+#     no_api_key / empty_text / network / http / parse / invalid_bill；
+# · 前置校验（key 空、text 空）在发请求之前，绝不白跑网络；
+# · 日期：模型可以说空（→ 用今天），但只要给了，就必须是真实存在的 YYYY-MM-DD，
+#   绝不静默改成今天（2026-02-30 这类必须报 invalid_bill）；
+# · 日志只记字数/状态码，绝不记 key，也绝不记用户原话（可能是个人消费信息）。
+# ============================================================================
+
+# 追加区块需要 date.today()：为保持“只追加、不改文件头部 import”，这里就地导入。
+from datetime import date as _date
+
+TEXT_BILL_MODEL = "deepseek-chat"
+TEXT_BILL_TEMPERATURE = 0        # 抽取信息要可复现，不要发散
+TEXT_BILL_MAX_TOKENS = 200       # 一行 JSON 足够
+TEXT_BILL_TIMEOUT = 20
+
+TEXT_BILL_SYSTEM_PROMPT = """你是一个账单信息抽取器。请从用户的一句中文口述里抽取：商户/项目名称、金额（正数数字）、交易日期、收支类型。只输出一个 JSON 对象，不要任何解释。日期必须是 YYYY-MM-DD；如果用户说“今天/昨天/前天”，请按我给你的今天日期换算成绝对日期；如果完全没提日期，paid_at 给空串。金额取正数，不要说“元”。收入类（工资/红包/退款/收款）type 为“收入”，其余为“支出”。"""
+
+
+class TextBillError(Exception):
+    """口述文字 → 账单结构化失败。
+
+    code 取值：
+      no_api_key   未配置 DeepSeek API Key（**未发请求**）
+      empty_text   输入文字为空/纯空白（**未发请求**）
+      network      网络异常（超时 / 连接失败 / 其它请求层异常）
+      http         接口返回非 200
+      parse        模型输出不是可解析的 JSON（抠 ```json 代码块后仍失败）
+      invalid_bill 解析成功但字段不合规（商户空、金额<=0/超上限、日期非法）
+
+    message 为面向用户的中文提示，可直接展示。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"TextBillError(code={self.code!r}, message={self.message!r})"
+
+
+def _loads_json_object(content: str):
+    """先整体 json.loads；失败再抠 ```json ... ``` 代码块；都不行返回 None（不抛）。"""
+    candidates = [content]
+    fenced = re.search(
+        r"```(?:json)?\s*(.+?)```", content, flags=re.IGNORECASE | re.DOTALL
+    )
+    if fenced:
+        candidates.append(fenced.group(1))
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate.strip())
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _parse_text_bill_date(value):
+    """严格按 %Y-%m-%d 解析真实日历日；其它格式 / 不存在的日期一律返回 None。
+
+    与 _normalize_bill_date 的区别：这条链路吃的是模型的**结构化输出**，
+    格式不合规就是违约（或用户没说清楚），按 invalid_bill 让用户重说一句，
+    不做“2026/10/1”“2026年10月1日”之类的宽松兜底。
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def extract_bill_from_text(text: str, api_key: str = "") -> dict:
+    """把一句中文口述（已转写好的文字）抽成一条账单。
+
+    返回：
+        {"merchant": str, "amount": float, "occurred_at": "YYYY-MM-DD",
+         "bill_type": "支出"|"收入", "raw": str}
+    raw 是模型原始输出（JSON 字符串），仅用于排查，不直接展示给用户。
+
+    失败：抛 TextBillError(code, message)，code 见类文档。
+    """
+    # ---- ① 前置校验：key 空 / text 空，都**不发请求** ----
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise TextBillError(
+            "no_api_key",
+            "未配置 DEEPSEEK_API_KEY，语音记账暂不可用。请在 .streamlit/secrets.toml 里配置 "
+            "DEEPSEEK_API_KEY 后重试。",
+        )
+    if not isinstance(text, str) or not text.strip():
+        raise TextBillError("empty_text", "没有听到内容，请再说一遍。")
+    api_key = api_key.strip()
+    utterance = text.strip()
+    today = _date.today()
+
+    # 把“今天”告诉模型，它才能把“昨天/前天”换算成绝对日期。
+    # 用户原话只作为待抽取文本，system prompt 已限定它不执行任何指令。
+    user_content = f"今天是 {today.isoformat()}。\n用户原话：{utterance}"
+    payload = {
+        "model": TEXT_BILL_MODEL,
+        "messages": [
+            {"role": "system", "content": TEXT_BILL_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": TEXT_BILL_TEMPERATURE,
+        "max_tokens": TEXT_BILL_MAX_TOKENS,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ---- ② 发请求 ----
+    try:
+        resp = requests.post(
+            DEEPSEEK_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=TEXT_BILL_TIMEOUT,
+        )
+    except requests.Timeout:
+        logger.warning("口述账单抽取超时（字数=%d）", len(utterance))
+        raise TextBillError("network", "账单识别超时，请稍后重试。") from None
+    except requests.ConnectionError:
+        logger.warning("口述账单抽取连接失败（字数=%d）", len(utterance))
+        raise TextBillError("network", "网络连接失败，请检查网络后重试。") from None
+    except requests.RequestException as exc:
+        logger.warning(
+            "口述账单抽取请求失败（字数=%d，异常=%s）", len(utterance), type(exc).__name__
+        )
+        raise TextBillError("network", "账单识别请求发送失败，请稍后重试。") from None
+
+    # ---- ③ 非 200 → http（带状态码；body 脱敏 key 后截断 80 字） ----
+    if resp.status_code != 200:
+        snippet = _extract_error_snippet(resp, api_key)
+        tail = f" 返回内容：{snippet}" if snippet else ""
+        logger.warning("口述账单抽取接口返回 HTTP %s（字数=%d）", resp.status_code, len(utterance))
+        raise TextBillError(
+            "http",
+            f"账单识别服务返回异常（HTTP {resp.status_code}）。请稍后重试；"
+            f"若为 401/403，请检查 DEEPSEEK_API_KEY 是否正确；"
+            f"若为 429/余额相关，请检查账户额度。{tail}",
+        )
+
+    # ---- ④ 取出模型文本 ----
+    try:
+        resp_data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("口述账单抽取响应不是合法 JSON（字数=%d）", len(utterance))
+        raise TextBillError("parse", "AI 没有返回有效结果，请重试。") from None
+    try:
+        content = resp_data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("口述账单抽取响应结构不符合预期（字数=%d）", len(utterance))
+        raise TextBillError("parse", "AI 没有返回有效结果，请重试。") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("口述账单抽取响应 content 为空（字数=%d）", len(utterance))
+        raise TextBillError("parse", "AI 没有返回有效结果，请重试。")
+    content = content.strip()
+
+    # ---- ⑤ 解析 JSON：整体 → ```json 代码块 → parse ----
+    data = _loads_json_object(content)
+    if data is None:
+        logger.warning("口述账单抽取输出不是合法 JSON（字数=%d）", len(utterance))
+        raise TextBillError("parse", "AI 返回的结果无法解析成账单 JSON，请再说一遍。")
+
+    # ---- ⑥ 字段校验（顺序：商户 → 金额 → 日期 → 类型） ----
+    merchant_raw = data.get("merchant")
+    merchant = merchant_raw.strip() if isinstance(merchant_raw, str) else ""
+    if not merchant:
+        logger.warning("口述账单抽取缺少商户（字数=%d）", len(utterance))
+        raise TextBillError("invalid_bill", "没听清是哪一笔消费，请再说一遍。")
+
+    # amount：必须是“能直接转 float”的正数（bool 不算数字，字符串不做去符号兜底）
+    amount_raw = data.get("amount")
+    amount = None
+    if isinstance(amount_raw, bool) or amount_raw is None:
+        amount = None
+    elif isinstance(amount_raw, (int, float)):
+        amount = float(amount_raw)
+    elif isinstance(amount_raw, str):
+        try:
+            amount = float(amount_raw.strip())
+        except ValueError:
+            amount = None
+    if amount is None or not math.isfinite(amount) or amount <= 0:
+        logger.warning("口述账单抽取金额非法（字数=%d）", len(utterance))
+        raise TextBillError(
+            "invalid_bill",
+            "没听清这笔花了多少钱，请说出一个大于 0 的金额后再重复一遍。",
+        )
+    if amount > MAX_BILL_AMOUNT:
+        logger.warning("口述账单抽取金额超出上限（字数=%d）", len(utterance))
+        raise TextBillError(
+            "invalid_bill", "金额超出合理范围，请核对后再说一遍，或手动填写。"
+        )
+
+    paid_at_raw = data.get("paid_at")
+    if not isinstance(paid_at_raw, str) or not paid_at_raw.strip():
+        # 完全没提日期 → 用今天（system prompt 要求这种情况给空串）
+        occurred_at = today.isoformat()
+    else:
+        occurred_at = _parse_text_bill_date(paid_at_raw)
+        if occurred_at is None:
+            # 给了日期但不是真实日历日（如 2026-02-30）→ 绝不静默改成今天
+            logger.warning("口述账单抽取日期非法（字数=%d）", len(utterance))
+            raise TextBillError(
+                "invalid_bill",
+                f"没听清是哪一天的花费（原始值：「{paid_at_raw.strip()[:20]}」），"
+                "请说具体日期（例如“10 月 1 日”）后再重复一遍。",
+            )
+
+    # 其它值统一按支出（只有明确的收入类词汇才判为收入）
+    bill_type = _normalize_bill_type(data.get("type")) or "支出"
+
+    logger.info(
+        "口述账单抽取成功（字数=%d，类型=%s，日期=%s）",
+        len(utterance),
+        bill_type,
+        "显式" if isinstance(paid_at_raw, str) and paid_at_raw.strip() else "空→今天",
+    )
+    return {
+        "merchant": merchant,
+        "amount": round(float(amount), 2),
+        "occurred_at": occurred_at,
+        "bill_type": bill_type,
+        "raw": content,
+    }
