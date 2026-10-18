@@ -42,6 +42,11 @@ except ImportError as _poster_import_exc:
         f"{type(_poster_import_exc).__name__}: {_poster_import_exc}"
     )
 
+
+class _ChartInsightFallbackError(Exception):
+    """ai_agent.ChartInsightError 尚未合入时的占位异常（保证 except 子句可用）。"""
+
+
 st.set_page_config(layout="wide")
 
 # ========= 「记住我」常量 =========
@@ -450,6 +455,43 @@ if st.session_state.is_admin:
 @st.cache_data
 def load_all_data(user_id):
     return get_all_bills(user_id)
+
+
+# ===== AI 图表洞察：同一份 stats 命中进程内缓存，不重复调用 API =====
+# 这里刻意**不用** @st.cache_data：额度必须按「是否真的发起 API 请求」计算，
+# 而 st.cache_data 不暴露命中/未命中，无法区分。改用显式 dict：
+#   · 命中 → 直接返回文本、不调用 AI、页面不扣额度（用户多点几次不会被扣完）；
+#   · 未命中 → 调一次 AI，成功后写入缓存，由调用方 +1 额度；
+#   · 失败 → 不写缓存（下次仍会重试），由调用方按“已尝试”+1 额度。
+# 进程级缓存必须挂在 st.cache_resource 上：Streamlit 每次 rerun 都会重跑本文件，
+# 模块级 dict 会被重新初始化为空，缓存等于没做。cache_resource 在进程内只建一次，
+# 跨 rerun / 跨会话共享；重启应用即失效。上限 200 条，超出丢最早一条（FIFO 近似）。
+_CHART_INSIGHT_CACHE_MAX = 200
+
+
+@st.cache_resource(show_spinner=False)
+def _chart_insight_cache_store() -> dict[str, str]:
+    """返回进程级 stats_json -> 洞察文本 的缓存字典（单例）。"""
+    return {}
+
+
+def _chart_insight_cached(stats_json: str, api_key: str) -> tuple[str, bool]:
+    """返回 (洞察文本, 是否命中缓存)。
+
+    stats_json 由调用方用 json.dumps(..., sort_keys=True, ensure_ascii=False)
+    归一化，同一份图表数据得到同一个 key。
+    """
+    store = _chart_insight_cache_store()
+    if stats_json in store:
+        return store[stats_json], True
+    from ai_agent import generate_chart_insight
+
+    text = generate_chart_insight(json.loads(stats_json), api_key)
+    if len(store) >= _CHART_INSIGHT_CACHE_MAX:
+        store.pop(next(iter(store)))
+    store[stats_json] = text
+    return text, False
+
 
 # Sidebar
 with st.sidebar:
@@ -1274,6 +1316,165 @@ with tab_dash:
                 }]
             }
             st_echarts(rose_option, height=320)
+
+    # ===== AI 洞察：本月消费图表解读（玫瑰图下方、数据导出之前）=====
+    # 统计口径与上方玫瑰图一致：本月 + 支出。无支出时只给引导，不显示按钮。
+    _insight_exp_df = df_current_month[df_current_month["type"] == "支出"]
+    _insight_total = float(_insight_exp_df["amount"].sum()) if not _insight_exp_df.empty else 0.0
+    if _insight_exp_df.empty or _insight_total <= 0:
+        st.caption("本月还没有支出，先记几笔再看 AI 洞察")
+    else:
+        _insight_tx_count = int(len(_insight_exp_df))
+
+        # Top1 分类：优先 category；迁移 012 未执行（无 category 列）时退回 merchant。
+        if "category" in _insight_exp_df.columns:
+            _insight_cat = (
+                _insight_exp_df["category"].fillna("其他").astype(str).str.strip()
+            )
+            _insight_grouped = (
+                _insight_exp_df.assign(
+                    _top_cat=_insight_cat.where(_insight_cat != "", "其他")
+                )
+                .groupby("_top_cat")["amount"]
+                .sum()
+            )
+        else:
+            _insight_grouped = _insight_exp_df.groupby("merchant")["amount"].sum()
+        if _insight_grouped.empty:
+            _insight_top_category = "其他"
+            _insight_top_amount = 0.0
+        else:
+            _insight_top_category = str(_insight_grouped.idxmax())
+            _insight_top_amount = float(_insight_grouped.max())
+
+        # 最高单笔：本月支出中金额最大的一条；空 DataFrame 已在上面拦掉。
+        _insight_max_row = _insight_exp_df.loc[_insight_exp_df["amount"].idxmax()]
+        _insight_max_merchant_raw = _insight_max_row.get("merchant")
+        _insight_max_merchant = (
+            "" if pd.isna(_insight_max_merchant_raw) else str(_insight_max_merchant_raw).strip()
+        )
+        _insight_max_date_raw = _insight_max_row.get("date")
+        _insight_max_date = (
+            "" if pd.isna(_insight_max_date_raw) else str(_insight_max_date_raw).strip()
+        )
+        _insight_max_single = {
+            "merchant": _insight_max_merchant or "未知商户",
+            "amount": float(_insight_max_row["amount"]),
+            "date": _insight_max_date,
+        }
+
+        # 上月：本月 1 号往前一天 = 上月最后一天，只用 datetime.date，不引入 dateutil。
+        _insight_month_first = date(
+            int(current_month_str[:4]), int(current_month_str[5:7]), 1
+        )
+        _insight_prev_last_day = _insight_month_first - timedelta(days=1)
+        _insight_prev_month = f"{_insight_prev_last_day.year}-{_insight_prev_last_day.month:02d}"
+        _insight_prev_total = float(
+            df[
+                (df["date_parsed"].dt.strftime("%Y-%m") == _insight_prev_month)
+                & (df["type"] == "支出")
+            ]["amount"].sum()
+        )
+        _insight_change_pct = (
+            (_insight_total - _insight_prev_total) / _insight_prev_total * 100.0
+            if _insight_prev_total > 0
+            else None
+        )
+
+        _insight_stats = {
+            "month": current_month_str,
+            "total_expense": _insight_total,
+            "tx_count": _insight_tx_count,
+            "top_category": _insight_top_category,
+            "top_amount": _insight_top_amount,
+            "max_single": _insight_max_single,
+            "prev_month_expense": _insight_prev_total,
+            "change_pct": _insight_change_pct,
+        }
+        _insight_stats_json = json.dumps(_insight_stats, sort_keys=True, ensure_ascii=False)
+        stats_key = hashlib.sha256(_insight_stats_json.encode()).hexdigest()
+
+        if st.button("🔎 AI 洞察", key="chart_insight_btn"):
+            if st.session_state.ai_daily_count >= 20:
+                st.warning("今日免费额度已用完，请明天再来")
+            else:
+                # 函数内 import：后端缺失也能落到本地兜底，不让整页红屏。
+                try:
+                    from ai_agent import ChartInsightError
+                except ImportError:
+                    ChartInsightError = _ChartInsightFallbackError
+
+                _insight_error = None
+                _insight_text = None
+                _insight_hit = False
+                try:
+                    with st.spinner("AI 正在读你的账单…"):
+                        _insight_text, _insight_hit = _chart_insight_cached(
+                            _insight_stats_json, get_deepseek_api_key()
+                        )
+                except ChartInsightError as exc:
+                    _insight_error = exc
+                    st.warning(f"AI 洞察暂不可用：{exc}")
+                except Exception as exc:
+                    _insight_error = exc
+                    print(f"[insight] AI 洞察失败：{type(exc).__name__}: {exc}")
+                    st.warning("AI 洞察暂不可用，已用本地分析代替")
+
+                _insight_text = (
+                    _insight_text.strip() if isinstance(_insight_text, str) else ""
+                )
+                if _insight_error is None and _insight_text:
+                    st.session_state["chart_insight"] = {
+                        "key": stats_key,
+                        "text": _insight_text,
+                        "fallback": False,
+                    }
+                    # 只有真正发起 API 请求才扣额度；命中缓存不扣，避免用户
+                    # 反复点击把当日 20 次额度耗尽。
+                    if not _insight_hit:
+                        st.session_state.ai_daily_count += 1
+                else:
+                    if _insight_error is None:
+                        # 后端违约返回空文本：同样走本地兜底，保证页面有可用内容
+                        print("[insight] AI 洞察返回空文本，使用本地兜底")
+                        st.warning("AI 洞察暂不可用，已用本地分析代替")
+                    _insight_fallback = (
+                        f"本月你在「{_insight_top_category}」上花得最多"
+                        f"（¥{_insight_top_amount:.2f}）"
+                    )
+                    if _insight_max_single:
+                        _insight_fallback += (
+                            f"，单笔最高 ¥{_insight_max_single['amount']:.2f}"
+                            f"（{_insight_max_single['merchant']}）"
+                        )
+                    if _insight_change_pct is not None:
+                        _insight_fallback += (
+                            f"；比上月{'多' if _insight_change_pct > 0 else '少'}花 "
+                            f"{abs(_insight_change_pct):.1f}%"
+                        )
+                    _insight_fallback += "。控制一下冲动消费会更好。"
+                    st.session_state["chart_insight"] = {
+                        "key": stats_key,
+                        "text": _insight_fallback,
+                        "fallback": True,
+                    }
+                    # 失败说明确实发起过请求（异常在 API 调用之后抛出），按“已尝试”扣 1 次；
+                    # 失败结果不写缓存，用户再点会重新请求。
+                    st.session_state.ai_daily_count += 1
+
+        # 渲染独立于按钮：rerun 后只要数据没变（key 相同）就继续展示；
+        # 数据已变化（key 不同）则刻意不渲染旧文本，避免误导。
+        _insight_saved = st.session_state.get("chart_insight")
+        if (
+            isinstance(_insight_saved, dict)
+            and _insight_saved.get("key") == stats_key
+            and _insight_saved.get("text")
+        ):
+            st.info(_insight_saved["text"])
+            _insight_caption = "AI 洞察 · 基于本月图表数据"
+            if _insight_saved.get("fallback"):
+                _insight_caption += "（本地兜底）"
+            st.caption(_insight_caption)
 
     # Export
     st.subheader("数据导出")

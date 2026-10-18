@@ -1839,3 +1839,217 @@ def extract_bill_from_text(text: str, api_key: str = "") -> dict:
         "bill_type": bill_type,
         "raw": content,
     }
+
+
+# ============================================================================
+# 图表洞察（DeepSeek Chat，纯文本一段话，供 app.py 图表区展示）
+# ----------------------------------------------------------------------------
+# 输入是 app.py 已经算好的图表统计（stats），本函数只负责"翻译成人话"，
+# 不做任何统计/聚合计算；输出裁剪到 120 字，防止模型不听话写成长篇。
+# · 失败统一走 ChartInsightError(code, message)，code ∈
+#     no_api_key / empty_stats / network / http / empty_text；
+# · 前置校验（key 空、stats 非 dict、总支出 <= 0）全部在**发请求之前**完成；
+# · 日志只记 month、字数、状态码、异常类型，绝不记 api_key 或用户数据原文。
+# ============================================================================
+
+# 系统提示词必须**逐字**保持（产品口径，改一个字点评风格就跑偏）。
+CHART_INSIGHT_SYSTEM_PROMPT = "你是一个懂大学生、说话犀利但不刻薄的理财分析师。请根据我提供的本月消费图表数据，用 50 字左右写一段洞察点评：必须提到本月消费最多的类别和它的金额，如果给了最高单笔就提一句，如果有上月对比就说清是变节制还是变铺张，最后给一条具体建议。不要寒暄、不要分点、不要解释，直接输出一段话。"
+
+CHART_INSIGHT_MODEL = "deepseek-chat"
+CHART_INSIGHT_TEMPERATURE = 0.7
+CHART_INSIGHT_MAX_TOKENS = 200
+CHART_INSIGHT_TIMEOUT = 20
+CHART_INSIGHT_MAX_CHARS = 120  # 返回文本硬上限：超过截断到 120 字并补「…」
+
+
+class ChartInsightError(Exception):
+    """图表洞察生成失败。
+
+    code 取值：
+      no_api_key   未配置 DeepSeek API Key（**未发请求**）
+      empty_stats  本月没有消费数据 / stats 不是 dict（**未发请求**）
+      network      网络异常（超时 / 连接失败 / 其它请求层异常）
+      http         接口返回非 200（message 只带状态码，不带响应体）
+      empty_text   响应不是合法 JSON / choices/content 缺失或为空
+
+    message 为面向用户的中文提示，可直接展示。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"ChartInsightError(code={self.code!r}, message={self.message!r})"
+
+
+def _chart_amount(value):
+    """金额宽松转 float：None / bool / 非数字 / nan / inf → None（表示"没有这项数据"）。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(amount):
+        return None
+    return amount
+
+
+def _chart_count(value) -> int:
+    """笔数转 int：非法/负数 → 0（图表统计里笔数只用于文案，不值得为此报错）。"""
+    amount = _chart_amount(value)
+    if amount is None or amount < 0:
+        return 0
+    return int(amount)
+
+
+def _format_chart_max_single(max_single) -> str:
+    """最高单笔文案：结构不符/为空 → "无"；字段缺失时用占位词，绝不 KeyError。"""
+    if not isinstance(max_single, dict) or not max_single:
+        return "无"
+    merchant = str(max_single.get("merchant") or "").strip() or "未知商户"
+    amount = _chart_amount(max_single.get("amount"))
+    amount_text = f"{amount:.2f} 元" if amount is not None else "金额未知"
+    occurred = str(max_single.get("date") or "").strip() or "日期未知"
+    return f"{merchant} / {amount_text} / {occurred}"
+
+
+def _format_chart_change(change_pct) -> str:
+    """环比文案：无数据 → "上月无数据"；否则说清是变铺张（涨）还是变节制（降）。"""
+    change = _chart_amount(change_pct)
+    if change is None:
+        return "上月无数据"
+    if change > 0:
+        return f"较上月上升 {change:.1f}%（变铺张）"
+    if change < 0:
+        return f"较上月下降 {abs(change):.1f}%（变节制）"
+    return "与上月持平（0.0%）"
+
+
+def _build_chart_insight_user_content(stats: dict) -> str:
+    """把 app.py 汇总的图表 stats 排成中文条目（金额一律两位小数）。"""
+    month = str(stats.get("month") or "本月")
+    total_expense = _chart_amount(stats.get("total_expense")) or 0.0
+    tx_count = _chart_count(stats.get("tx_count"))
+
+    # Top1 类别：缺失时写占位词，不带出任何原始数据结构。
+    top_category = str(stats.get("top_category") or "").strip() or "无"
+    top_amount = _chart_amount(stats.get("top_amount"))
+    top_amount_text = f"{top_amount:.2f} 元" if top_amount is not None else "金额未知"
+
+    prev_expense = _chart_amount(stats.get("prev_month_expense"))
+    prev_expense_text = f"{prev_expense:.2f} 元" if prev_expense is not None else "无"
+
+    lines = [
+        "这是我的本月消费图表数据，请按系统要求写一段洞察点评：",
+        f"月份：{month}",
+        f"本月总支出：{total_expense:.2f} 元",
+        f"消费笔数：{tx_count} 笔",
+        f"Top1 类别：{top_category} / {top_amount_text}",
+        f"最高单笔：{_format_chart_max_single(stats.get('max_single'))}",
+        f"上月总支出：{prev_expense_text}",
+        f"环比：{_format_chart_change(stats.get('change_pct'))}",
+    ]
+    return "\n".join(lines)
+
+
+def generate_chart_insight(stats: dict, api_key: str) -> str:
+    """根据图表统计生成一段约 50 字的消费洞察，返回去除首尾空白后的文本。
+
+    失败一律抛 ChartInsightError（中文 message，可直接上页面）：
+      · api_key 为空                     → 未配置提示（且**不发请求**）；
+      · stats 不是 dict                  → "数据不完整"（且**不发请求**）；
+      · 总支出 <= 0 / 缺失 / 非数字       → "本月还没有消费记录"（且**不发请求**）；
+      · 超时 / 连接失败 / 其它请求层异常  → 对应中文提示；
+      · 非 200                           → 带状态码的提示（不拼响应体）；
+      · 响应不是 JSON / 没有有效 content → "AI 没有返回有效洞察"。
+    返回文本超过 120 字时截断到 120 字并补「…」。
+    日志只记月份、字数、状态码与异常类型，**绝不**记 api_key 或用户数据原文。
+    """
+    # ① api_key：先查它，没有 key 时不该先花一次网络往返。
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise ChartInsightError(
+            "no_api_key",
+            "未配置 DEEPSEEK_API_KEY，AI 图表洞察暂不可用",
+        )
+    api_key = api_key.strip()
+
+    # ② 数据前置校验：stats 结构不对 / 本月没有任何支出，都不该让模型对着 0 硬编。
+    if not isinstance(stats, dict):
+        raise ChartInsightError(
+            "empty_stats",
+            "本月消费数据不完整，暂时无法生成图表洞察，请刷新后重试",
+        )
+    total_expense = _chart_amount(stats.get("total_expense"))
+    if total_expense is None or total_expense <= 0:
+        raise ChartInsightError(
+            "empty_stats",
+            "本月还没有消费记录，先记几笔再来查看图表洞察吧",
+        )
+    month = str(stats.get("month") or "本月")
+
+    user_content = _build_chart_insight_user_content(stats)
+    payload = {
+        "model": CHART_INSIGHT_MODEL,
+        "messages": [
+            {"role": "system", "content": CHART_INSIGHT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        # temperature 0.7：点评要有点"人味"但不至于跑题；max_tokens 200 够 50 字。
+        "temperature": CHART_INSIGHT_TEMPERATURE,
+        "max_tokens": CHART_INSIGHT_MAX_TOKENS,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ③ 发请求：超时/连接失败翻译成用户能看懂的句子（不把异常对象漏到页面）。
+    try:
+        resp = requests.post(
+            DEEPSEEK_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=CHART_INSIGHT_TIMEOUT,
+        )
+    except requests.Timeout:
+        logger.warning("图表洞察请求超时（月份=%s）", month)
+        raise ChartInsightError("network", "生成图表洞察超时，请稍后再试") from None
+    except requests.ConnectionError:
+        logger.warning("图表洞察请求连接失败（月份=%s）", month)
+        raise ChartInsightError("network", "网络连接失败，请检查网络") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：日志只记异常类型（确保不把 headers / key 带出去）。
+        logger.warning("图表洞察请求失败（月份=%s，异常=%s）", month, type(exc).__name__)
+        raise ChartInsightError("network", "网络连接失败，请检查网络") from None
+
+    # ④ 非 200：只带状态码，不把响应体拼进 message（响应体可能含请求回显）。
+    if resp.status_code != 200:
+        logger.warning("图表洞察接口返回 HTTP %s（月份=%s）", resp.status_code, month)
+        raise ChartInsightError("http", f"AI 服务返回异常（HTTP {resp.status_code}），请稍后重试")
+
+    # ⑤ 解析：非 JSON / 结构不符 / content 为空 → 同一条"没有有效洞察"。
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("图表洞察响应不是合法 JSON（月份=%s）", month)
+        raise ChartInsightError("empty_text", "AI 没有返回有效洞察，请重试") from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("图表洞察响应结构不符合预期（月份=%s）", month)
+        raise ChartInsightError("empty_text", "AI 没有返回有效洞察，请重试") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("图表洞察响应 content 为空（月份=%s）", month)
+        raise ChartInsightError("empty_text", "AI 没有返回有效洞察，请重试")
+
+    content = content.strip()
+    if len(content) > CHART_INSIGHT_MAX_CHARS:
+        content = content[:CHART_INSIGHT_MAX_CHARS] + "…"
+    logger.info("图表洞察生成成功（月份=%s，字数=%d）", month, len(content))
+    return content
