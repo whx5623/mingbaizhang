@@ -1630,6 +1630,10 @@ with tab_dash:
     # 函数缺失 / 取数异常 / 返回空 dict 都只降级成一行提示，绝不红屏。
     # 放在玫瑰图之后、AI 洞察之前；与上方玫瑰图不同，这里不依赖 df 的 category 列。
     st.subheader("🗓️ 消费日历热力图")
+    st.caption("💡 颜色越红，代表当天花钱越猛。鼠标悬停可查看具体金额。")
+    # 默认展示「近三个月」：只在首次访问时写入默认值，用户之后切到「本月」不会被重置。
+    if "cal_range" not in st.session_state:
+        st.session_state["cal_range"] = "近三个月"
     _cal_range = st.radio("范围", ["本月", "近三个月"], horizontal=True, key="cal_range")
     _cal_months = 1 if _cal_range == "本月" else 3
 
@@ -1708,23 +1712,28 @@ with tab_dash:
         else:
             # streamlit-echarts 的 height 参数是字符串（默认 "300px"）：传整数时前端
             # 会拼成无单位的 style.height → canvas 高度为 0（图表整块空白），必须带 px。
-            _cal_height = "260px" if _cal_months == 1 else "430px"
-            # 近三个月时三个 calendar 用显式 top 纵向堆叠（本月在最下，时间向下流动）
-            _cal_tops = ["5%", "38%", "71%"] if _cal_months > 1 else [None]
+            # 本月压到 240px 减少下方空白；三个月横向并排，300px 足够放下 6 行格子。
+            _cal_height = "240px" if _cal_months == 1 else "300px"
+            # 三个月：三个 calendar 横向并排（3 × 7 列 ≈ 460px），比纵向堆叠饱满得多，
+            # 也不会出现月份标签互相叠压；本月：单个 calendar 居中、格子放大到 26px。
+            _cal_lefts = ["3%", "36%", "69%"] if _cal_months > 1 else ["center"]
+            _cal_cell = 26 if _cal_months == 1 else 22
             _cal_calendars = []
             _cal_series = []
             for _cal_index, _cal_month_key in enumerate(_cal_month_keys):
                 _cal_calendar = {
                     "range": [_cal_month_key],
-                    "cellSize": ["auto", 16],
+                    # 固定正方形色块：cellSize 两个数值必须相等；传 ["auto", N] 时
+                    # 宽度会被日历布局拉长成细长条（上一版的问题）。
+                    "cellSize": [_cal_cell, _cal_cell],
                     "yearLabel": {"show": False},
                     "dayLabel": {"nameMap": "ZH"},
-                    "monthLabel": {"nameMap": "ZH"},
+                    "monthLabel": {"nameMap": "ZH", "position": "start"},
                     "itemStyle": {"color": "transparent", "borderWidth": 0},
                     "splitLine": {"show": False},
+                    "left": _cal_lefts[_cal_index],
+                    "top": "12%",
                 }
-                if _cal_tops[_cal_index] is not None:
-                    _cal_calendar["top"] = _cal_tops[_cal_index]
                 _cal_calendars.append(_cal_calendar)
                 _cal_series.append(
                     {
@@ -1767,14 +1776,39 @@ with tab_dash:
                 "calendar": _cal_calendars,
                 "series": _cal_series,
             }
-            # 同样用容器包裹 + 异常降级：日历图依赖 calendar/heatmap 配置，
-            # 任何配置层异常都不应让整个看板红屏。
-            try:
-                with st.container():
-                    st_echarts(_cal_option, height=_cal_height)
-            except Exception as _cal_chart_exc:
-                print(f"[chart] 日历热力图渲染失败：{type(_cal_chart_exc).__name__}: {_cal_chart_exc}")
-                st.warning("日历热力图暂时无法渲染，请刷新页面重试")
+            # 左图右榜：左侧日历热力图，右侧是跟随当前时间范围的花钱 Top 3。
+            # 图表保留原有 st.container() + 异常降级（容器在列内，不会视觉双框）。
+            _cal_left, _cal_right = st.columns([2, 1], gap="large")
+            with _cal_left:
+                try:
+                    with st.container():
+                        st_echarts(_cal_option, height=_cal_height)
+                except Exception as _cal_chart_exc:
+                    print(
+                        f"[chart] 日历热力图渲染失败："
+                        f"{type(_cal_chart_exc).__name__}: {_cal_chart_exc}"
+                    )
+                    st.warning("日历热力图暂时无法渲染，请刷新页面重试")
+            with _cal_right:
+                st.markdown("#### 🏆 花钱最猛 Top 3")
+                st.caption("按当前选择的时间范围统计")
+                # 用归一化后的 _cal_points（日期已校验、金额已转 float）：
+                # 榜单范围随上方 radio 走（本月 → 本月 Top3；近三个月 → 近三个月 Top3）。
+                _cal_top3 = sorted(
+                    ((_day, _amount) for _day, _amount in _cal_points if _amount > 0),
+                    key=lambda _item: _item[1],
+                    reverse=True,
+                )[:3]
+                if not _cal_top3:
+                    st.caption("这段时间还没有支出")
+                else:
+                    for _cal_rank, (_cal_day_str, _cal_amount) in enumerate(_cal_top3):
+                        _cal_medal = ["🥇", "🥈", "🥉"][_cal_rank]
+                        _cal_day = datetime.strptime(_cal_day_str, "%Y-%m-%d")
+                        st.markdown(
+                            f"{_cal_medal} **{_cal_day.month}月{_cal_day.day}日**："
+                            f"花了 **{_cal_amount:.0f}** 元"
+                        )
 
     # ===== AI 洞察：本月消费图表解读（玫瑰图下方、数据导出之前）=====
     # 统计口径与上方玫瑰图一致：本月 + 支出。无支出时只给引导，不显示按钮。
