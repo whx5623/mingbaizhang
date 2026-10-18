@@ -3,6 +3,7 @@ import pandas as pd
 from streamlit_echarts import st_echarts
 from datetime import datetime, date, timedelta
 from config import get_deepseek_api_key
+from finance_math import compute_irr, payment_from_fee, debt_ratio
 from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, get_user_auth_state, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data, get_login_daily_stats, login_events_available, LoginThrottled
 import requests
 import json
@@ -291,6 +292,24 @@ with st.sidebar:
     st.session_state.city_level = st.selectbox("所在城市", ["一线", "二线", "三线"], index=["一线", "二线", "三线"].index(st.session_state.city_level))
     st.divider()
 
+    # ===== 负债率常驻预警（>30% 红色，侧边栏始终可见）=====
+    # 数据来源：「算算分期有多贵？」最近一次试算的**每期还款额**（存在 inst_result 里）。
+    # 没试算过就没有“本月待还分期”这个数，因此不显示；每个月生活费 <= 0 也无法计算。
+    _inst_snapshot = st.session_state.get("inst_result")
+    if _inst_snapshot and st.session_state.monthly_living > 0:
+        try:
+            _ratio = debt_ratio(float(_inst_snapshot["payment"]), float(st.session_state.monthly_living))
+        except Exception as _ratio_exc:  # 预警本身绝不能让侧边栏红屏
+            print(f"[sidebar] 负债率预警计算失败：{type(_ratio_exc).__name__}: {_ratio_exc}")
+            _ratio = None
+        if _ratio is not None and _ratio > 0.3:
+            st.error(
+                f"🚨 负债率 {_ratio * 100:.1f}% 已超过 30% 警戒线\n\n"
+                f"本月待还分期 {float(_inst_snapshot['payment']):.2f} 元，"
+                f"占每月生活费 {float(st.session_state.monthly_living):.2f} 元的 {_ratio * 100:.1f}%。"
+            )
+    st.divider()
+
     today = date.today()
     if st.session_state.ai_last_count_date != today:
         st.session_state.ai_daily_count = 0
@@ -485,6 +504,142 @@ if submitted:
             st.rerun()                     # 刷新页面，成功提示由顶部 flash 显示
         except Exception as exc:
             st.error(f"保存失败：{exc}")
+
+# ========== 分期真实利率试算 ==========
+with st.expander("算算分期有多贵？", expanded=False):
+    st.caption("按现金流 IRR 计算真实年化利率，不是“手续费/本金”的简单除法")
+
+    inst_mode = st.radio(
+        "输入方式",
+        ["每期还款总额", "每期手续费"],
+        horizontal=True,
+        key="inst_mode",
+    )
+
+    inst_col1, inst_col2 = st.columns(2)
+    with inst_col1:
+        inst_principal = st.number_input(
+            "本金（元）",
+            min_value=1.0,
+            value=5000.0,
+            step=100.0,
+            format="%.2f",
+            key="inst_principal",
+        )
+    with inst_col2:
+        inst_periods = st.number_input(
+            "期数（月）",
+            min_value=1,
+            max_value=60,
+            value=12,
+            step=1,
+            key="inst_periods",
+        )
+
+    # 两种模式下金额的语义不同：总额模式直接就是每期还款，手续费模式要加上每期本金
+    if inst_mode == "每期手续费":
+        inst_amount = st.number_input(
+            "每期手续费（元）",
+            min_value=0.0,
+            value=450.0,
+            step=10.0,
+            format="%.2f",
+            key="inst_amount",
+        )
+    else:
+        inst_amount = st.number_input(
+            "每期还款额（元）",
+            min_value=0.0,
+            value=450.0,
+            step=10.0,
+            format="%.2f",
+            key="inst_amount",
+        )
+
+    inst_clicked = st.button("计算真实利率", key="inst_calc_btn")
+
+    if inst_clicked:
+        # 控件本身已有下限，这里再校验一次业务口径：任何一项不合法都不调用后端
+        try:
+            if inst_principal <= 0:
+                raise ValueError("本金必须大于 0 元")
+            if inst_periods < 1 or inst_periods > 60:
+                raise ValueError("期数需在 1~60 期之间")
+            if inst_amount <= 0:
+                raise ValueError("每期还款额/手续费必须大于 0 元")
+            if inst_mode == "每期手续费":
+                inst_payment = float(
+                    payment_from_fee(float(inst_principal), int(inst_periods), float(inst_amount))
+                )
+            else:
+                inst_payment = float(inst_amount)
+            inst_irr = compute_irr(float(inst_principal), int(inst_periods), inst_payment)
+            # 结果存进 session_state：侧边栏改生活费触发 rerun 时，试算结果和负债诊断不会消失
+            st.session_state["inst_result"] = {
+                "mode": inst_mode,
+                "annual_rate": float(inst_irr["annual_rate"]),
+                "total_payment": float(inst_irr["total_payment"]),
+                "total_interest": float(inst_irr["total_interest"]),
+                "payment": inst_payment,
+                "periods": int(inst_periods),
+                "principal": float(inst_principal),
+            }
+        except ValueError as e:
+            # 后端主动抛出的中文业务错误，可以直接展示给用户
+            st.session_state.pop("inst_result", None)
+            st.error(str(e))
+        except Exception as e:
+            # 其它异常可能包含实现细节，只进服务端日志，页面给通用文案（不红屏）
+            st.session_state.pop("inst_result", None)
+            print(f"[installment] 真实利率计算失败：{type(e).__name__}: {e}")
+            st.error("计算失败，请检查输入")
+
+    inst_result = st.session_state.get("inst_result")
+    # 结果只在同一输入方式下展示：切换 radio 后语义已变，旧结果不应继续挂在页面上
+    if inst_result and inst_result.get("mode") == inst_mode:
+        inst_annual = inst_result["annual_rate"]
+        inst_payment = inst_result["payment"]
+        inst_periods_done = inst_result["periods"]
+        inst_total_payment = inst_result["total_payment"]
+        inst_total_interest = inst_result["total_interest"]
+
+        # 醒目结论：标题 + 粗体，不用 unsafe_allow_html；年化 <= 0 时换掉“高达”措辞
+        if inst_annual <= 0:
+            st.markdown(f"### 这笔分期没有额外利息（年化 {inst_annual * 100:.2f}%）")
+        else:
+            st.markdown(f"### 这笔分期的真实年化利率高达 **{inst_annual * 100:.2f}%**！")
+
+        st.caption(
+            f"每期还款 {inst_payment:.2f} 元 × {inst_periods_done} 期 = 共还 {inst_total_payment:.2f} 元，"
+            f"利息/手续费合计 {inst_total_interest:.2f} 元"
+        )
+        st.warning("这比一般理财收益高多了，建议谨慎超前消费")
+
+        # ---- 负债健康诊断：用本次试算的每期还款额对比每月生活费 ----
+        inst_living = st.session_state.monthly_living
+        if inst_living <= 0:
+            st.info("请先在侧边栏设置每月生活费，才能计算负债率")
+        else:
+            try:
+                ratio = debt_ratio(inst_payment, inst_living)
+            except Exception as e:
+                print(f"[installment] 负债率计算失败：{type(e).__name__}: {e}")
+                ratio = None
+            if ratio is None:
+                # 契约里生活费 <= 0 才返回 None（上面已拦住），这里兜底避免任何异常路径红屏
+                st.info("请先在侧边栏设置每月生活费，才能计算负债率")
+            else:
+                st.metric("负债率", f"{ratio * 100:.1f}%")
+                if ratio > 0.3:
+                    st.error(
+                        f"🚨 负债率 {ratio * 100:.1f}% 已超过 30% 警戒线：本月待还分期 {inst_payment:.2f} 元，"
+                        f"占每月生活费 {inst_living:.2f} 元的 {ratio * 100:.1f}%。"
+                        "建议降低分期金额或延长前先重估还款能力。"
+                    )
+                else:
+                    st.success(
+                        f"✅ 负债率 {ratio * 100:.1f}%，处于可承受范围（未超过 30% 警戒线）。"
+                    )
 
 # Metric cards
 st.subheader("收支概览")
