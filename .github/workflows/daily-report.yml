@@ -1,0 +1,64 @@
+# ============================================================================
+# 每日财务晚报（21:00 北京时间）—— pg_cron 之外的**推荐路径**
+# ----------------------------------------------------------------------------
+# 为什么不用 pg_cron：pg_cron 只能按计划跑 SQL / 存储过程，跑不了 Python。
+# 而晚报需要「聚合 → 逐用户调 DeepSeek 生成点评 → 组包 → POST 飞书/钉钉」，
+# 必须由 Python 进程完成，所以定时器放在 GitHub Actions。
+#
+# 也可由 Supabase Edge Function 通过 GitHub API 触发 workflow_dispatch，
+# 或由 Edge Function 直接执行同等逻辑；本文件保持最小依赖、可手动重跑。
+#
+# 依赖的仓库 Secrets：
+#   DATABASE_URL      必填，Supabase/Postgres 连接串（db.py 读取）
+#   DEEPSEEK_API_KEY  必填，AI 点评；缺失时脚本自动使用本地兜底文案
+#   WEBHOOK_URL       必填，飞书/钉钉机器人 webhook（缺省时脚本 exit 2）
+#   WEBHOOK_SECRET    可选，钉钉加签密钥
+#   SUPABASE_URL / SUPABASE_KEY  可选：ai_agent.py 顶层会 create_client(SUPABASE_URL,
+#                                SUPABASE_KEY)；缺失时脚本注入占位配置以完成导入
+#                                （本任务只调用点评函数，不访问 Supabase）。
+# 隐私：默认脱敏（群消息只出现「用户#{user_id}」），ANONYMIZE_NAME=1 显式声明；
+#      需要真实用户名时去掉该变量并改传 --no-anonymize，且请先确认群成员权限。
+# ============================================================================
+name: daily-report
+
+on:
+  schedule:
+    # UTC 13:00 = Asia/Shanghai 21:00（中国无夏令时）
+    - cron: "0 13 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 定时与手动触发撞车时只保留最新一次，避免同一天重复推送。
+concurrency:
+  group: daily-report
+  cancel-in-progress: false
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Send daily report
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          ANONYMIZE_NAME: "1"
+        run: python send_daily_report.py

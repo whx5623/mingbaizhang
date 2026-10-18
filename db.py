@@ -2094,3 +2094,437 @@ def auto_categorize(merchant, description="", api_key=None) -> str:
         category, FALLBACK_CATEGORY, merchant_text[:50],
     )
     return FALLBACK_CATEGORY
+
+
+# ---------------------------------------------------------------------------
+# 日报 / 通知（migrations/014_user_notifications.sql）
+# ---------------------------------------------------------------------------
+# 这组函数只服务于「把日报发出去」这件事，不参与记账/登录主流程：
+#   · report_user_stats 只读 users / bills，014 没执行也能用（不会因为通知表缺失而失败）；
+#   · record_notification / notification_already_sent 依赖 014 的 user_notifications，
+#     表不存在时**明确抛 RuntimeError**（中文提示先执行 014），不静默返回假数据 ——
+#     「没发过」和「功能没启用」是两种完全不同的状态，调用方必须能区分。
+#   · 幂等口径：同一 (user_id, sent_date, channel) 只有一行；重复写走
+#     ON CONFLICT DO UPDATE，不会新增行，也不会把 created_at 重置成"第一次发送"。
+# ---------------------------------------------------------------------------
+
+NOTIFICATION_STATUS_SENT = "sent"
+NOTIFICATION_STATUS_FAILED = "failed"
+NOTIFICATION_STATUS_SKIPPED = "skipped"
+NOTIFICATION_STATUSES = frozenset(
+    {NOTIFICATION_STATUS_SENT, NOTIFICATION_STATUS_FAILED, NOTIFICATION_STATUS_SKIPPED}
+)
+
+DEFAULT_NOTIFICATION_CHANNEL = "webhook"
+NOTIFICATION_CHANNEL_MAX_LEN = 32  # 与 014 的 user_notifications_channel_len 同口径
+
+NOTIFICATION_TABLE_MISSING_MESSAGE = (
+    "日报通知记录功能未启用：请先执行 migrations/014_user_notifications.sql"
+)
+
+# 日报的「今天」按北京时间（UTC+8）自然日计算。
+# 为什么不用 date.today()：应用机可能部署在 UTC 或其他时区，本机日期会随环境漂移；
+# 为什么不用库会话的 current_date：init_db 把会话时区钉成了 UTC，而本功能面向中国用户，
+# 「今天」应是用户所在地的日历日。中国自 1991 年起不实行夏令时，固定 +8 没有歧义；
+# bills.date 本身是 DATE/ISO 日历日，不携带时区，所以这里只决定"拿哪一天去比"。
+_REPORT_TZ = timezone(timedelta(hours=8))
+
+# 月份严格格式：YYYY-MM，月份 01~12。用 fullmatch，'2026-1'、'2026-13'、'26-10' 一律拒绝。
+_MONTH_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$", re.ASCII)
+
+# month_budget_source 的固定口径标记。本函数**不读任何预算表**，见 docstring 说明。
+REPORT_BUDGET_SOURCE = "budget"
+
+
+def _parse_report_month(month: str) -> tuple[date, date]:
+    """把 "YYYY-MM" 解析成 [当月 1 日, 下月 1 日) 的左闭右开边界。
+
+    严格校验：只接受 4 位年份 + 2 位月份（01~12）。非法输入抛 ValueError（中文文案），
+    在**开数据库连接之前**就拒绝，避免拿一个拼错的月份去扫表。
+    """
+    if not isinstance(month, str):
+        raise ValueError(f"月份格式必须是 YYYY-MM（例如 2026-10）：{month!r}")
+    text = month.strip()
+    if not _MONTH_PATTERN.fullmatch(text):
+        raise ValueError(f"月份格式必须是 YYYY-MM（例如 2026-10）：{month!r}")
+    year, mon = int(text[:4]), int(text[5:7])
+    try:
+        start = date(year, mon, 1)
+        end = date(year + 1, 1, 1) if mon == 12 else date(year, mon + 1, 1)
+    except ValueError as exc:
+        # 理论上年份 0000 / 9999-12 才会走到这里（正则已挡住月份越界）。
+        raise ValueError(f"月份超出可计算范围：{month!r}") from exc
+    return start, end
+
+
+def _report_today() -> date:
+    """日报口径的「今天」：北京时间（UTC+8）的日历日。"""
+    return datetime.now(_REPORT_TZ).date()
+
+
+def _as_decimal(value) -> Decimal:
+    """把 DB 返回的 numeric / None 收敛成 Decimal；金额运算一律用 Decimal，避免二进制浮点误差。"""
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
+def _money_to_float(value) -> float:
+    """金额转 float，并定量到两位小数（与 NUMERIC(12,2) / _CENT 同口径）。"""
+    return float(_as_decimal(value).quantize(_CENT, rounding=ROUND_HALF_UP))
+
+
+def _normalize_sent_date(sent_date) -> date:
+    """通知归属日：datetime.date / "YYYY-MM-DD" → datetime.date；其余抛 ValueError。
+
+    datetime.datetime 是 date 的子类，必须先拦下来取 .date()，否则会带着时分秒
+    绑定到 DATE 列（PG 会静默截断，口径就模糊了）。None 不允许：sent_date 是 NOT NULL。
+    """
+    if isinstance(sent_date, datetime):
+        return sent_date.date()
+    if isinstance(sent_date, date):
+        return sent_date
+    if isinstance(sent_date, str):
+        text = sent_date.strip()
+        if _ISO_DATE_PATTERN.fullmatch(text):
+            try:
+                return datetime.strptime(text, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+        raise ValueError(f"发送日期格式必须是 YYYY-MM-DD：{sent_date!r}")
+    raise ValueError(f"发送日期格式必须是 YYYY-MM-DD：{sent_date!r}")
+
+
+def _normalize_notification_channel(channel) -> str:
+    """渠道：strip 后 1~32 个字符（与 014 的 CHECK 同口径），非法输入抛 ValueError。"""
+    if not isinstance(channel, str):
+        raise ValueError(f"通知渠道必须是字符串：{channel!r}")
+    text = channel.strip()
+    if not 1 <= len(text) <= NOTIFICATION_CHANNEL_MAX_LEN:
+        raise ValueError(
+            f"通知渠道长度必须是 1~{NOTIFICATION_CHANNEL_MAX_LEN} 个字符：{channel!r}"
+        )
+    return text
+
+
+def _normalize_notification_status(status) -> str:
+    """状态只允许 sent / failed / skipped（与 014 的 CHECK 同口径）。"""
+    if not isinstance(status, str) or status.strip() not in NOTIFICATION_STATUSES:
+        raise ValueError(
+            f"通知状态非法：{status!r}（只允许 {' / '.join(sorted(NOTIFICATION_STATUSES))}）"
+        )
+    return status.strip()
+
+
+def _normalize_notification_user_id(user_id) -> int:
+    """user_id 必须是正整数；非法输入在现场就抛 ValueError，而不是等 FK 抛 IntegrityError。
+
+    只接受 int / 十进制字符串：float / Decimal 即使值是 1.0 也拒绝 ——
+    ``int(1.9)`` 会静默截断成 1，把"写错用户"伪装成"写对用户"，比直接报错更危险。
+    """
+    if isinstance(user_id, bool) or not isinstance(user_id, (int, str)):
+        raise ValueError(f"user_id 必须是正整数：{user_id!r}")
+    try:
+        uid = int(user_id.strip()) if isinstance(user_id, str) else int(user_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"user_id 必须是正整数：{user_id!r}") from exc
+    if uid <= 0:
+        raise ValueError(f"user_id 必须是正整数：{user_id!r}")
+    return uid
+
+
+def _raise_notification_table_missing(exc):
+    """把 42P01（user_notifications 不存在）翻译成带中文可操作提示的 RuntimeError。"""
+    raise RuntimeError(NOTIFICATION_TABLE_MISSING_MESSAGE) from exc
+
+
+def _notification_row_to_dict(row) -> dict:
+    """把 user_notifications 的一行转成给调用方用的 dict。
+
+    · sent_date 保持 datetime.date（不是字符串），与"日期用 datetime.date"的约定一致；
+    · created_at 保留数据库返回的 tz-aware datetime（timestamptz 原样，不擅自格式化）；
+    · id / user_id 转 int；金额字段本表没有，无需处理。
+    """
+    mapping = row._mapping
+    return {
+        "id": int(mapping["id"]),
+        "user_id": int(mapping["user_id"]),
+        "sent_date": mapping["sent_date"],
+        "channel": mapping["channel"],
+        "status": mapping["status"],
+        "message": mapping["message"],
+        "error": mapping["error"],
+        "created_at": mapping["created_at"],
+    }
+
+
+def report_user_stats(month: str) -> list[dict]:
+    """按「YYYY-MM」汇总每个用户的本月收支与今日支出，供日报脚本使用。
+
+    参数
+    ----
+    month : str
+        形如 "2026-10" 的月份；**严格校验**（必须 4 位年 + 2 位月，月份 01~12），
+        否则抛 ValueError。校验发生在开连接之前。
+
+    返回
+    ----
+    list[dict]，**每个用户一行**（包括本月没有任何账单的用户），按 user_id 升序：
+        {
+          "user_id": int,
+          "username": str,
+          "is_admin": bool,
+          "month_expense": float,      # 本月支出
+          "month_income": float,       # 本月收入
+          "month_balance": float,      # = month_income - month_expense
+          "today_expense": float,      # 今天（北京时间自然日）的支出
+          "today_overspend": bool,
+          "month_budget_source": "budget",   # 口径标记，见下
+        }
+
+    口径（务必与调用方对齐）
+    ------------------------
+    · 本月支出/收入：``bills.date::date`` 落在 [当月 1 日, 下月 1 日) 的行，
+      且 ``bills.type`` 分别等于常量 EXPENSE_TYPE("支出") / INCOME_TYPE("收入")。
+      类型没有在 SQL 里做模糊匹配：001/003/007 已把 type 归一并用 CHECK 限定为这两个值，
+      这里复用常量而不是在 SQL 里写魔法字符串。
+    · month_balance = month_income - month_expense（用 Decimal 相减后再转 float，
+      避免 0.1 + 0.2 这类二进制浮点尾差）。
+    · today_expense：只统计**今天且属于本月**的支出；如果请求的是历史月份，今天不在
+      该月窗口内，today_expense = 0（函数不会把"今天"的消费算进别的月份）。
+    · today_overspend：``today_expense > 0`` **且**
+      ``today_expense > 本月日均支出`` 时为 True。本月日均支出 =
+      month_expense / 已过天数（当月请求取 today.day；历史月份取整月天数；
+      未来月份已过 0 天，此时恒为 False，不做除以 0）。
+      ⚠ 这是「今天花得比**自己本月日均**多」的相对判断，**不是**「超预算」：
+        本函数只读 users / bills，库里没有 budget 表，也没有用户的预算值。
+        字段名沿用 today_overspend 是为了和日报模板/调用方兼容，注释以此为准。
+    · month_budget_source：固定返回 "budget"，只是给调用方的口径标记（表示"预算口径"），
+      **不代表**本函数真的读到了预算；实际阈值是上面的本月日均支出。若以后接入真实预算，
+      应在此处返回预算来源并同步改 today_overspend 的算法。
+
+    时区
+    ----
+    「今天」= 北京时间（UTC+8）自然日，由 _report_today() 计算；
+    ``bills.date`` 是不带时区的日历日（TEXT/DATE），比较时统一 ``::date``。
+    本函数不受数据库会话 TimeZone 影响（DATE 本身没有时区）。
+
+    性能
+    ----
+    单条 SQL：bounds CTE + 按 user 聚合的 CTE + ``users LEFT JOIN``，没有任何 N+1。
+    ⚠ ``bills.date`` 目前是 TEXT（007 用 CHECK 保证 ISO 格式）。``date::date`` 依赖
+      「所有值都是合法 ISO 日期」这一前提；如果绕过 007 写入脏值（'2026/10/1'），
+      整条查询会因 invalid input syntax 失败。写入侧请继续走 add_bill / CSV 归一。
+    """
+    global engine
+    month_start, month_end = _parse_report_month(month)
+    today = _report_today()
+
+    if engine is None:
+        init_db()
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                WITH bounds AS (
+                    SELECT CAST(:month_start AS date) AS month_start,
+                           CAST(:month_end   AS date) AS month_end,
+                           CAST(:today       AS date) AS today
+                ),
+                per_user AS (
+                    SELECT b.user_id,
+                           COALESCE(SUM(b.amount) FILTER (WHERE b.type = :expense), 0)
+                               AS month_expense,
+                           COALESCE(SUM(b.amount) FILTER (WHERE b.type = :income), 0)
+                               AS month_income,
+                           COALESCE(SUM(b.amount) FILTER (
+                               WHERE b.type = :expense
+                                 AND b.date::date = bounds.today
+                           ), 0) AS today_expense
+                    FROM public.bills b
+                    CROSS JOIN bounds
+                    WHERE b.date::date >= bounds.month_start
+                      AND b.date::date <  bounds.month_end
+                    GROUP BY b.user_id
+                )
+                SELECT u.id            AS user_id,
+                       u.username      AS username,
+                       u.is_admin      AS is_admin,
+                       COALESCE(p.month_expense, 0) AS month_expense,
+                       COALESCE(p.month_income,  0) AS month_income,
+                       COALESCE(p.today_expense, 0) AS today_expense
+                FROM public.users u
+                LEFT JOIN per_user p ON p.user_id = u.id
+                ORDER BY u.id
+            """),
+            {
+                "month_start": month_start,
+                "month_end": month_end,
+                "today": today,
+                "expense": EXPENSE_TYPE,
+                "income": INCOME_TYPE,
+            },
+        ).fetchall()
+
+    # 已过天数：当月按 today.day；历史月份按整月；未来月份 0（不做除法）。
+    if month_start <= today < month_end:
+        elapsed_days = today.day
+    elif today >= month_end:
+        elapsed_days = (month_end - month_start).days
+    else:
+        elapsed_days = 0
+
+    stats = []
+    for row in rows:
+        month_expense_dec = _as_decimal(row.month_expense)
+        month_income_dec = _as_decimal(row.month_income)
+        today_expense_dec = _as_decimal(row.today_expense)
+        month_balance_dec = month_income_dec - month_expense_dec
+
+        if elapsed_days > 0:
+            daily_avg = month_expense_dec / Decimal(elapsed_days)
+            today_overspend = today_expense_dec > 0 and today_expense_dec > daily_avg
+        else:
+            today_overspend = False
+
+        stats.append(
+            {
+                "user_id": int(row.user_id),
+                "username": row.username,
+                "is_admin": bool(row.is_admin),
+                "month_expense": _money_to_float(month_expense_dec),
+                "month_income": _money_to_float(month_income_dec),
+                "month_balance": _money_to_float(month_balance_dec),
+                "today_expense": _money_to_float(today_expense_dec),
+                "today_overspend": bool(today_overspend),
+                "month_budget_source": REPORT_BUDGET_SOURCE,
+            }
+        )
+    return stats
+
+
+def record_notification(user_id, sent_date, channel, status, message=None, error=None) -> dict:
+    """写入/更新一条通知发送记录（同一 user+日期+渠道**只有一行**）。
+
+    幂等语义：``INSERT ... ON CONFLICT (user_id, sent_date, channel) DO UPDATE``，
+    冲突时只更新 status / message / error / created_at=now()，**不新增行**；
+    因此同一天先发 failed、后发成功再写 sent，得到的仍是同一行（status 变 sent）。
+    created_at 记录的是「最后一次写入」的时刻，不是第一次发送的时刻 ——
+    需要"首次发送时间"应另加列，本表刻意不承担审计全量历史。
+    ⚠ 因为冲突时**无条件**覆盖 status，把一条已经 sent 的行再写成 skipped
+      （例如"今天已发过，补一条 skipped 留痕"）会让 notification_already_sent
+      变回 False；调用方不要在 sent 之后用 skipped 覆盖它，否则同日第三次运行
+      会误判"还没发"并重复推送。failed 覆盖 sent 同理，重试语义必须由调用方显式决定。
+
+    参数校验（全部在开连接之前）：
+      · status 必须在 {'sent','failed','skipped'} 内，否则 ValueError；
+      · sent_date 接受 datetime.date 或 "YYYY-MM-DD"，其余 ValueError；
+      · channel strip 后 1~32 字符，否则 ValueError；
+      · user_id 必须是正整数。
+    message / error 可为 None；非字符串会转成 str 后入库。
+
+    返回：RETURNING * 的 dict（id、user_id、sent_date(date)、channel、status、
+    message、error、created_at(tz-aware datetime)）。
+
+    表不存在（014 未执行）→ RuntimeError（中文提示），不静默吞掉；
+    其他数据库异常照常向上抛，由调用方决定是否重试。
+    """
+    global engine
+    uid = _normalize_notification_user_id(user_id)
+    day = _normalize_sent_date(sent_date)
+    ch = _normalize_notification_channel(channel)
+    st = _normalize_notification_status(status)
+    msg = None if message is None else str(message)
+    err = None if error is None else str(error)
+
+    if engine is None:
+        init_db()
+
+    with engine.connect() as conn:
+        try:
+            row = conn.execute(
+                text("""
+                    INSERT INTO public.user_notifications
+                        (user_id, sent_date, channel, status, message, error)
+                    VALUES
+                        (:uid, :sent_date, :channel, :status, :message, :error)
+                    ON CONFLICT (user_id, sent_date, channel) DO UPDATE
+                       SET status     = EXCLUDED.status,
+                           message    = EXCLUDED.message,
+                           error      = EXCLUDED.error,
+                           created_at = now()
+                    RETURNING *
+                """),
+                {
+                    "uid": uid,
+                    "sent_date": day,
+                    "channel": ch,
+                    "status": st,
+                    "message": msg,
+                    "error": err,
+                },
+            ).fetchone()
+            conn.commit()
+        except ProgrammingError as exc:
+            conn.rollback()
+            if _is_undefined_table(exc):
+                _raise_notification_table_missing(exc)
+            raise
+        except SQLAlchemyError:
+            conn.rollback()
+            raise
+
+    if row is None:
+        # 写成功却读不回：极少见（并发删号 / 连接串指向别的库）。不返回 None，
+        # 否则调用方会拿到一个与签名不符的返回值。
+        raise RuntimeError("通知记录写入后未能读回，请重试")
+    return _notification_row_to_dict(row)
+
+
+def notification_already_sent(user_id, sent_date, channel="webhook") -> bool:
+    """该用户在该日、该渠道是否已有 **status='sent'** 的记录。
+
+    只看 sent：failed / skipped 不算"已发送"，允许下一次运行重试；
+    同一行被 upsert 成 failed 后本函数会返回 False（按 status 判定，不是按行存在）。
+    表不存在（014 未执行）→ RuntimeError（中文提示），而不是 False ——
+    False 会被调用方理解成"还没发，可以发"，导致一个没启用的功能被当成正常状态。
+    """
+    global engine
+    uid = _normalize_notification_user_id(user_id)
+    day = _normalize_sent_date(sent_date)
+    ch = _normalize_notification_channel(channel)
+
+    if engine is None:
+        init_db()
+
+    with engine.connect() as conn:
+        try:
+            exists = conn.execute(
+                text("""
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM public.user_notifications
+                        WHERE user_id   = :uid
+                          AND sent_date = :sent_date
+                          AND channel   = :channel
+                          AND status    = :sent
+                    )
+                """),
+                {
+                    "uid": uid,
+                    "sent_date": day,
+                    "channel": ch,
+                    "sent": NOTIFICATION_STATUS_SENT,
+                },
+            ).scalar()
+        except ProgrammingError as exc:
+            conn.rollback()
+            if _is_undefined_table(exc):
+                _raise_notification_table_missing(exc)
+            raise
+        except SQLAlchemyError:
+            conn.rollback()
+            raise
+    return bool(exists)

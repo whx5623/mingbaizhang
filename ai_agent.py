@@ -1022,3 +1022,138 @@ def generate_health_comment(score: int, grade: str, title: str, deductions: list
         content = content[:HEALTH_COMMENT_MAX_CHARS] + "…"
     logger.info("健康分点评生成成功（分数=%s，等级=%s，字数=%d）", score, grade, len(content))
     return content
+
+
+# ============================================================================
+# 晚间点评（DeepSeek Chat，纯文本一句话，供 send_daily_report.py 批量调用）
+# ----------------------------------------------------------------------------
+# 与健康分点评同构：本函数只负责把"今天的账"翻译成人话，不做任何统计逻辑。
+# 失败一律 EveningCommentError（message 为可展示的中文）；日志绝不记录 api_key。
+# 批量任务对每个用户单独调用，单用户失败由调用方兜底，不得中断整批。
+# ============================================================================
+
+# 系统提示词必须**逐字**保持（产品口径，改一个字点评风格就跑偏）。
+EVENING_COMMENT_SYSTEM_PROMPT = (
+    '你是一个陪大学生记账的贴心又有点毒舌的财务搭子。请根据这名用户今天的消费情况，'
+    '写一句不超过 25 个字的晚间消费点评（例如"今天花得有点多哦"）。'
+    '不要寒暄、不要解释、不要分点，直接给一句话。'
+)
+
+EVENING_COMMENT_MAX_CHARS = 40  # 返回文本硬上限（25 字要求 + 余量，超了截断）
+
+
+class EveningCommentError(Exception):
+    """晚间点评失败。message 是面向用户的中文提示，可直接展示。"""
+
+    def __init__(self, message):
+        self.message = message
+        super().__init__(message)
+
+
+def _evening_money(value) -> float:
+    """把 stats 里的金额安全转成 float（None/空串/非法值 → 0.0）。
+
+    批量任务的数据来自库里的聚合结果，脏数据不应让单个用户拖垮整批。
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _build_evening_comment_user_content(stats: dict) -> str:
+    """把 stats 排成 user 消息：本月支出/收入/结余、今日支出、是否比平时花得多。"""
+    stats = stats or {}
+    username = str(stats.get("username") or "同学").strip() or "同学"
+    month_expense = _evening_money(stats.get("month_expense"))
+    month_income = _evening_money(stats.get("month_income"))
+    month_balance = stats.get("month_balance")
+    if month_balance is None:
+        # 契约里有 month_balance；缺省时用 收入-支出 兜底，避免把 None 塞进提示词。
+        month_balance = month_income - month_expense
+    month_balance = _evening_money(month_balance)
+    today_expense = _evening_money(stats.get("today_expense"))
+    overspend = bool(stats.get("today_overspend"))
+    return (
+        f"用户：{username}\n"
+        f"本月支出：{month_expense:.2f} 元\n"
+        f"本月收入：{month_income:.2f} 元\n"
+        f"本月结余：{month_balance:.2f} 元\n"
+        f"今日支出：{today_expense:.2f} 元\n"
+        f"今天是否比平时花得多：{'是' if overspend else '否'}\n"
+        "请按要求写一句点评。"
+    )
+
+
+def generate_evening_comment(stats: dict, api_key: str) -> str:
+    """根据用户今天的消费情况生成一句不超过 25 字的晚间点评。
+
+    失败一律抛 EveningCommentError（中文 message，可直接展示）：
+      · api_key 为空 → 未配置提示（且**不发请求**）；
+      · 超时 / 连接失败 → 对应中文提示；
+      · 非 200 → 带状态码的提示；
+      · 响应不是 JSON / 没有有效 content → "AI 没有返回有效点评"。
+    返回文本去除首尾空白；超过 40 字时截断到 40 字并补「…」（防止模型不听话）。
+    日志只记字数，**绝不**记 api_key、请求头或真实用户名。
+    """
+    # ① api_key：先查它，没有 key 时不该先花一次网络往返。
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise EveningCommentError("未配置 DEEPSEEK_API_KEY，AI 晚间点评暂不可用")
+    api_key = api_key.strip()
+
+    user_content = _build_evening_comment_user_content(stats)
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [
+            {"role": "system", "content": EVENING_COMMENT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        # temperature 0.9：晚间点评要有"人味"（毒舌/俏皮），不必保守；
+        # max_tokens 60 对 25 字一句话足够，同时从成本上限制它写成小作文。
+        "temperature": 0.9,
+        "max_tokens": 60,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ② 发请求：超时/连接失败翻译成用户能看懂的句子（不把异常对象漏到页面）。
+    try:
+        resp = requests.post(DEEPSEEK_CHAT_URL, headers=headers, json=payload, timeout=20)
+    except requests.Timeout:
+        logger.warning("晚间点评请求超时")
+        raise EveningCommentError("生成晚间点评超时，请稍后再试") from None
+    except requests.ConnectionError:
+        logger.warning("晚间点评请求连接失败")
+        raise EveningCommentError("网络连接失败，请检查网络") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：日志只记异常类型（确保不把 headers / key 带出去）。
+        logger.warning("晚间点评请求失败（异常=%s）", type(exc).__name__)
+        raise EveningCommentError("网络连接失败，请检查网络") from None
+
+    # ③ 非 200：只带状态码，不把响应体拼进 message（响应体可能含请求回显）。
+    if resp.status_code != 200:
+        logger.warning("晚间点评接口返回 HTTP %s", resp.status_code)
+        raise EveningCommentError(f"AI 服务返回异常（HTTP {resp.status_code}）")
+
+    # ④ 解析：非 JSON / 结构不符 / content 为空 → 同一条"没有有效点评"。
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("晚间点评响应不是合法 JSON")
+        raise EveningCommentError("AI 没有返回有效点评，请重试") from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("晚间点评响应结构不符合预期")
+        raise EveningCommentError("AI 没有返回有效点评，请重试") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("晚间点评响应 content 为空")
+        raise EveningCommentError("AI 没有返回有效点评，请重试")
+
+    content = content.strip()
+    if len(content) > EVENING_COMMENT_MAX_CHARS:
+        content = content[:EVENING_COMMENT_MAX_CHARS] + "…"
+    logger.info("晚间点评生成成功（字数=%d）", len(content))
+    return content
