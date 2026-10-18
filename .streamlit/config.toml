@@ -1,0 +1,10 @@
+# 「明白账」品牌主题（仅视觉；不含任何 server 配置）
+# 之所以同时保留 styles.py 的 CSS：主题变量负责原生控件颜色与底色，
+# CSS 负责圆角/阴影/胶囊/斑马纹等主题变量表达不了的细节。
+[theme]
+base = "light"
+primaryColor = "#1E88E5"
+backgroundColor = "#F8F9FA"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1F2937"
+font = "sans serif"

@@ -93,6 +93,16 @@ if ('serviceWorker' in navigator) {
 st.markdown(pwa_html, unsafe_allow_html=True)
 # ==============================
 
+# ========= 全局视觉主题（集中管理于 styles.py，失败不阻塞业务） =========
+# 注入点必须在 st.set_page_config 之后（否则 set_page_config 会抛错），
+# 且在任何业务控件渲染之前；异常只打日志，绝不让样式问题拖垮整页。
+try:
+    from styles import inject_styles
+    inject_styles()
+except Exception as exc:  # 样式失败绝不能阻塞业务
+    print(f"[styles] 注入失败：{type(exc).__name__}: {exc}")
+# ==============================
+
 def get_secret(key: str):
     try:
         val = st.secrets.get(key)
@@ -292,82 +302,103 @@ def logout():
 
 # ========== 未登录分支 ==========
 if st.session_state.user_id is None:
-    st.title("明白账 - 登录 / 注册")
-    # 用户名：库里是 VARCHAR(50)，前端先卡住长度，避免提交后被数据库截断/报错
-    username = st.text_input("用户名", max_chars=50, placeholder="3-50 个字符")
-    # 密码：长度规则与 db 层 bcrypt 的硬限制保持一致（8 位起，UTF-8 72 字节封顶）
-    password = st.text_input("密码", type="password", help="至少 8 位；最长 72 字节（约 24 个汉字）")
-    # 「记住我」只属于登录表单：注册分支不读这个值，也不会下发 remember token
-    remember_me = st.checkbox("记住我（7天免登录）", key="remember_me_checkbox")
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("登录"):
-            login_name = (username or "").strip()  # 入库时不含首尾空格，登录也要对齐
-            if not login_name or not password:
-                st.warning("请输入用户名和密码")
-            else:
-                try:
-                    uid = verify_user(login_name, password)
-                except LoginThrottled as exc:
-                    # 业务状态（失败次数过多），不是程序故障：直接把中文文案给用户
-                    st.error(str(exc))
-                except Exception as exc:
-                    # 数据库连不上等程序性错误：详情只写服务端日志，页面给通用文案
-                    # （异常里可能带 host/port/SQL/参数，绝不能出现在未认证页面）
-                    print(f"[login] 登录异常：{type(exc).__name__}: {exc}")
-                    st.error("登录失败：服务暂时不可用，请稍后再试")
-                else:
-                    if uid:
-                        st.session_state.user_id = uid
-                        if remember_me:
-                            # 写库失败/组件异常只降级提示，登录继续（见 _issue_remember_token）
-                            _issue_remember_token(uid)
-                        # 不在这里查管理员标记：紧接的 st.rerun() 会在下一次 run 开头的
-                        # 统一鉴权里重算，此处赋值没人读，纯多一次查询
-                        st.rerun()
+    # 居中布局：左右两列只做留白，所有登录内容都放在 center 里。
+    # 用比例列而不是固定像素宽度，宽屏/窄屏都能自适应，不会横向溢出。
+    left, center, right = st.columns([1, 2, 1])
+    with center:
+        # 标题在卡片之上、列内居中：走 markdown 内联样式，避免 st.title 再产生一个左对齐大标题
+        st.markdown(
+            "<div style='text-align:center; padding: 12px 0 6px;'>"
+            "<h1 style='margin:0 0 6px;'>明白账</h1>"
+            "<div style='color:#6B7280; font-size:0.95rem;'>欢迎回来，继续记录每一笔</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        # key 以 card_ 开头 → styles.py 的 [class*="st-key-card_"] 自动把它变成
+        # 白底 + 16px 圆角 + 柔和阴影的卡片（无需再写任何 CSS）
+        with st.container(border=True, key="card_login"):
+            st.markdown(
+                "<h3 style='text-align:center;margin-top:0'>登录 / 注册</h3>",
+                unsafe_allow_html=True,
+            )
+            # 用户名：库里是 VARCHAR(50)，前端先卡住长度，避免提交后被数据库截断/报错
+            username = st.text_input("用户名", max_chars=50, placeholder="3-50 个字符")
+            # 密码：长度规则与 db 层 bcrypt 的硬限制保持一致（8 位起，UTF-8 72 字节封顶）
+            password = st.text_input("密码", type="password", help="至少 8 位；最长 72 字节（约 24 个汉字）")
+            # 「记住我」只属于登录表单：注册分支不读这个值，也不会下发 remember token
+            remember_me = st.checkbox("记住我（7天免登录）", key="remember_me_checkbox")
+            # 输入框保持单列（卡片内不再套多列输入），窄列里也不会被挤到溢出
+            st.caption("首次使用？输入用户名和密码后点「注册」即可自动登录")
+            # 按钮横排：左边「登录」primary、右边「注册」secondary，顺序与原先一致
+            btn_login, btn_register = st.columns(2)
+            with btn_login:
+                if st.button("登录", type="primary", use_container_width=True):
+                    login_name = (username or "").strip()  # 入库时不含首尾空格，登录也要对齐
+                    if not login_name or not password:
+                        st.warning("请输入用户名和密码")
                     else:
-                        # “用户不存在”和“密码错误”共用一句提示，避免用户名枚举
-                        st.error("用户名或密码错误")
-    with col2:
-        if st.button("注册"):
-            # 全部校验都在调用 db 之前完成：任何一条不过就绝不写库
-            reg_name = (username or "").strip()
-            # 密码的 UTF-8 字节数提前安全计算：孤立代理字符（如 "\ud800"）会让 encode 抛
-            # UnicodeEncodeError，若在按钮回调里没兜住就是整页红屏 traceback
-            try:
-                pw_bytes = len(password.encode("utf-8"))
-            except UnicodeEncodeError:
-                pw_bytes = None
-            if not reg_name:
-                st.warning("用户名不能为空")
-            elif len(reg_name) > 50:
-                st.warning("用户名不能超过 50 个字符")
-            elif not password:
-                st.warning("密码不能为空")
-            elif len(password) < 8:
-                st.warning("密码至少 8 位")
-            elif pw_bytes is None:
-                st.warning("密码包含无法处理的字符，请换一个")
-            elif pw_bytes > 72:
-                st.warning("密码过长：最长 72 字节（约 24 个汉字）")
-            else:
-                try:
-                    new_uid = register_user(reg_name, password)
-                    if new_uid:
-                        # 成功提示走 flash：紧跟 rerun 的 st.success 会被吞掉
-                        # 文案固定，不拼接用户名：flash 用 markdown 渲染，用户名可控会变成 [点我](http://evil)
-                        st.session_state["flash"] = {"level": "success", "msg": "注册成功，已自动登录"}
-                        st.session_state.user_id = new_uid
-                        st.rerun()
+                        try:
+                            uid = verify_user(login_name, password)
+                        except LoginThrottled as exc:
+                            # 业务状态（失败次数过多），不是程序故障：直接把中文文案给用户
+                            st.error(str(exc))
+                        except Exception as exc:
+                            # 数据库连不上等程序性错误：详情只写服务端日志，页面给通用文案
+                            # （异常里可能带 host/port/SQL/参数，绝不能出现在未认证页面）
+                            print(f"[login] 登录异常：{type(exc).__name__}: {exc}")
+                            st.error("登录失败：服务暂时不可用，请稍后再试")
+                        else:
+                            if uid:
+                                st.session_state.user_id = uid
+                                if remember_me:
+                                    # 写库失败/组件异常只降级提示，登录继续（见 _issue_remember_token）
+                                    _issue_remember_token(uid)
+                                # 不在这里查管理员标记：紧接的 st.rerun() 会在下一次 run 开头的
+                                # 统一鉴权里重算，此处赋值没人读，纯多一次查询
+                                st.rerun()
+                            else:
+                                # “用户不存在”和“密码错误”共用一句提示，避免用户名枚举
+                                st.error("用户名或密码错误")
+            with btn_register:
+                if st.button("注册", type="secondary", use_container_width=True):
+                    # 全部校验都在调用 db 之前完成：任何一条不过就绝不写库
+                    reg_name = (username or "").strip()
+                    # 密码的 UTF-8 字节数提前安全计算：孤立代理字符（如 "\ud800"）会让 encode 抛
+                    # UnicodeEncodeError，若在按钮回调里没兜住就是整页红屏 traceback
+                    try:
+                        pw_bytes = len(password.encode("utf-8"))
+                    except UnicodeEncodeError:
+                        pw_bytes = None
+                    if not reg_name:
+                        st.warning("用户名不能为空")
+                    elif len(reg_name) > 50:
+                        st.warning("用户名不能超过 50 个字符")
+                    elif not password:
+                        st.warning("密码不能为空")
+                    elif len(password) < 8:
+                        st.warning("密码至少 8 位")
+                    elif pw_bytes is None:
+                        st.warning("密码包含无法处理的字符，请换一个")
+                    elif pw_bytes > 72:
+                        st.warning("密码过长：最长 72 字节（约 24 个汉字）")
                     else:
-                        st.error("注册失败，未获取用户ID")
-                except ValueError as e:
-                    # 数据层主动抛的中文业务错误（密码不合规 / 用户名已被占用），可以直接展示
-                    st.error(str(e))
-                except Exception as e:
-                    # 其它异常可能含 SQL / 参数（如 bcrypt hash），只进服务端日志
-                    print(f"[register] 注册异常：{type(e).__name__}: {e}")
-                    st.error("注册失败：系统繁忙，请稍后再试")
+                        try:
+                            new_uid = register_user(reg_name, password)
+                            if new_uid:
+                                # 成功提示走 flash：紧跟 rerun 的 st.success 会被吞掉
+                                # 文案固定，不拼接用户名：flash 用 markdown 渲染，用户名可控会变成 [点我](http://evil)
+                                st.session_state["flash"] = {"level": "success", "msg": "注册成功，已自动登录"}
+                                st.session_state.user_id = new_uid
+                                st.rerun()
+                            else:
+                                st.error("注册失败，未获取用户ID")
+                        except ValueError as e:
+                            # 数据层主动抛的中文业务错误（密码不合规 / 用户名已被占用），可以直接展示
+                            st.error(str(e))
+                        except Exception as e:
+                            # 其它异常可能含 SQL / 参数（如 bcrypt hash），只进服务端日志
+                            print(f"[register] 注册异常：{type(e).__name__}: {e}")
+                            st.error("注册失败：系统繁忙，请稍后再试")
     st.stop()
 
 # 纵深防御：先清掉上一轮可能残留的管理员标记，只有本次鉴权成功才重新赋 True
@@ -624,7 +655,7 @@ with st.sidebar:
                 st.success(f"🎉 恭喜升级：{_ti['emoji']} {_ti['title']}！")
 
     # ---- 个人设定（含负债率常驻预警）----
-    with st.container(border=True):
+    with st.container(border=True, key="card_settings"):
         st.header("个人设定")
         if "monthly_budget" not in st.session_state:
             st.session_state.monthly_budget = 1500.0
@@ -659,7 +690,7 @@ with st.sidebar:
                 )
 
     # ---- 今日提问额度 ----
-    with st.container(border=True):
+    with st.container(border=True, key="card_quota"):
         st.subheader("今日提问额度")
         today = date.today()
         if st.session_state.ai_last_count_date != today:
@@ -669,7 +700,7 @@ with st.sidebar:
         st.info(f"今日剩余提问次数：{remaining}")
 
     # ---- 数据导入（CSV 上传 + 演示数据）----
-    with st.container(border=True):
+    with st.container(border=True, key="card_data_import"):
         st.subheader("数据导入")
         uploaded_file = st.file_uploader("上传账单文件", type=['csv'], key=f"uploader_{st.session_state.user_id}")
         if uploaded_file is not None:
@@ -1929,7 +1960,7 @@ with tab_dash:
 
 with tab_tools:
     # ---- 手动记一笔 ----
-    with st.container(border=True):
+    with st.container(border=True, key="card_manual"):
         st.subheader("✏️ 手动记一笔")
         # 手动记账
         submitted = False  # 先初始化，避免 expander 将来被条件包裹时 submitted 未定义
@@ -1968,7 +1999,7 @@ with tab_tools:
                     st.error(f"保存失败：{exc}")
 
     # ---- 分期真实利率试算 ----
-    with st.container(border=True):
+    with st.container(border=True, key="card_installment"):
         st.subheader("💰 算算分期有多贵？")
         st.caption("按现金流 IRR 计算真实年化利率，不是“手续费/本金”的简单除法")
 
@@ -2105,7 +2136,7 @@ with tab_tools:
                         )
 
     # ---- 我的心愿单 ----
-    with st.container(border=True):
+    with st.container(border=True, key="card_goal"):
         st.subheader("🏺 我的心愿单")
         try:
             goal = get_goal(st.session_state.user_id)
@@ -2221,7 +2252,7 @@ with tab_tools:
                         st.rerun()
 
     # ---- AI 智能预算（放在心愿单之后）----
-    with st.container(border=True):
+    with st.container(border=True, key="card_budget"):
         st.subheader("🤖 AI 智能预算")
         try:
             _budget_details = get_budget_details(st.session_state.user_id)
@@ -2377,7 +2408,7 @@ with tab_tools:
                             st.rerun()
 
     # ---- 🎤 语音记账（放在 AI 智能预算之后；后端契约：ai_agent.transcribe_audio / extract_bill_from_text）----
-    with st.container(border=True):
+    with st.container(border=True, key="card_voice"):
         st.subheader("🎤 语音记账")
         st.caption("按住麦克风说一句，例如：今天食堂花了 25 块（≤30 秒）")
         _voice_audio = st.audio_input(
@@ -2521,7 +2552,7 @@ with tab_tools:
     # ---- 🏆 我的挑战（放在语音记账之后，Tab2 最后一张卡片）----
     # AI 生成每周省钱挑战 + 完成领积分。后端：db.get_challenge_state / db.award_challenge_points
     # （migrations/017）。后端缺失 / 017 未执行时整卡降级成一行提示，绝不红屏。
-    with st.container(border=True):
+    with st.container(border=True, key="card_challenge"):
         st.subheader("🏆 我的挑战")
         _challenge_uid = st.session_state.user_id
         _challenge_state = None
