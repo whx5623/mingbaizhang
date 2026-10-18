@@ -81,6 +81,12 @@ def build_system_prompt(total_income, total_expense, balance, recent_bills_text,
 {recent_bills_text}
 结合参考知识与账单数据，给出适合大学生的财务建议。
 如果用户提到一笔消费或收入，请调用add_bill工具自动记录账单。
+
+工具使用规则（必须严格遵守）：
+1. 查询类问题（某段时间/某分类花了多少、有哪些账单）→ 必须调用 query_bills，不要凭记忆或不完整的“最近5笔账单”作答；拿到结果后用自然语言总结（总笔数、总金额、Top 商户/分类），不要编造数字。
+2. 删除类请求 → 直接调用 delete_bills（只调用工具，不要自己编造删除结果）。调用后系统会向用户展示「确认卡片」，用户回复「确认」才会真正执行删除；因此你**不要**在文字里再问一遍确认，也不要在没有用户删除意图时调用它。
+3. 如果用户没说清日期区间，先追问清楚再调用工具，不要自行猜测。
+4. 不要在一次回复里同时调用 add_bill 和 delete_bills。
 """
     return prompt
 
@@ -111,6 +117,39 @@ def get_ai_response(messages, api_key, zhipu_api_key, total_income, total_expens
                         "type": {"type": "string", "description": "收入/支出"}
                     },
                     "required": ["date", "merchant", "amount", "payment_method", "type"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "query_bills",
+                "description": "按日期区间/分类/关键词查询用户的账单，返回明细；用户问“上个月在食堂花了多少”这类问题时必须调用",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "start_date": {"type": "string", "description": "开始日期，格式YYYY-MM-DD"},
+                        "end_date": {"type": "string", "description": "结束日期，格式YYYY-MM-DD（含当天）"},
+                        "category": {"type": "string", "description": "分类，可选，如 餐饮/奶茶咖啡/购物。不填表示不限分类"},
+                        "keyword": {"type": "string", "description": "商户或分类关键词，可选，如 食堂/咖啡。不填表示不限关键词"}
+                    },
+                    "required": ["start_date", "end_date"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "delete_bills",
+                "description": "危险操作：按日期区间（可选分类）删除用户的账单，删除不可恢复，且区间内的收入与支出会被一起删除。用户明确表达删除意图时直接调用本工具：调用后系统会向用户展示确认卡片，用户回复「确认」后系统才会真正执行；因此不要在文字里自行询问确认，也不要编造删除结果",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "start_date": {"type": "string", "description": "开始日期，格式YYYY-MM-DD"},
+                        "end_date": {"type": "string", "description": "结束日期，格式YYYY-MM-DD（含当天）"},
+                        "category": {"type": "string", "description": "分类，可选，如 餐饮/购物；不填表示该区间内全部类别"}
+                    },
+                    "required": ["start_date", "end_date"]
                 }
             }
         }

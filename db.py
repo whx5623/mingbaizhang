@@ -3645,3 +3645,160 @@ def get_daily_expense_totals(user_id, months: int = 3, today=None) -> dict[str, 
         result[day.isoformat()] = totals.get(day, 0.0)
         day += timedelta(days=1)
     return result
+
+
+# ===========================================================================
+# 自然语言查账 / 删账（AI tool 后端）
+# ---------------------------------------------------------------------------
+# 这两个函数是 ai_agent.py 里 query_bills / delete_bills 两个 tool 的落库实现，
+# 安全边界**全部在这里**，不依赖 AI 层（模型可能幻觉、可能被提示词注入诱导）：
+#   · 每条 SQL 都带 `user_id = :uid`，且 uid 只来自调用方传入、经
+#     _normalize_budget_user_id 校验的正整数 —— **不存在「不带 user_id 的删除」**；
+#   · 日期区间、分类、关键词一律走绑定参数，绝不字符串拼接，注入面为零；
+#   · 删除语句只写 bills 一张表，DELETE 语义上不可能波及 users / savings_goals；
+#   · 区间上限 366 天：既防「一次删/查全库」，也防误传 1970~2999 的宽区间拖垮库；
+#   · 日志只记 user_id / 区间 / 命中行数，绝不落商户、关键词明细（隐私）。
+# 注意：按约定这两个函数**不接受 bill_type**，删除会连同区间内的收入一起删；
+# 前端确认文案必须说明「含收入」。
+# ===========================================================================
+
+BILL_QUERY_MAX_SPAN_DAYS = 366   # 闭区间两端相差最多 366 天（含端点即最多 367 个自然日）
+BILL_FILTER_TEXT_MAX_LEN = 50    # 分类 / 关键词 strip 后的长度上限
+
+
+def _normalize_bill_query_range(start_date, end_date) -> tuple[str, str]:
+    """校验查询/删除的日期区间，返回 (start, end) 两个严格 ISO 字符串。
+
+    全部校验都在**开连接之前**完成：非法入参连库都不碰。
+      · 两端各走 _normalize_bill_date（严格 ``^\\d{4}-\\d{2}-\\d{2}$`` + 真实日历日）；
+      · end >= start；
+      · 跨度（end - start 的天数）<= 366，超过即 ValueError「查询区间过大」。
+    用 `date()` 而不是字符串比较算跨度：字符串只能比字典序，算不出天数。
+    """
+    start = _normalize_bill_date(start_date)
+    end = _normalize_bill_date(end_date)
+    start_day = datetime.strptime(start, "%Y-%m-%d").date()
+    end_day = datetime.strptime(end, "%Y-%m-%d").date()
+    if end_day < start_day:
+        raise ValueError(f"结束日期不能早于开始日期：{start} ~ {end}")
+    if (end_day - start_day).days > BILL_QUERY_MAX_SPAN_DAYS:
+        raise ValueError(
+            f"查询区间过大：最多 {BILL_QUERY_MAX_SPAN_DAYS} 天（当前 {start} ~ {end}）"
+        )
+    return start, end
+
+
+def _normalize_bill_filter_text(value, field_name: str) -> str | None:
+    """分类 / 关键词：None → None（不限）；否则 strip 后 1~50 个字符，非法即 ValueError。
+
+    只接受 str：int / list 之类不做 str() 隐式转换 —— 把「传错类型」悄悄变成
+    「查了一个叫 123 的分类」会让调用方以为查询成功，实际永远 0 行。
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name}必须是 1~{BILL_FILTER_TEXT_MAX_LEN} 个字符的字符串：{value!r}")
+    cleaned = value.strip()
+    if not 1 <= len(cleaned) <= BILL_FILTER_TEXT_MAX_LEN:
+        raise ValueError(f"{field_name}必须是 1~{BILL_FILTER_TEXT_MAX_LEN} 个字符：{value!r}")
+    return cleaned
+
+
+def _normalize_bill_query_user_id(user_id) -> int:
+    """AI 查账/删账的 user_id 校验：直接复用预算模块的正整数口径（拒绝 bool/float）。"""
+    return _normalize_budget_user_id(user_id)
+
+
+def query_bills(user_id, start_date, end_date, category=None, keyword=None) -> pd.DataFrame:
+    """按日期区间（可选分类 / 关键词）查询某个用户的账单明细。
+
+    返回 DataFrame，列与 get_all_bills 一致（``SELECT *`` + 同三列归一化：
+    type / amount / category）；按 ``date DESC, id DESC`` 排序。
+    **空结果返回带列名的空 DataFrame**（而不是 None 或空表壳）：AI 层随后要按
+    `df["amount"].sum()` 之类做汇总，None 会直接炸，空表壳会 KeyError。
+
+    SQL 全参数绑定；user_id 限定在 WHERE 第一项，跨用户查询不可能发生。
+    """
+    uid = _normalize_bill_query_user_id(user_id)
+    start, end = _normalize_bill_query_range(start_date, end_date)
+    cat = _normalize_bill_filter_text(category, "分类")
+    kw = _normalize_bill_filter_text(keyword, "关键词")
+
+    if engine is None:
+        init_db()
+
+    # 只拼接**固定的 SQL 片段**（是否加子句由参数是否为 None 决定），值全部绑定。
+    where_sql = [
+        "SELECT * FROM bills",
+        "WHERE user_id = :uid",
+        "  AND date::date BETWEEN :start AND :end",
+    ]
+    params = {"uid": uid, "start": start, "end": end}
+    if cat is not None:
+        where_sql.append("  AND category = :cat")
+        params["cat"] = cat
+    if kw is not None:
+        # ILIKE 的通配符由 Python 侧包成 %kw%；kw 本身仍是绑定参数，不存在注入。
+        where_sql.append("  AND (merchant ILIKE :kw OR category ILIKE :kw)")
+        params["kw"] = f"%{kw}%"
+    # date 是 TEXT（ISO 零填充）→ 字典序 == 时间序；同一天再按 id 倒序保证稳定。
+    where_sql.append("ORDER BY date DESC, id DESC")
+    stmt = text("\n".join(where_sql))
+
+    with engine.connect() as conn:
+        df = pd.read_sql(stmt, conn, params=params)
+        if df.empty and not len(df.columns):
+            # 空结果时 pd.read_sql 通常仍带列名；这里兜的是「驱动/版本把列信息丢了」
+            # 的极端情况 —— 用同表 0 行查询取一次列定义，保证 columns 非空。
+            columns = list(conn.execute(text("SELECT * FROM bills WHERE 1 = 0")).keys())
+            df = pd.DataFrame(columns=columns)
+
+    # 与 get_all_bills 完全同口径：type 字符串口径 + amount float + category 空值→「其他」。
+    df = _normalize_category_column(_normalize_type_column(_normalize_amount_column(df)))
+
+    # 只记区间与命中行数，不记 category / keyword（keyword 可能是商户名，属隐私）。
+    logging.getLogger(__name__).info(
+        "[db] query_bills user_id=%s range=%s..%s rows=%s", uid, start, end, len(df)
+    )
+    return df
+
+
+def delete_bills(user_id, start_date, end_date, category=None) -> int:
+    """删除某个用户在日期区间内（可选分类）的账单，返回实际删除行数。
+
+    ⚠ 危险操作，但**: 本函数不做任何确认** —— 二次确认属于交互层（ai_agent 的
+    tool 描述 + 系统提示词要求模型先复述条件、等用户回复「确认」）。这里只保证
+    「就算被调用，也只可能删到该用户、该区间、该分类」。
+    ⚠ 不接受 bill_type：区间内**收入与支出一起删**（前端确认文案必须写明「含收入」）。
+
+    SQL 全参数绑定；`user_id` 是 WHERE 的首个条件，且 DELETE 只作用于 bills 表
+    （绝不触及 users / savings_goals / chat_history）。没有 category 时删整段区间。
+    """
+    uid = _normalize_bill_query_user_id(user_id)
+    start, end = _normalize_bill_query_range(start_date, end_date)
+    cat = _normalize_bill_filter_text(category, "分类")
+
+    if engine is None:
+        init_db()
+
+    delete_sql = [
+        "DELETE FROM bills",
+        "WHERE user_id = :uid",
+        "  AND date::date BETWEEN :start AND :end",
+    ]
+    params = {"uid": uid, "start": start, "end": end}
+    if cat is not None:
+        delete_sql.append("  AND category = :cat")
+        params["cat"] = cat
+    stmt = text("\n".join(delete_sql))
+
+    with engine.connect() as conn:
+        result = conn.execute(stmt, params)
+        conn.commit()  # DELETE 必须显式提交，否则连接归还时事务回滚、rowcount 是假象
+        deleted = int(result.rowcount or 0)
+
+    # 只记 user_id / 区间 / 删除行数；不记商户、分类、关键词。
+    logging.getLogger(__name__).info(
+        "[db] delete_bills user_id=%s range=%s..%s deleted=%s", uid, start, end, deleted
+    )
+    return deleted

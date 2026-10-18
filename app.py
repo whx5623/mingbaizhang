@@ -10,7 +10,7 @@ except ImportError as _health_import_exc:
     compute_health_score = None
     print(f"[health] 健康分模块不可用：{type(_health_import_exc).__name__}: {_health_import_exc}")
 from finance_math import compute_irr, payment_from_fee, debt_ratio
-from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, get_user_auth_state, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data, get_login_daily_stats, login_events_available, LoginThrottled, set_goal, get_goal, add_to_goal, get_budget_details, save_budget_details, generate_smart_budget
+from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, get_user_auth_state, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data, get_login_daily_stats, login_events_available, LoginThrottled, set_goal, get_goal, add_to_goal, get_budget_details, save_budget_details, generate_smart_budget, query_bills, delete_bills
 # 消费日历热力图后端由并行方提供（见 db.get_daily_expense_totals）：
 # 尚未合入时先降级成 None，页面只显示一行提示，绝不因 ImportError 红屏。
 try:
@@ -2495,7 +2495,24 @@ with tab_ai:
         st.session_state.chat_history.append({"role": "assistant", "content": "你好！我是明白账AI财务管家，可以帮你分析账单，也可以直接帮你记账，有什么想问我的吗？"})
 
     for msg in st.session_state.chat_history:
-        st.chat_message(msg["role"]).write(msg["content"])
+        # tool 消息是模型 ↔ 本地函数的协议数据（查询结果原文可能很长），不直接展示；
+        # assistant 的 tool_calls 消息 content 为 None，也没有可展示内容 —— 一并跳过。
+        if msg.get("role") == "tool":
+            continue
+        _msg_content = msg.get("content")
+        _msg_table = msg.get("table")
+        if not _msg_content and not _msg_table:
+            continue
+        with st.chat_message(msg["role"]):
+            if _msg_content:
+                st.write(_msg_content)
+            # 查询结果表随 assistant 消息持久化：rerun / 切换 Tab 后依然在文字下方
+            if _msg_table:
+                st.dataframe(
+                    pd.DataFrame(_msg_table),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
     # 📸 截图记账：放在聊天输入框上方，聊天本身的逻辑不变
     screenshot_file = st.file_uploader(
@@ -2570,93 +2587,319 @@ with tab_ai:
                     st.session_state.page = 0  # 新账单按日期倒序，通常在第一页
                     st.rerun()
 
+    # ===== 聊天工具（query_bills / delete_bills）的代码级安全辅助 =====
+    # 安全原则：删除**绝不**直接执行模型给的参数。
+    #   1) 收到 delete_bills tool call 时，先按同条件 query_bills 预览（笔数 + 合计，含收入）；
+    #   2) 把条件快照写进 st.session_state["pending_delete"]，只回复确认文案：
+    #      不删库、不 append tool 消息、不再调模型（模型没法在同一轮里「顺手」删数据）；
+    #   3) 下一轮用户必须亲口回「确认」，执行时只用 pending 里的快照参数；
+    #      pending 为空时即使输入「确认」也只走普通聊天 —— 二次确认由代码强制，不依赖模型自觉。
+    _PENDING_DELETE_YES = frozenset({"确认", "确定", "是", "删除"})
+    _PENDING_DELETE_NO = frozenset({"取消", "算了", "不要", "否"})
+
+    def _clear_pending_delete():
+        """清空待确认的删除及归属标记，避免残留到下一个账号 / 下一次登录。"""
+        st.session_state.pop("pending_delete", None)
+        st.session_state.pop("pending_delete_owner", None)
+
+    def _pending_confirmation_visible():
+        """确认文案是否仍在聊天记录里（登出会清空 chat_history，旧 pending 必须失效）。"""
+        return any(
+            str(_m.get("content") or "").startswith("⚠️ 即将删除")
+            for _m in st.session_state.chat_history
+            if _m.get("role") == "assistant"
+        )
+
+    def _validate_delete_range(start_raw, end_raw):
+        """严格校验删除区间：ISO 日期（YYYY-MM-DD）、end >= start、跨度 <= 366 天。"""
+        try:
+            _start_dt = datetime.strptime(str(start_raw), "%Y-%m-%d").date()
+            _end_dt = datetime.strptime(str(end_raw), "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            return None, None, "删除参数不合法：日期需为 YYYY-MM-DD 格式"
+        if _end_dt < _start_dt:
+            return None, None, "删除参数不合法：结束日期早于开始日期"
+        if (_end_dt - _start_dt).days > 366:
+            return None, None, "删除参数不合法：单次最多删除 366 天内的账单"
+        return _start_dt.isoformat(), _end_dt.isoformat(), None
+
+    def _format_query_result(bill_df):
+        """查询结果 → (给模型看的短文本, 持久化到 chat_history 的表格行)。
+
+        给模型的最多 20 行且带列名；聊天里持久化的表格最多 50 行，避免一次全量
+        查询把 session_state 撑爆。空结果不写 table，页面只显示「没有查到」。
+        """
+        if bill_df is None or len(bill_df) == 0:
+            return "没有查到符合条件的账单", None
+        _spend = _income = 0.0
+        try:
+            _spend = float(bill_df.loc[bill_df["type"] == "支出", "amount"].sum())
+            _income = float(bill_df.loc[bill_df["type"] == "收入", "amount"].sum())
+        except (KeyError, TypeError, ValueError):
+            pass
+        _tool_text = (
+            f"查询到 {len(bill_df)} 笔，支出合计 {_spend:.2f}，收入合计 {_income:.2f}\n"
+            f"{bill_df.head(20).to_string(index=False)}"
+        )
+        return _tool_text, bill_df.head(50).to_dict("records")
+
+    def _build_delete_confirmation(func_args):
+        """delete_bills tool call → 预览 + 写 pending_delete，返回给用户看的确认文案。
+
+        注意：本函数**不执行删除**；只有下一轮用户回「确认」才会真正调 delete_bills。
+        """
+        _start, _end, _range_err = _validate_delete_range(
+            func_args.get("start_date"), func_args.get("end_date")
+        )
+        if _range_err:
+            st.error(f"{_range_err}，未执行删除。")
+            return f"{_range_err}，未执行删除。"
+        _category = func_args.get("category")
+        st.caption("🔎 正在执行查询操作…")
+        try:
+            with st.spinner("正在执行查询操作…"):
+                _preview_df = query_bills(
+                    st.session_state.user_id, _start, _end, _category, None
+                )
+        except ValueError as _preview_err:
+            st.error(f"删除前预览失败：{_preview_err}")
+            return f"删除前预览失败：{_preview_err}。未执行删除。"
+        except Exception as _preview_exc:
+            print(f"[chat] 删除前预览失败：{type(_preview_exc).__name__}: {_preview_exc}")
+            st.error("删除前预览失败，请稍后再试")
+            return "删除前预览失败，账单未改动，请稍后再试。"
+        _count = 0 if _preview_df is None else len(_preview_df)
+        if _count == 0:
+            # 没有可删的数据：不进入待确认状态，避免用户对着「删除 0 笔」再确认一次
+            _clear_pending_delete()
+            return "没有查到符合条件的账单，无需删除。"
+        _spend = _income = 0.0
+        try:
+            _spend = float(_preview_df.loc[_preview_df["type"] == "支出", "amount"].sum())
+            _income = float(_preview_df.loc[_preview_df["type"] == "收入", "amount"].sum())
+        except (KeyError, TypeError, ValueError):
+            pass
+        _total = _spend + _income
+        st.session_state["pending_delete"] = {
+            "start_date": _start,
+            "end_date": _end,
+            "category": _category,
+            "keyword": None,
+            "count": _count,
+            "total": _total,
+        }
+        # 归属标记：logout 只清 chat_history、不清 pending_delete，换账号后必须让旧快照失效
+        st.session_state["pending_delete_owner"] = st.session_state.user_id
+        _scope = f"{_start} 至 {_end}" + (f"·{_category}" if _category else "")
+        return (
+            f"⚠️ 即将删除 {_scope} 的 {_count} 笔账单"
+            f"（合计 ¥{_total:.2f}，含收入）。\n\n"
+            "回复「确认」执行删除，回复「取消」放弃。"
+        )
+
     user_input = st.chat_input("可以直接让我帮你记账，例如：今天喝奶茶花了15元")
     if user_input:
         st.chat_message("user").write(user_input)
         st.session_state.chat_history.append({"role": "user", "content": user_input})
 
-        from ai_agent import get_ai_response
-        api_key = get_deepseek_api_key()
-        if not api_key:
-            st.error("请先设置 DEEPSEEK_API_KEY 环境变量")
-        else:
-            current_ts = datetime.now().timestamp()
-            st.session_state.ai_call_timestamps.append(current_ts)
-            st.session_state.ai_call_timestamps = [t for t in st.session_state.ai_call_timestamps if current_ts - t <= 10]
-
-            if len(st.session_state.ai_call_timestamps) > 3:
-                warn_msg = "提问太快了，请休息 10 秒后再试"
-                st.chat_message("assistant").write(warn_msg)
-                st.session_state.chat_history.append({"role": "assistant", "content": warn_msg})
-            elif st.session_state.ai_daily_count >=20:
-                limit_msg = "今日免费额度已用完，请明天再来"
-                st.chat_message("assistant").write(limit_msg)
-                st.session_state.chat_history.append({"role": "assistant", "content": limit_msg})
-            else:
-                st.session_state.ai_daily_count += 1
-                remaining = 20 - st.session_state.ai_daily_count
-                with st.sidebar:
-                    st.info(f"今日剩余提问次数：{remaining}")
-                try:
-                    recent_5_bills = df.sort_values("date_parsed", ascending=False).head(5)
-                    recent_bills_text = recent_5_bills.to_string(index=False)
-                    resp = get_ai_response(
-                        messages=st.session_state.chat_history,
-                        api_key=api_key,
-                        zhipu_api_key=ZHIPU_API_KEY,
-                        total_income=total_income,
-                        total_expense=total_expense,
-                        balance=balance,
-                        recent_bills_text=recent_bills_text
-                    )
-                    if resp.status_code != 200:
-                        st.error(f"API请求失败，状态码：{resp.status_code}，返回信息：{resp.text}")
-                    else:
-                        res_data = resp.json()
-                        msg = res_data["choices"][0]["message"]
-                        if "tool_calls" in msg and msg["tool_calls"]:
-                            tool_call = msg["tool_calls"][0]
-                            func_name = tool_call["function"]["name"]
-                            func_args = json.loads(tool_call["function"]["arguments"])
-                            tool_result = ""
-                            if func_name == "add_bill":
-                                bill_date = func_args.get("date", datetime.now().strftime("%Y-%m-%d"))
-                                merchant = func_args["merchant"]
-                                amount = float(func_args["amount"])
-                                payment_method = func_args.get("payment_method","未知")
-                                bill_type = func_args["type"]
-                                add_bill(st.session_state.user_id, bill_date, merchant, amount, payment_method, bill_type)
-                                tool_result = f"已成功添加账单：日期{bill_date}，商户{merchant}，金额{amount}，类型{bill_type}"
-                                st.cache_data.clear()
-                            elif func_name == "get_summary":
-                                tool_result = f"用户财务汇总：总收入{total_income:.2f}，总支出{total_expense:.2f}，结余{balance:.2f}"
-                            st.session_state.chat_history.append(msg)
-                            st.session_state.chat_history.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call["id"],
-                                "content": tool_result
-                            })
-                            resp2 = get_ai_response(
-                                messages=st.session_state.chat_history,
-                                api_key=api_key,
-                                zhipu_api_key=ZHIPU_API_KEY,
-                                total_income=total_income,
-                                total_expense=total_expense,
-                                balance=balance,
-                                recent_bills_text=recent_bills_text
+        if st.session_state.get("pending_delete"):
+            # ---- 待删除会话：只认用户的明确指令，绝不把输入交给模型 ----
+            _pending_owner = st.session_state.get("pending_delete_owner")
+            if _pending_owner is not None and (
+                _pending_owner != st.session_state.user_id
+                or not _pending_confirmation_visible()
+            ):
+                # 账号切换 / 聊天记录被清空（如登出）后：旧 pending 一律作废，绝不执行删除
+                _clear_pending_delete()
+                st.session_state.chat_history.append(
+                    {
+                        "role": "assistant",
+                        "content": "待确认的删除已失效（账号切换或聊天记录已清空），未删除任何账单。",
+                    }
+                )
+                st.rerun()
+            _pending = st.session_state["pending_delete"]
+            _cmd = user_input.strip()
+            if _cmd in _PENDING_DELETE_YES:
+                _start, _end, _range_err = _validate_delete_range(
+                    _pending.get("start_date"), _pending.get("end_date")
+                )
+                if _range_err:
+                    # 快照参数被污染/过期：报错并作废，不执行任何删除
+                    _clear_pending_delete()
+                    st.error(f"{_range_err}，已取消本次删除。")
+                else:
+                    st.caption("🗑️ 正在执行删除操作…")
+                    try:
+                        with st.spinner("正在执行删除操作…"):
+                            delete_bills(
+                                st.session_state.user_id,
+                                _start,
+                                _end,
+                                _pending.get("category"),
                             )
-                            res2 = resp2.json()
-                            ai_answer = res2["choices"][0]["message"]["content"]
+                    except Exception as _del_exc:
+                        print(f"[chat] 删除账单失败：{type(_del_exc).__name__}: {_del_exc}")
+                        _clear_pending_delete()
+                        st.error("删除失败，账单未改动，请稍后再试")
+                    else:
+                        st.cache_data.clear()
+                        _pending_count = int(_pending.get("count") or 0)
+                        _pending_total = float(_pending.get("total") or 0)
+                        _deleted_msg = (
+                            f"已删除 {_pending_count} 笔账单"
+                            f"（合计 ¥{_pending_total:.2f}）。"
+                        )
+                        st.session_state.chat_history.append(
+                            {"role": "assistant", "content": _deleted_msg}
+                        )
+                        _clear_pending_delete()
+                        st.rerun()
+            elif _cmd in _PENDING_DELETE_NO:
+                _clear_pending_delete()
+                st.session_state.chat_history.append(
+                    {"role": "assistant", "content": "已取消删除，没有改动任何账单。"}
+                )
+                st.rerun()
+            else:
+                # 既不是确认也不是取消：留在待确认状态，提示后重跑；不调用模型，避免绕过确认
+                st.session_state.chat_history.append(
+                    {
+                        "role": "assistant",
+                        "content": "请回复「确认」或「取消」以继续（取消后可以重新提问）。",
+                    }
+                )
+                st.rerun()
+        else:
+            from ai_agent import get_ai_response
+            api_key = get_deepseek_api_key()
+            if not api_key:
+                st.error("请先设置 DEEPSEEK_API_KEY 环境变量")
+            else:
+                current_ts = datetime.now().timestamp()
+                st.session_state.ai_call_timestamps.append(current_ts)
+                st.session_state.ai_call_timestamps = [t for t in st.session_state.ai_call_timestamps if current_ts - t <= 10]
+
+                if len(st.session_state.ai_call_timestamps) > 3:
+                    warn_msg = "提问太快了，请休息 10 秒后再试"
+                    st.chat_message("assistant").write(warn_msg)
+                    st.session_state.chat_history.append({"role": "assistant", "content": warn_msg})
+                elif st.session_state.ai_daily_count >=20:
+                    limit_msg = "今日免费额度已用完，请明天再来"
+                    st.chat_message("assistant").write(limit_msg)
+                    st.session_state.chat_history.append({"role": "assistant", "content": limit_msg})
+                else:
+                    st.session_state.ai_daily_count += 1
+                    remaining = 20 - st.session_state.ai_daily_count
+                    with st.sidebar:
+                        st.info(f"今日剩余提问次数：{remaining}")
+                    try:
+                        recent_5_bills = df.sort_values("date_parsed", ascending=False).head(5)
+                        recent_bills_text = recent_5_bills.to_string(index=False)
+                        resp = get_ai_response(
+                            messages=st.session_state.chat_history,
+                            api_key=api_key,
+                            zhipu_api_key=ZHIPU_API_KEY,
+                            total_income=total_income,
+                            total_expense=total_expense,
+                            balance=balance,
+                            recent_bills_text=recent_bills_text
+                        )
+                        if resp.status_code != 200:
+                            st.error(f"API请求失败，状态码：{resp.status_code}，返回信息：{resp.text}")
                         else:
-                            ai_answer = msg["content"]
-                        st.chat_message("assistant").write(ai_answer)
-                        st.session_state.chat_history.append({"role": "assistant", "content": ai_answer})
-                except requests.exceptions.Timeout:
-                    st.error("请求超时，请稍后重试")
-                except requests.exceptions.ConnectionError:
-                    st.error("网络连接失败，请检查网络")
-                except Exception as err:
-                    st.error(f"发生错误：{str(err)}")
+                            res_data = resp.json()
+                            msg = res_data["choices"][0]["message"]
+                            ai_answer = None
+                            answer_table = None
+                            _delete_confirmation_sent = False
+                            if "tool_calls" in msg and msg["tool_calls"]:
+                                tool_call = msg["tool_calls"][0]
+                                func_name = tool_call["function"]["name"]
+                                func_args = json.loads(tool_call["function"]["arguments"])
+                                tool_result = ""
+                                if func_name == "add_bill":
+                                    bill_date = func_args.get("date", datetime.now().strftime("%Y-%m-%d"))
+                                    merchant = func_args["merchant"]
+                                    amount = float(func_args["amount"])
+                                    payment_method = func_args.get("payment_method","未知")
+                                    bill_type = func_args["type"]
+                                    add_bill(st.session_state.user_id, bill_date, merchant, amount, payment_method, bill_type)
+                                    tool_result = f"已成功添加账单：日期{bill_date}，商户{merchant}，金额{amount}，类型{bill_type}"
+                                    st.cache_data.clear()
+                                elif func_name == "get_summary":
+                                    tool_result = f"用户财务汇总：总收入{total_income:.2f}，总支出{total_expense:.2f}，结余{balance:.2f}"
+                                elif func_name == "query_bills":
+                                    # 界面提示「正在执行查询操作」：spinner + 聊天内一行 caption
+                                    st.caption("🔎 正在执行查询操作…")
+                                    try:
+                                        with st.spinner("正在执行查询操作…"):
+                                            _query_df = query_bills(
+                                                st.session_state.user_id,
+                                                func_args.get("start_date"),
+                                                func_args.get("end_date"),
+                                                func_args.get("category"),
+                                                func_args.get("keyword"),
+                                            )
+                                    except ValueError as _query_err:
+                                        # 参数非法：把中文原因交回模型解释，页面不红屏
+                                        st.error(f"查询参数不合法：{_query_err}")
+                                        tool_result = f"查询参数不合法：{_query_err}"
+                                    except Exception as _query_exc:
+                                        print(f"[chat] 查询账单失败：{type(_query_exc).__name__}: {_query_exc}")
+                                        st.error("查询失败，请稍后再试")
+                                        tool_result = "查询失败，请稍后再试"
+                                    else:
+                                        tool_result, answer_table = _format_query_result(_query_df)
+                                elif func_name == "delete_bills":
+                                    # 安全核心：只预览 + 写 pending_delete，绝不执行删除，
+                                    # 也不 append tool 消息 / 不再调模型（用户回「确认」后才删）。
+                                    ai_answer = _build_delete_confirmation(func_args)
+                                    _delete_confirmation_sent = True
+                                if not _delete_confirmation_sent:
+                                    st.session_state.chat_history.append(msg)
+                                    st.session_state.chat_history.append({
+                                        "role": "tool",
+                                        "tool_call_id": tool_call["id"],
+                                        "content": tool_result
+                                    })
+                                    resp2 = get_ai_response(
+                                        messages=st.session_state.chat_history,
+                                        api_key=api_key,
+                                        zhipu_api_key=ZHIPU_API_KEY,
+                                        total_income=total_income,
+                                        total_expense=total_expense,
+                                        balance=balance,
+                                        recent_bills_text=recent_bills_text
+                                    )
+                                    if resp2.status_code != 200:
+                                        st.error(f"API请求失败，状态码：{resp2.status_code}")
+                                        ai_answer = "操作已完成，但生成文字总结失败，请稍后再试。"
+                                    else:
+                                        res2 = resp2.json()
+                                        ai_answer = res2["choices"][0]["message"]["content"]
+                            else:
+                                ai_answer = msg["content"]
+                            if ai_answer is not None:
+                                with st.chat_message("assistant"):
+                                    st.write(ai_answer)
+                                    if answer_table:
+                                        # 本轮立刻渲染；同时写进 chat_history，rerun 后依然在文字下方
+                                        st.dataframe(
+                                            pd.DataFrame(answer_table),
+                                            use_container_width=True,
+                                            hide_index=True,
+                                        )
+                                _assistant_entry = {"role": "assistant", "content": ai_answer}
+                                if answer_table:
+                                    _assistant_entry["table"] = answer_table
+                                st.session_state.chat_history.append(_assistant_entry)
+                    except requests.exceptions.Timeout:
+                        st.error("请求超时，请稍后重试")
+                    except requests.exceptions.ConnectionError:
+                        st.error("网络连接失败，请检查网络")
+                    except Exception as err:
+                        st.error(f"发生错误：{str(err)}")
 
 # 用户反馈模块
 with st.expander("💬 给我们提建议"):
