@@ -463,7 +463,7 @@ if st.session_state.is_admin:
             "series": [{"type": "line", "data": reg_7df["count"].tolist()}],
             "tooltip": {"trigger": "axis"}
         }
-        st_echarts(reg_option, height=300)
+        st_echarts(reg_option, height="300px")
 
         st.subheader("近 7 个自然日每日活跃用户")
         active_option = {
@@ -472,7 +472,7 @@ if st.session_state.is_admin:
             "series": [{"type": "line", "data": active_7df["count"].tolist()}],
             "tooltip": {"trigger": "axis"}
         }
-        st_echarts(active_option, height=300)
+        st_echarts(active_option, height="300px")
 
         st.subheader("近 7 个自然日每日登录用户")
         if not login_events_available():
@@ -484,7 +484,7 @@ if st.session_state.is_admin:
             "series": [{"type": "line", "data": login_7df["count"].tolist()}],
             "tooltip": {"trigger": "axis"}
         }
-        st_echarts(login_option, height=300)
+        st_echarts(login_option, height="300px")
         st.caption("登录趋势来自 login_events（009 执行后开始记录）；日期按 UTC 自然日分桶（北京时间 08:00 换日）；009 执行前该图为空属正常。")
         st.divider()
 
@@ -913,7 +913,7 @@ with tab_dash:
                 "data": [{"value": health["score"], "name": f'{health["grade"]} · {health["title"]}'}]
             }]
         }
-        st_echarts(health_option, height=300)
+        st_echarts(health_option, height="300px")
 
         health_score = int(health["score"])
         health_grade = str(health["grade"])
@@ -1617,7 +1617,13 @@ with tab_dash:
                     "data": rose_data
                 }]
             }
-            st_echarts(rose_option, height=320)
+            # 用容器包裹，避免父级 flex/样式异常时图表塌陷；异常只降级提示，不红屏。
+            try:
+                with st.container():
+                    st_echarts(rose_option, height="320px")
+            except Exception as _rose_exc:
+                print(f"[chart] 玫瑰图渲染失败：{type(_rose_exc).__name__}: {_rose_exc}")
+                st.warning("玫瑰图暂时无法渲染，请刷新页面重试")
 
     # ===== 消费日历热力图（本月 / 近三个月）=====
     # 数据由并行方 db.get_daily_expense_totals 提供（连续零填充的每日支出合计）：
@@ -1700,7 +1706,9 @@ with tab_dash:
             # 契约里零填充的日期也会有 0 值：全 0 说明这段时间没有支出，不画空图
             st.caption("这段时间还没有支出记录，先记几笔吧")
         else:
-            _cal_height = 260 if _cal_months == 1 else 430
+            # streamlit-echarts 的 height 参数是字符串（默认 "300px"）：传整数时前端
+            # 会拼成无单位的 style.height → canvas 高度为 0（图表整块空白），必须带 px。
+            _cal_height = "260px" if _cal_months == 1 else "430px"
             # 近三个月时三个 calendar 用显式 top 纵向堆叠（本月在最下，时间向下流动）
             _cal_tops = ["5%", "38%", "71%"] if _cal_months > 1 else [None]
             _cal_calendars = []
@@ -1759,7 +1767,14 @@ with tab_dash:
                 "calendar": _cal_calendars,
                 "series": _cal_series,
             }
-            st_echarts(_cal_option, height=_cal_height)
+            # 同样用容器包裹 + 异常降级：日历图依赖 calendar/heatmap 配置，
+            # 任何配置层异常都不应让整个看板红屏。
+            try:
+                with st.container():
+                    st_echarts(_cal_option, height=_cal_height)
+            except Exception as _cal_chart_exc:
+                print(f"[chart] 日历热力图渲染失败：{type(_cal_chart_exc).__name__}: {_cal_chart_exc}")
+                st.warning("日历热力图暂时无法渲染，请刷新页面重试")
 
     # ===== AI 洞察：本月消费图表解读（玫瑰图下方、数据导出之前）=====
     # 统计口径与上方玫瑰图一致：本月 + 支出。无支出时只给引导，不显示按钮。
