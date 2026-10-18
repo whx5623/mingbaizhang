@@ -1843,6 +1843,34 @@ CATEGORY_RULES = [
     (["药", "医院", "挂号", "体检", "诊所"], "医疗"),
 ]
 
+# ---------------------------------------------------------------------------
+# AI 分类结果的进程内缓存
+# ---------------------------------------------------------------------------
+# 为什么要缓存：规则未命中的长尾商户（"楼下小卖部"之类）每次记账都会打一次
+# DeepSeek；同一商户反复出现时，网络延迟和 API 成本都白花，而且一次超时就会让
+# 同一笔商户的分类结果在两次记账之间摇摆。缓存只存**成功且合法**的分类：
+#   · 失败 / 超时 / 回落 "其他" 一律不缓存 —— 否则一次网络抖动就会把某个商户
+#     永久钉死成"其他"，之后即使 AI 恢复了也再也不会重试；
+#   · 缓存是**进程级**的（普通 dict，不落库、不跨进程）：重启/热重载即失效，
+#     多个 worker 各有一份；这是刻意的取舍 —— 分类只是可选增强，不值得为它
+#     引入 Redis/数据库表这种新的故障点和运维成本。
+# key 用「商户|描述」的小写折叠形式：strip + casefold 让 " 瑞幸咖啡 " 与
+# "瑞幸咖啡"、"Starbucks" 与 "starbucks" 共用一条缓存；描述参与 key 是因为
+# 同一商户在不同描述下可能被分到不同类。
+_AI_CATEGORY_CACHE: dict[str, str] = {}
+
+# 容量上限：512 条 ×（key 几十字符 + value 几个字符）≈ 几十 KB，对学生账单的
+# 商户规模足够；超过上限时丢**最早插入**的一条（dict 自 3.7 起保插入序），
+# 不做真正的 LRU（命中不刷新顺序）。取舍：真正的 LRU 要 OrderedDict.move_to_end
+# 或额外时间戳，收益只是让热点商户晚一点被淘汰；这里选"实现最简单、内存上限硬、
+# 行为可预测"，清空整表则会让下一波请求同时打 AI（惊群），所以只淘汰一条。
+_AI_CATEGORY_CACHE_MAX = 512
+
+# 命中/未命中计数：不参与业务逻辑，只为观测缓存是否真的生效（测试也靠它断言）。
+# 注意：读取/累加这两个计数本身绝不能影响分类，所以下面用 try/except 兜住。
+_AI_CATEGORY_CACHE_HITS = 0
+_AI_CATEGORY_CACHE_MISSES = 0
+
 # bills.category 是否存在的进程级缓存：None = 还没探测过；True/False = 探测结果。
 # 只缓存**探测成功**的结果：探测本身失败（库暂时不可用）时不缓存，
 # 否则一次网络抖动就会让整个进程永久降级、执行 012 后也必须重启才能恢复。
@@ -1953,13 +1981,63 @@ def _normalize_category_column(df):
     return df
 
 
+def _ai_category_cache_key(merchant_text, description_text):
+    """拼缓存 key：商户 + 描述，各自 strip + casefold，用 '|' 分隔。
+
+    两个字段都用 '|' 之外的字符做分隔符本身不保证无碰撞（商户里真带 '|' 时
+    "a|b"+"c" 与 "a"+"b|c" 会撞）；但碰撞的代价只是多一次缓存命中（分类可能
+    不完美），而分类本来就是尽力而为，不值得为它引入转义/元组 key 的复杂度。
+    """
+    return f"{merchant_text.strip().casefold()}|{description_text.strip().casefold()}"
+
+
+def _remember_ai_category(cache_key, category):
+    """把一次成功的 AI 分类写进进程内缓存；**缓存自身出任何问题都只降级**。
+
+    · 只接受已在 BILL_CATEGORIES 内的分类（调用方已校验，这里再兜一层）；
+    · 容量上限 _AI_CATEGORY_CACHE_MAX：满了丢最早插入的一条（dict 保序）；
+    · 不记 key/描述到日志（可能含用户隐私），只记异常类型。
+    """
+    if category not in BILL_CATEGORIES:
+        return
+    try:
+        max_size = int(_AI_CATEGORY_CACHE_MAX)
+        if max_size <= 0:
+            return
+        while len(_AI_CATEGORY_CACHE) >= max_size:
+            _AI_CATEGORY_CACHE.pop(next(iter(_AI_CATEGORY_CACHE)))
+        _AI_CATEGORY_CACHE[cache_key] = category
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "[db] 写入 AI 分类缓存失败（忽略，不影响记账）", exc_info=True
+        )
+
+
+def clear_ai_category_cache():
+    """清空 AI 分类缓存，并把命中/未命中计数归零（测试 / 运维用）。
+
+    缓存是**进程级**的：只存在于当前 Python 进程的内存字典里，重启、热重载、
+    切换 worker 都会失效，也**不会**写进数据库。多进程部署时各进程互不共享，
+    清理只影响当前进程 —— 这是"分类只是可选增强"的刻意取舍，不引入外部缓存。
+    """
+    global _AI_CATEGORY_CACHE_HITS, _AI_CATEGORY_CACHE_MISSES
+    _AI_CATEGORY_CACHE.clear()
+    _AI_CATEGORY_CACHE_HITS = 0
+    _AI_CATEGORY_CACHE_MISSES = 0
+
+
 def auto_categorize(merchant, description="", api_key=None) -> str:
     """给一笔账单推断分类，返回 BILL_CATEGORIES 中的一个（失败一律 "其他"）。
 
     优先级：
       ① 关键词规则（CATEGORY_RULES 顺序，命中即返回）：零延迟、零成本、可复现；
-      ② 规则未命中且 api_key 非空 → 懒加载 ai_agent.classify_category 问一次 AI；
-      ③ 其余所有情况（无 key / 空输入 / AI 异常 / AI 返回值不在枚举内）→ "其他"。
+      ② 规则未命中且 api_key 非空 → 先查进程内缓存（命中直接返回，不打网络）；
+      ③ 缓存未命中才懒加载 ai_agent.classify_category 问一次 AI，成功结果写回缓存；
+      ④ 其余所有情况（无 key / 空输入 / AI 异常 / 返回值不在枚举内）→ "其他"。
+
+    缓存只存**成功且合法**的分类：失败/回落「其他」的结果不缓存，避免一次网络
+    抖动把商户永久钉死成「其他」。缓存是进程级的（重启即失效），详见
+    _AI_CATEGORY_CACHE 上方的注释与 clear_ai_category_cache()。
 
     为什么 from ai_agent import classify_category 放在函数内部：
     db.py 与 ai_agent.py 在 `import db` 时不能互相顶层 import（循环依赖，
@@ -1969,6 +2047,7 @@ def auto_categorize(merchant, description="", api_key=None) -> str:
     这个函数**永不抛异常**：调用方（add_bill / CSV 导入 / 示例数据）都把它当
     可选信息，分类失败只能降级，不能影响记账。
     """
+    global _AI_CATEGORY_CACHE_HITS, _AI_CATEGORY_CACHE_MISSES
     merchant_text = "" if merchant is None else str(merchant).strip()
     description_text = "" if description is None else str(description).strip()
     if not merchant_text and not description_text:
@@ -1982,6 +2061,19 @@ def auto_categorize(merchant, description="", api_key=None) -> str:
 
     if not api_key or not str(api_key).strip():
         return FALLBACK_CATEGORY
+
+    # 命中缓存：同一「商户|描述」不再打 AI。缓存只可能存成功分类，所以这里
+    # 直接返回即可；计数只为观测，绝不影响返回值。
+    cache_key = _ai_category_cache_key(merchant_text, description_text)
+    try:
+        cached = _AI_CATEGORY_CACHE.get(cache_key)
+    except Exception:
+        cached = None
+    if cached is not None:
+        _AI_CATEGORY_CACHE_HITS += 1
+        return cached
+    _AI_CATEGORY_CACHE_MISSES += 1
+
     try:
         from ai_agent import classify_category
         category = classify_category(merchant_text, description_text, str(api_key), BILL_CATEGORIES)
@@ -1994,6 +2086,8 @@ def auto_categorize(merchant, description="", api_key=None) -> str:
         return FALLBACK_CATEGORY
 
     if category in BILL_CATEGORIES:
+        # 只缓存成功结果；失败/「其他」不缓存，下次仍会重试 AI。
+        _remember_ai_category(cache_key, category)
         return category
     logging.getLogger(__name__).warning(
         "[db] AI 返回分类 %r 不在 BILL_CATEGORIES 内，回落「%s」（商户=%r）",

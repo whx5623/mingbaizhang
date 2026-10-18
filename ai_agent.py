@@ -900,3 +900,125 @@ def classify_category(merchant: str, description: str, api_key: str, categories:
 
     logger.info("AI 分类成功（商户=%s，分类=%s）", merchant_text, category)
     return category
+
+
+# ============================================================================
+# 健康分点评（DeepSeek Chat，纯文本一句话）
+# ----------------------------------------------------------------------------
+# 输入是 health_score.compute_health_score 已经算好的分数/等级/称号/扣分项，
+# 本函数只负责"翻译成人话"，不做任何评分逻辑（评分必须留在纯函数里可单测）。
+# 失败一律 HealthCommentError（message 是可直接展示的中文）；日志绝不记录 api_key。
+# ============================================================================
+
+# 系统提示词必须**逐字**保持（产品口径，改一个字点评风格就跑偏）。
+HEALTH_COMMENT_SYSTEM_PROMPT = (
+    "你是一个说话犀利、懂大学生的理财教练。请根据用户的财务健康分和扣分项，"
+    "用不超过 30 个字写一句点评：先点出分数，再给一条最关键的改进建议，"
+    "不要寒暄、不要解释、不要分点。"
+)
+
+HEALTH_COMMENT_MAX_CHARS = 40  # 返回文本的硬上限（30 字要求 + 余量，超了截断）
+
+
+class HealthCommentError(Exception):
+    """健康分点评失败。message 是面向用户的中文提示，可直接展示。"""
+
+    def __init__(self, message):
+        self.message = message
+        super().__init__(message)
+
+
+def _build_health_comment_user_content(score, grade, title, deductions) -> str:
+    """把分数/等级/称号/扣分项排成 user 消息（空扣分项写成「无」）。"""
+    score_text = "" if score is None else str(score).strip()
+    grade_text = "" if grade is None else str(grade).strip()
+    title_text = "" if title is None else str(title).strip()
+
+    items = []
+    if isinstance(deductions, (list, tuple)):
+        for item in deductions:
+            text = "" if item is None else str(item).strip()
+            if text:
+                items.append(text)
+    deductions_text = "；".join(items) if items else "无"
+
+    return (
+        f"得分：{score_text or '未知'}\n"
+        f"等级：{grade_text or '未知'}\n"
+        f"称号：{title_text or '未知'}\n"
+        f"扣分项：{deductions_text}\n"
+        "请按要求写一句点评。"
+    )
+
+
+def generate_health_comment(score: int, grade: str, title: str, deductions: list[str], api_key: str) -> str:
+    """根据健康分生成一句不超过 30 字的点评，返回去除首尾空白后的文本。
+
+    失败一律抛 HealthCommentError（中文 message，可直接上页面）：
+      · api_key 为空          → 未配置提示（且**不发请求**）；
+      · 超时 / 连接失败       → 对应中文提示；
+      · 非 200                → 带状态码的提示；
+      · 响应不是 JSON / 没有有效 content → "AI 没有返回有效点评"。
+    返回文本超过 40 字时截断到 40 字并补「…」（防止模型不听话写成长篇）。
+    日志只记分数/等级与字数，**绝不**记 api_key 或请求头。
+    """
+    # ① api_key：先查它，没有 key 时不该先花一次网络往返。
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise HealthCommentError("未配置 DEEPSEEK_API_KEY，AI 点评暂不可用")
+    api_key = api_key.strip()
+
+    user_content = _build_health_comment_user_content(score, grade, title, deductions)
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [
+            {"role": "system", "content": HEALTH_COMMENT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        # temperature 0.8：点评要有点"人味"但不至于跑题；max_tokens 80 够 30 字。
+        "temperature": 0.8,
+        "max_tokens": 80,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ② 发请求：超时/连接失败翻译成用户能看懂的句子（不把异常对象漏到页面）。
+    try:
+        resp = requests.post(DEEPSEEK_CHAT_URL, headers=headers, json=payload, timeout=20)
+    except requests.Timeout:
+        logger.warning("健康分点评请求超时（分数=%s）", score)
+        raise HealthCommentError("生成点评超时，请稍后再试") from None
+    except requests.ConnectionError:
+        logger.warning("健康分点评请求连接失败（分数=%s）", score)
+        raise HealthCommentError("网络连接失败，请检查网络") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：日志只记异常类型（确保不把 headers / key 带出去）。
+        logger.warning("健康分点评请求失败（分数=%s，异常=%s）", score, type(exc).__name__)
+        raise HealthCommentError("网络连接失败，请检查网络") from None
+
+    # ③ 非 200：只带状态码，不把响应体拼进 message（响应体可能含请求回显）。
+    if resp.status_code != 200:
+        logger.warning("健康分点评接口返回 HTTP %s（分数=%s）", resp.status_code, score)
+        raise HealthCommentError(f"AI 服务返回异常（HTTP {resp.status_code}）")
+
+    # ④ 解析：非 JSON / 结构不符 / content 为空 → 同一条"没有有效点评"。
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("健康分点评响应不是合法 JSON（分数=%s）", score)
+        raise HealthCommentError("AI 没有返回有效点评，请重试") from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("健康分点评响应结构不符合预期（分数=%s）", score)
+        raise HealthCommentError("AI 没有返回有效点评，请重试") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("健康分点评响应 content 为空（分数=%s）", score)
+        raise HealthCommentError("AI 没有返回有效点评，请重试")
+
+    content = content.strip()
+    if len(content) > HEALTH_COMMENT_MAX_CHARS:
+        content = content[:HEALTH_COMMENT_MAX_CHARS] + "…"
+    logger.info("健康分点评生成成功（分数=%s，等级=%s，字数=%d）", score, grade, len(content))
+    return content

@@ -3,6 +3,12 @@ import pandas as pd
 from streamlit_echarts import st_echarts
 from datetime import datetime, date, timedelta
 from config import get_deepseek_api_key
+try:
+    from health_score import compute_health_score
+except ImportError as _health_import_exc:
+    # 并行开发期 health_score.py 可能尚未合入：先降级，绝不让整页红屏
+    compute_health_score = None
+    print(f"[health] 健康分模块不可用：{type(_health_import_exc).__name__}: {_health_import_exc}")
 from finance_math import compute_irr, payment_from_fee, debt_ratio
 from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, get_user_auth_state, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data, get_login_daily_stats, login_events_available, LoginThrottled, set_goal, get_goal, add_to_goal
 import requests
@@ -75,6 +81,7 @@ def logout():
     st.session_state.pop("last_screenshot_sig", None)     # 截图签名同理：换人后同一张图应能重新识别
     st.session_state.pop("flash", None)             # 上一个人的提示（可能含商户名）不能带给下一个人
     st.session_state.pop("month_review", None)      # AI 复盘含本月消费明细，绝不能带给下一个登录的人
+    st.session_state.pop("health_comment", None)    # AI 锐评同样基于本月财务数据，换人后必须失效
     st.session_state["page"] = 0
     st.session_state["chat_history"] = []           # 换人登录不应看到上一个人的 AI 聊天记录
     st.cache_data.clear()
@@ -477,6 +484,117 @@ else:
 tab_dash, tab_tools, tab_ai = st.tabs(["📊 财务看板", "💡 实用工具", "🤖 AI 管家"])
 
 with tab_dash:
+    # ===== 财务健康分仪表盘（放在最顶部，最醒目的位置）=====
+    # 计算失败只降级成一行提示，绝不影响下方的指标卡 / 图表 / 导出
+    try:
+        # 本月支出按 category 汇总；迁移 012 未执行（无 category 列）时传空 dict
+        if "category" in df_current_month.columns:
+            _month_exp_df = df_current_month[df_current_month["type"] == "支出"]
+            _month_cat = _month_exp_df["category"].fillna("其他").astype(str).str.strip()
+            _month_exp_df = _month_exp_df.assign(
+                _category=_month_cat.where(_month_cat != "", "其他")
+            )
+            category_totals = {
+                str(_cat): float(_amt)
+                for _cat, _amt in _month_exp_df.groupby("_category")["amount"].sum().items()
+            }
+        else:
+            category_totals = {}
+
+        # 心愿进度：没有目标 / 011 未执行 / 读库异常 → 一律 None，健康分照常计算
+        try:
+            goal_progress = (get_goal(st.session_state.user_id) or {}).get("progress")
+            if goal_progress is not None:
+                goal_progress = float(goal_progress)
+        except Exception as goal_exc:
+            print(f"[health] 读取心愿进度失败：{type(goal_exc).__name__}: {goal_exc}")
+            goal_progress = None
+
+        if compute_health_score is None:
+            raise RuntimeError("health_score 模块未就绪")
+        health = compute_health_score(
+            month_expense=float(month_expense),
+            budget=float(budget),
+            month_balance=float(month_balance),
+            save_target=float(st.session_state.save_target),
+            goal_progress=goal_progress,
+            category_totals=category_totals,
+        )
+        if not isinstance(health, dict) or "score" not in health:
+            raise ValueError("compute_health_score 返回值缺少 score")
+    except Exception as health_exc:
+        print(f"[health] 健康分计算失败：{type(health_exc).__name__}: {health_exc}")
+        st.info("健康分暂不可用")
+    else:
+        st.subheader("🏆 本月财务健康分")
+        health_option = {
+            "series": [{
+                "type": "gauge", "min": 0, "max": 100, "startAngle": 210, "endAngle": -30,
+                "progress": {"show": True, "width": 16},
+                "axisLine": {"lineStyle": {"width": 16, "color": [
+                    [0.6, "#e74c3c"], [0.75, "#f39c12"], [0.9, "#3498db"], [1, "#2ecc71"]]}},
+                "pointer": {"width": 6, "itemStyle": {"color": "#333"}},
+                "axisTick": {"distance": -20, "length": 6},
+                "splitLine": {"distance": -22, "length": 16},
+                "axisLabel": {"distance": -32, "fontSize": 12},
+                "detail": {"valueAnimation": True, "fontSize": 40, "offsetCenter": [0, "40%"],
+                           "formatter": "{value} 分"},
+                "title": {"offsetCenter": [0, "68%"], "fontSize": 15},
+                "data": [{"value": health["score"], "name": f'{health["grade"]} · {health["title"]}'}]
+            }]
+        }
+        st_echarts(health_option, height=300)
+
+        health_score = int(health["score"])
+        health_grade = str(health["grade"])
+        health_title = str(health["title"])
+        health_deductions = [str(item) for item in (health.get("deductions") or [])]
+
+        st.markdown(f"### 财务健康分 **{health_score}** 分 · {health_grade} 级 · {health_title}")
+        if health_deductions:
+            st.caption("主要扣分项：" + " ｜ ".join(health_deductions))
+
+        # ===== AI 锐评：按「月份 + 分数」缓存，正常 rerun 不重复调用 API =====
+        comment_key = f"{current_month_str}:{health_score}"
+        cached_comment = st.session_state.get("health_comment")
+        if (
+            isinstance(cached_comment, dict)
+            and cached_comment.get("key") == comment_key
+            and cached_comment.get("text")
+        ):
+            st.info(cached_comment["text"])
+        elif st.session_state.ai_daily_count >= 20:
+            st.caption("今日 AI 额度已用完，明天再看点评")
+        else:
+            try:
+                from ai_agent import generate_health_comment, HealthCommentError
+            except ImportError as import_exc:
+                print(f"[health] AI 点评模块不可用：{type(import_exc).__name__}: {import_exc}")
+                st.caption("AI 点评暂不可用，请稍后再试")
+            else:
+                with st.spinner("AI 正在锐评你的钱包…"):
+                    try:
+                        comment_text = generate_health_comment(
+                            health_score,
+                            health_grade,
+                            health_title,
+                            health_deductions,
+                            get_deepseek_api_key(),
+                        )
+                    except HealthCommentError as ai_err:
+                        # 业务失败（未配 key / 网络 / 解析）：不红屏、不计额度，下次 rerun 可重试
+                        st.caption(f"AI 点评暂不可用：{ai_err}")
+                    except Exception as ai_exc:
+                        print(f"[health] AI 点评失败：{type(ai_exc).__name__}: {ai_exc}")
+                        st.caption("AI 点评暂不可用，请稍后再试")
+                    else:
+                        st.session_state.ai_daily_count += 1
+                        st.session_state["health_comment"] = {
+                            "key": comment_key,
+                            "text": comment_text,
+                        }
+                        st.info(comment_text)
+
     # Metric cards
     st.subheader("收支概览")
     col1, col2 = st.columns(2)
