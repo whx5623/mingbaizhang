@@ -20,6 +20,28 @@ import hashlib
 import os
 import tomllib
 
+# 吃土倒计时后端由并行方提供：尚未合入时先降级成 None，页面整块静默不显示，绝不红屏
+try:
+    from db import forecast_broke, get_recent_expense, get_username
+except ImportError as _forecast_import_exc:
+    forecast_broke = None
+    get_recent_expense = None
+    get_username = None
+    print(
+        f"[forecast] 预测模块不可用："
+        f"{type(_forecast_import_exc).__name__}: {_forecast_import_exc}"
+    )
+
+# 海报绘制模块（Pillow 本地出图，不消耗 AI 额度）：缺失只让海报功能降级
+try:
+    import poster
+except ImportError as _poster_import_exc:
+    poster = None
+    print(
+        f"[poster] 海报模块不可用："
+        f"{type(_poster_import_exc).__name__}: {_poster_import_exc}"
+    )
+
 st.set_page_config(layout="wide")
 
 # ========= 「记住我」常量 =========
@@ -753,6 +775,95 @@ with tab_dash:
             st.metric("总支出", f"{total_expense:.2f}")
         with col_b:
             st.metric("当前结余", f"{balance:.2f}")
+
+    # ===== 吃土倒计时（近 7 天 / 本月日均 → 月底是否见底）=====
+    # 后端函数由并行方提供：缺失 / 任何异常都静默不显示，绝不影响下方预算进度与账单明细。
+    _forecast = None
+    try:
+        try:
+            _recent_expense = get_recent_expense(st.session_state.user_id, 7)
+        except Exception as _recent_exc:
+            print(
+                f"[forecast] 读取近7天支出失败："
+                f"{type(_recent_exc).__name__}: {_recent_exc}"
+            )
+            _recent_expense = None
+        # 用项目统一的 UTC+8 日报时钟，避免部署机为 UTC 时北京凌晨 00:00-08:00 差一天
+        _forecast_today = getattr(db, "_report_today", None)
+        _forecast = forecast_broke(
+            float(month_expense),
+            float(st.session_state.monthly_budget),
+            recent_expense=_recent_expense,
+            today=_forecast_today() if callable(_forecast_today) else None,
+        )
+    except Exception as _forecast_exc:
+        print(f"[forecast] 预测失败：{type(_forecast_exc).__name__}: {_forecast_exc}")
+        _forecast = None
+
+    if isinstance(_forecast, dict):
+        if _forecast.get("can_last") is True:
+            try:
+                _surplus = float(_forecast["projected_surplus"])
+            except (KeyError, TypeError, ValueError):
+                _surplus = 0.0
+            try:
+                _daily_avg = float(_forecast["daily_avg"])
+            except (KeyError, TypeError, ValueError):
+                _daily_avg = 0.0
+            try:
+                _days_left = int(_forecast["days_left_in_month"])
+            except (KeyError, TypeError, ValueError):
+                _days_left = 0
+            st.success(f"💪 照此速度，月底还能结余 {_surplus:.2f} 元！")
+            st.caption(
+                f"日均 ¥{_daily_avg:.2f}"
+                f"（{'近7天' if _forecast.get('basis') == '7d' else '本月'}口径）"
+                f"· 剩余 {_days_left} 天"
+            )
+        elif _forecast.get("can_last") is False:
+            _broke_date_raw = str(_forecast.get("broke_date") or "")
+            try:
+                _broke_dt = datetime.strptime(_broke_date_raw, "%Y-%m-%d")
+            except (TypeError, ValueError):
+                _broke_dt = None
+            try:
+                _days_to_broke = _forecast.get("days_to_broke")
+                _days_to_broke = (
+                    int(_days_to_broke) if _days_to_broke is not None else None
+                )
+            except (TypeError, ValueError):
+                _days_to_broke = None
+            _days_text = f"{_days_to_broke} 天" if _days_to_broke is not None else "几天"
+            if _days_to_broke == 0:
+                _blink_text = "🚨 今天已经吃土了，本月预算已用完！"
+            elif _broke_dt is not None:
+                _blink_text = (
+                    f"🚨 预计 {_broke_dt.month} 月 {_broke_dt.day} 日破产，"
+                    f"距离吃土还有 {_days_text}！建议少喝奶茶。"
+                )
+            else:
+                _blink_text = (
+                    f"🚨 预计 {_broke_date_raw or '本月'} 破产，"
+                    f"距离吃土还有 {_days_text}！建议少喝奶茶。"
+                )
+            # 动画样式只注入一次：否则每次 rerun 都会多一段重复 <style>
+            if not st.session_state.get("_blink_css_injected"):
+                st.markdown(
+                    "<style>"
+                    "@keyframes mbz-blink {0%,100%{opacity:1;} 50%{opacity:.35;}}"
+                    ".mbz-blink{animation:mbz-blink 1s infinite;background:#7f1d1d;"
+                    "color:#fff;border-radius:10px;padding:14px;font-size:18px;"
+                    "font-weight:700;}"
+                    "</style>",
+                    unsafe_allow_html=True,
+                )
+                st.session_state["_blink_css_injected"] = True
+            st.markdown(
+                f'<div class="mbz-blink">{_blink_text}</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.info(str(_forecast.get("reason") or "暂时无法预测"))
 
     # ===== 本月预算进度（细分预算来自 Tab2「AI 智能预算」的采纳结果）=====
     # 未设置 / 015 未执行 / 读库异常：一律不显示该区块，页面上不会出现空标题。
@@ -1625,6 +1736,157 @@ with tab_ai:
             st.info(saved_month_review["text"])
         else:
             st.success(saved_month_review["text"])
+
+    # ========== 财务诊断海报（本地 Pillow 绘制，不额外消耗 AI 额度）==========
+    # 放在月度复盘之后：生成海报只读页面已有数据，不调用任何 AI 接口。
+    with st.expander("🖼️ 生成我的财务诊断海报", expanded=False):
+        if st.button("生成海报", key="poster_generate_btn"):
+            _poster_uid = st.session_state.user_id
+
+            # 昵称：读库失败只用「用户」，不影响海报
+            try:
+                _poster_nickname = (
+                    (get_username(_poster_uid) or "").strip() or "用户"
+                )
+            except Exception as _nick_exc:
+                print(
+                    f"[poster] 读取昵称失败："
+                    f"{type(_nick_exc).__name__}: {_nick_exc}"
+                )
+                _poster_nickname = "用户"
+
+            # 本月 Top1：优先 category（迁移 012 后），没这列就退回 merchant
+            _poster_top_category, _poster_top_amount = "暂无", 0.0
+            _poster_category_totals = {}
+            try:
+                _poster_expense_df = df_current_month[df_current_month["type"] == "支出"]
+                if not _poster_expense_df.empty:
+                    _poster_group_col = (
+                        "category"
+                        if "category" in _poster_expense_df.columns
+                        else "merchant"
+                    )
+                    _poster_groups = (
+                        _poster_expense_df.groupby(_poster_group_col)["amount"]
+                        .sum()
+                        .sort_values(ascending=False)
+                    )
+                    if len(_poster_groups) > 0:
+                        _poster_top_category = (
+                            str(_poster_groups.index[0]).strip() or "暂无"
+                        )
+                        _poster_top_amount = float(_poster_groups.iloc[0])
+                        _poster_category_totals = {
+                            str(_name): float(_amount)
+                            for _name, _amount in _poster_groups.items()
+                        }
+            except Exception as _top_exc:
+                print(
+                    f"[poster] 统计 Top1 失败："
+                    f"{type(_top_exc).__name__}: {_top_exc}"
+                )
+
+            # 健康分：优先复用 Tab1 已算好的 health；拿不到就按同一口径现算一次
+            try:
+                _poster_health = health
+            except NameError:
+                _poster_health = None
+            if not (isinstance(_poster_health, dict) and "score" in _poster_health):
+                try:
+                    if compute_health_score is None:
+                        raise RuntimeError("health_score 模块未就绪")
+                    try:
+                        _poster_goal_progress = (
+                            get_goal(_poster_uid) or {}
+                        ).get("progress")
+                    except Exception as _goal_exc:
+                        print(
+                            f"[poster] 读取心愿进度失败："
+                            f"{type(_goal_exc).__name__}: {_goal_exc}"
+                        )
+                        _poster_goal_progress = None
+                    _poster_health = compute_health_score(
+                        month_expense=float(month_expense),
+                        budget=float(st.session_state.monthly_budget),
+                        month_balance=float(month_balance),
+                        save_target=float(st.session_state.save_target),
+                        goal_progress=_poster_goal_progress,
+                        category_totals=_poster_category_totals,
+                    )
+                except Exception as _poster_health_exc:
+                    print(
+                        f"[poster] 健康分现算失败："
+                        f"{type(_poster_health_exc).__name__}: {_poster_health_exc}"
+                    )
+                    _poster_health = {}
+            if not isinstance(_poster_health, dict):
+                _poster_health = {}
+            try:
+                _poster_score = int(_poster_health.get("score") or 0)
+            except (TypeError, ValueError):
+                _poster_score = 0
+            _poster_grade = str(_poster_health.get("grade") or "-")
+            _poster_title = str(_poster_health.get("title") or "")
+
+            # 点评：优先用 Tab1 已缓存的 AI 锐评；没有就用本地兜底文案，绝不为此再调 AI
+            _poster_comment = ""
+            try:
+                _cached_comment = st.session_state.get("health_comment") or {}
+                if isinstance(_cached_comment, dict):
+                    _poster_comment = str(_cached_comment.get("text") or "").strip()
+            except Exception:
+                _poster_comment = ""
+            if not _poster_comment:
+                _poster_comment = (
+                    f"本月花了 {float(month_expense):.2f} 元，"
+                    "奶茶少两杯，钱包会感谢你。"
+                )
+
+            try:
+                _poster_app_url = get_secret("APP_URL") or ""
+            except Exception:
+                _poster_app_url = ""
+
+            _poster_payload = {
+                "nickname": _poster_nickname,
+                "month": current_month_str,
+                "total_expense": float(month_expense),
+                "health_score": _poster_score,
+                "health_grade": _poster_grade,
+                "health_title": _poster_title,
+                "top_category": _poster_top_category,
+                "top_amount": _poster_top_amount,
+                "comment": _poster_comment,
+                "app_url": _poster_app_url,
+            }
+
+            if poster is None:
+                st.error("海报功能暂不可用，请稍后再试")
+            else:
+                try:
+                    with st.spinner("正在绘制海报…"):
+                        _poster_png = poster.build_poster(_poster_payload)
+                except poster.PosterError as _poster_err:
+                    st.error(str(_poster_err))
+                except Exception as _poster_exc:
+                    print(
+                        f"[poster] 生成失败："
+                        f"{type(_poster_exc).__name__}: {_poster_exc}"
+                    )
+                    st.error("海报生成失败，请稍后再试")
+                else:
+                    st.session_state["poster_bytes"] = _poster_png
+
+        _poster_bytes = st.session_state.get("poster_bytes")
+        if _poster_bytes:
+            st.image(_poster_bytes, caption=f"{current_month_str} 财务诊断海报")
+            st.download_button(
+                "保存到手机",
+                data=_poster_bytes,
+                file_name=f"mingbaizhang_{current_month_str}.png",
+                mime="image/png",
+                key="poster_download_btn",
+            )
 
     if len(st.session_state.chat_history) == 0:
         st.session_state.chat_history.append({"role": "assistant", "content": "你好！我是明白账AI财务管家，可以帮你分析账单，也可以直接帮你记账，有什么想问我的吗？"})

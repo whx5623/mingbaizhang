@@ -1,0 +1,3 @@
+# Streamlit Cloud 的 apt 依赖：云端没有 Windows 字体，装 Noto CJK 才能画出中文海报。
+# 本地（Windows）直接使用系统自带 C:\Windows\Fonts\msyh.ttc，无需安装本文件里的包。
+fonts-noto-cjk

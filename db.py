@@ -3300,3 +3300,272 @@ def clear_remember_token(user_id) -> None:
         if _pg_sqlstate(exc) == _PGCODE_UNDEFINED_COLUMN:  # 42703 = 016 未执行
             raise RuntimeError(REMEMBER_TOKEN_MISSING_MESSAGE) from exc
         raise
+
+
+# ---------------------------------------------------------------------------
+# 「吃土倒计时」预测 + 近 N 天支出 / 用户名查询（纯函数 + 只读查询）
+# ---------------------------------------------------------------------------
+# 本段只**追加**：不改动上面任何既有函数、常量与取数口径。
+# 分工：
+#   · forecast_broke(...)      纯函数，不碰 DB、不读全局状态：输出只由入参决定，
+#                              同一组入参永远得到同一结果，可直接单测；
+#   · get_recent_expense(...)  只读 bills（不依赖 012 的 category、也不依赖 015）；
+#   · get_username(...)        只读 users，找不到就抛 ValueError（调用方兜文案）。
+# 依赖的既有件（全部在文件上方已定义，这里不重新实现）：
+#   EXPENSE_TYPE / _ISO_DATE_PATTERN / _money_to_float（Decimal + ROUND_HALF_UP 定量）
+#   / _normalize_budget_user_id（正整数校验，与具体表无关）。
+
+FORECAST_REASON_NO_BUDGET = "未设置本月预算，无法预测"
+FORECAST_RECENT_DAYS_MIN = 1
+FORECAST_RECENT_DAYS_MAX = 31
+
+
+def _normalize_forecast_amount(value, label: str) -> float:
+    """把 month_expense / budget / recent_expense 收敛成「有限、≥ 0」的 float。
+
+    拒绝顺序（报错文案统一带字段中文名，调用方不用再猜是哪个参数错了）：
+      ① bool —— True/False 是 int 子类，float(True)==1.0 会把"开关"静默当成金额；
+      ② 不能转 float（None / 乱串 / 容器）；
+      ③ nan / inf —— 会顺着 daily_avg 把 projected 变成 nan，页面显示 "nan 元"；
+      ④ 负数 —— 负预算 / 负支出没有业务含义，且会让 remaining 的判断整体失真。
+    注意：**0 是合法值**（未设预算用 budget=0 表达；本月没花钱 month_expense=0），
+    所以这里只挡 < 0。全部校验都在计算任何字段之前完成。
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{label}非法：{value!r}（不是数字）")
+    try:
+        num = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label}非法：{value!r}（不是数字）") from exc
+    if not math.isfinite(num):
+        raise ValueError(f"{label}非法：{value!r}（必须是有限数字，不允许 nan/inf）")
+    if num < 0:
+        raise ValueError(f"{label}不能为负数：{value!r}")
+    return num
+
+
+def _normalize_forecast_today(today) -> date:
+    """today 收敛成 datetime.date：None → 今天；ISO 'YYYY-MM-DD' 或 date 原样。
+
+    datetime 是 date 的子类，必须先取 .date()：否则今天带时分秒时
+    ``today + timedelta(...)`` 与 ``(broke_date - today).days`` 会按"时间差不足 24h
+    就少一天"截断，days_to_broke 少 1 —— 而调用方只关心日历日。
+    非法字符串（'2026/10/18'、'2026-02-30'）与非法类型都抛同一条中文 ValueError。
+    """
+    if today is None:
+        return date.today()
+    if isinstance(today, datetime):
+        return today.date()
+    if isinstance(today, date):
+        return today
+    if isinstance(today, str):
+        text = today.strip()
+        if _ISO_DATE_PATTERN.fullmatch(text):
+            try:
+                return datetime.strptime(text, "%Y-%m-%d").date()
+            except ValueError:
+                pass  # 格式对但日子不存在（2026-02-30）→ 落到下面统一报错
+    raise ValueError(f"today 必须是 datetime.date 或 YYYY-MM-DD 字符串：{today!r}")
+
+
+def _normalize_forecast_days(days, label: str) -> int:
+    """天数窗口必须是 1~31 的 int（bool / float / 字符串一律拒绝，不静默转换）。
+
+    不静默转换的理由：``int(7.9)`` 会截断成 7，把"写错窗口"伪装成"写对窗口"；
+    上界 31 与"本月"同量级 —— 再长就不是"近 N 天"，而是历史统计；
+    recent_days=0 则会让 recent_expense / 0 直接 ZeroDivisionError。
+    """
+    if isinstance(days, bool) or not isinstance(days, int):
+        raise ValueError(f"{label}必须是 1~{FORECAST_RECENT_DAYS_MAX} 的整数：{days!r}")
+    if not FORECAST_RECENT_DAYS_MIN <= days <= FORECAST_RECENT_DAYS_MAX:
+        raise ValueError(f"{label}必须是 1~{FORECAST_RECENT_DAYS_MAX} 的整数：{days!r}")
+    return days
+
+
+def _forecast_month_end(today: date) -> date:
+    """当月的最后一天。用「下月 1 日 - 1 天」算，天然覆盖 2 月 / 闰年 / 大小月。
+
+    刻意不 import calendar：本文件只用 date / timedelta 就够，少一个模块级依赖，
+    也避免"闰年判断写错成 year % 4 == 0"这类经典坑（2028-02 是闰年、2100-02 不是）。
+    9999-12 会构造 date(10000, 1, 1) 失败 —— 极端边界直接让 ValueError 上抛。
+    """
+    if today.month == 12:
+        first_of_next = date(today.year + 1, 1, 1)
+    else:
+        first_of_next = date(today.year, today.month + 1, 1)
+    return first_of_next - timedelta(days=1)
+
+
+def forecast_broke(month_expense, budget, today=None,
+                   recent_expense=None, recent_days=7) -> dict:
+    """预测本月是否会在月底前「吃土」（超支 / 花光）：纯函数，不碰 DB。
+
+    参数
+    ----
+    month_expense : 本月截至今天的**已支出**总额（≥ 0 的有限数）。
+    budget        : 本月总预算（≥ 0 的有限数；0 表示"未设置"，见 reason）。
+    today         : datetime.date / "YYYY-MM-DD"；None → date.today()。
+    recent_expense: 近 recent_days 天的支出总额；None 或 0 → 退回"本月日均"。
+    recent_days   : 近 N 天窗口，1~31 的 int（只在 recent_expense > 0 时参与计算）。
+
+    口径（与产品确认过的「吃土倒计时」一致）
+    ------------------------------------
+    1. days_left_in_month = 当月天数 - today.day：**不含今天**（今天已过，
+       月末当天为 0）。所以 projected = month_expense + daily_avg * days_left
+       不会把今天重复算一次；
+    2. daily_avg：recent_expense > 0 → recent_expense / recent_days（basis="7d"，
+       反映"最近真的在花"）；否则 month_expense / today.day（basis="month"，
+       今天也算在分母里 —— "已花"本来就包含今天）；
+    3. budget <= 0：不预测（can_last=None + 中文 reason），但数值字段照算，
+       页面仍可展示"按当前速度本月将花多少"；
+    4. remaining = budget - month_expense <= 0：已经吃土 —— broke_date=今天、
+       days_to_broke=0、can_last=False；
+    5. 否则按 daily_avg 算还能撑几天：days_until = remaining / daily_avg，
+       破裂日 = today + floor(days_until)：
+         · 破裂日**晚于**当月最后一天 → can_last=True、broke_date=None（能撑到月底）；
+         · 否则 can_last=False、broke_date / days_to_broke 都是真实值；
+       daily_avg <= 0（没花钱、也预测不出速度）→ can_last=True、broke_date=None；
+    6. 金额字段全部定量到两位小数（_money_to_float），且 projected 用**已定量的
+       daily_avg** 计算：这样 "month_expense + daily_avg * days_left_in_month ==
+       projected_month_expense" 在返回字典里严格成立，前端再算也不会差一分钱；
+    7. broke_date 返回 **"YYYY-MM-DD" 字符串**（不是 date），与页面展示口径一致；
+       month 返回 "YYYY-MM"。
+
+    返回字段（逐字固定，前端按 key 取，顺序无关）：
+        can_last / broke_date / days_to_broke / days_left_in_month /
+        daily_avg / projected_month_expense / projected_surplus /
+        basis / month / reason
+
+    非法输入（负数、nan/inf、recent_days 越界、today 格式错）一律 ValueError，
+    且在计算任何字段之前抛出 —— 调用方只会拿到一条中文提示，不会拿到半个结果。
+    """
+    spent = _normalize_forecast_amount(month_expense, "本月支出 month_expense")
+    budget_value = _normalize_forecast_amount(budget, "本月预算 budget")
+    recent = (
+        None
+        if recent_expense is None
+        else _normalize_forecast_amount(recent_expense, "近 N 天支出 recent_expense")
+    )
+    days = _normalize_forecast_days(recent_days, "recent_days")
+    current = _normalize_forecast_today(today)
+
+    month_end = _forecast_month_end(current)
+    days_left = month_end.day - current.day  # 不含今天；月末当天为 0
+
+    if recent is not None and recent > 0:
+        basis = "7d"
+        daily_avg = _money_to_float(recent / days)
+    else:
+        # recent_expense 为 None 或 0：本月日均兜底。今天已过，分母含今天。
+        basis = "month"
+        daily_avg = _money_to_float(spent / current.day)
+
+    can_last = None
+    broke_date = None
+    days_to_broke = None
+    reason = None
+
+    if budget_value <= 0:
+        # 未设预算：能不能撑到月底无法定义，但"按当前速度月底会花多少"仍可算。
+        reason = FORECAST_REASON_NO_BUDGET
+    else:
+        remaining = budget_value - spent
+        if remaining <= 0:
+            # 已经超支 / 用光：今天就是"吃土日"（days_to_broke=0）。
+            can_last = False
+            broke_date = current
+            days_to_broke = 0
+        elif daily_avg <= 0:
+            # 预算有余额、但没有任何消费可以推出速度 → 预测不出具体日期。
+            can_last = True
+        else:
+            days_until = remaining / daily_avg
+            candidate = current + timedelta(days=math.floor(days_until))
+            if candidate > month_end:
+                # 破裂日落到下个月：本月能撑到月底，不给出具体日期（避免误导）。
+                can_last = True
+            else:
+                can_last = False
+                broke_date = candidate
+                days_to_broke = (candidate - current).days
+
+    projected = _money_to_float(spent + daily_avg * days_left)
+    surplus = _money_to_float(budget_value - projected)
+
+    return {
+        "can_last": can_last,
+        "broke_date": (
+            broke_date.strftime("%Y-%m-%d") if broke_date is not None else None
+        ),
+        "days_to_broke": days_to_broke,
+        "days_left_in_month": days_left,
+        "daily_avg": daily_avg,
+        "projected_month_expense": projected,
+        "projected_surplus": surplus,
+        "basis": basis,
+        "month": current.strftime("%Y-%m"),
+        "reason": reason,
+    }
+
+
+def get_recent_expense(user_id, days=7, today=None) -> float:
+    """近 N 天（含今天）的**支出**总额；无数据返回 0.0。
+
+    口径
+    ----
+    · 窗口是 [today-(days-1), today] 的**闭区间**：days=7 时正好 7 个日历日
+      （今天 + 过去 6 天）。起点用 timedelta(days=days-1)，多减一天就会把
+      "近 7 天"算成 8 天，与页面标签不符；
+    · 只看 type = '支出'（收入不计）；
+    · bills.date 是 VARCHAR（历史遗留），按 ``b.date::date`` 比较；007 的 CHECK
+      保证库里都是 ISO 日期。cast 失败的脏数据让异常原样上抛，**不静默漏算**
+      —— 少算支出会让"吃土倒计时"显得比实际乐观；
+    · **不依赖 012 的 category、也不依赖 015 的 budget_details**：只碰 bills；
+    · 参数全部绑定（:uid / :expense / :start / :end）；days 只在 Python 侧参与
+      timedelta 计算，绝不被拼进 SQL；
+    · 金额从 NUMERIC 转 float 并定量两位小数（_money_to_float）；无行 → 0.0。
+
+    user_id 校验复用 _normalize_budget_user_id：规则（正整数、不接受 bool/float）
+    与具体表无关，没必要再抄第三份；非法入参在**开连接之前**就 ValueError。
+    """
+    uid = _normalize_budget_user_id(user_id)
+    window = _normalize_forecast_days(days, "days")
+    end = _normalize_forecast_today(today)
+    start = end - timedelta(days=window - 1)
+    if engine is None:
+        init_db()
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                SELECT COALESCE(SUM(b.amount), 0) AS total
+                FROM public.bills AS b
+                WHERE b.user_id = :uid
+                  AND b.type = :expense
+                  AND b.date::date >= :start
+                  AND b.date::date <= :end
+            """),
+            {"uid": uid, "expense": EXPENSE_TYPE, "start": start, "end": end},
+        ).fetchone()
+    return _money_to_float(row.total) if row is not None else 0.0
+
+
+def get_username(user_id) -> str:
+    """按 users.id 取用户名；用户不存在 → ValueError("用户不存在")。
+
+    用途：把 user_id 显示成名字（报表 / 预测卡片）时的唯一入口。
+    · 只 SELECT username，不碰 password_hash / remember_token 等敏感列；
+    · user_id 先过 _normalize_budget_user_id（与具体表无关的正整数校验），
+      非法入参在**开连接之前**就 ValueError；
+    · 无行 = 用户真的不存在（被删号 / 传错 id）：抛 ValueError 由调用方决定
+      是提示还是回退，**绝不返回 None** 让下游把 None 拼成字符串 "None" 显示给用户。
+    """
+    uid = _normalize_budget_user_id(user_id)
+    if engine is None:
+        init_db()
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT username FROM users WHERE id = :uid"), {"uid": uid}
+        ).fetchone()
+    if row is None:
+        raise ValueError("用户不存在")
+    return row.username

@@ -20,3 +20,7 @@ streamlit-echarts==0.7.0
 supabase==2.32.0
 # extra-streamlit-components：登录页「记住我」需要读写浏览器 Cookie（0.1.81 实测可用）
 extra-streamlit-components==0.1.81
+# Pillow：财务诊断海报绘制（12.3.0 实测）
+pillow==12.3.0
+# qrcode：海报右下角二维码（8.2 实测；仅当 APP_URL 配置时使用）
+qrcode==8.2
