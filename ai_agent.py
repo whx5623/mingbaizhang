@@ -738,3 +738,165 @@ def generate_month_review(stats: dict, api_key: str) -> str:
     content = content.strip()
     logger.info("月度复盘生成成功（月份=%s，字数=%d）", month, len(content))
     return content
+
+
+# ============================================================================
+# 账单自动分类（DeepSeek Chat，只返回一个分类标签）
+# ----------------------------------------------------------------------------
+# 与月度复盘的区别：这里要的是**可程序消费的短标签**，不是自然语言。所以：
+#   · temperature=0：同一商户每次应得到同一个分类，分类统计才稳定；
+#   · max_tokens=32：只够输出 {"category": "..."}，从成本上堵住模型"解释一番"；
+#   · 只接受调用方传入的候选分类：模型编出新分类时抛 CategoryError，
+#     由 db.auto_categorize 回落「其他」—— 写路径不会因为模型胡说来失败；
+#   · api_key 为空时**不发请求**（先检查，再花网络往返）。
+# 失败一律 CategoryError（message 是可直接展示的中文）；日志绝不记录 api_key。
+# ============================================================================
+
+CATEGORY_MODEL = "deepseek-chat"
+
+CATEGORY_SYSTEM_PROMPT = (
+    "你是账单分类器。只能从用户给出的候选分类中选择一个，不能新增分类、不能解释。"
+    '只输出 JSON，格式为 {"category": "候选分类之一"}。'
+)
+
+
+class CategoryError(Exception):
+    """AI 分类失败。message 是面向用户的中文提示，可直接展示。"""
+
+    def __init__(self, message):
+        self.message = message
+        super().__init__(message)
+
+
+def _build_category_user_content(merchant, description, categories) -> str:
+    """把商户 / 描述 / 候选分类排成 user 消息（模型只需要这几项信息）。"""
+    merchant_text = "" if merchant is None else str(merchant).strip()
+    description_text = "" if description is None else str(description).strip()
+    return (
+        f"商户：{merchant_text or '未知商户'}\n"
+        f"描述：{description_text or '无'}\n"
+        f"候选分类：{'、'.join(categories)}\n"
+        '请只输出 JSON：{"category": "候选分类之一"}'
+    )
+
+
+def _extract_category(content: str):
+    """从模型回复里抠出分类名；抠不出返回 None（由调用方抛 CategoryError）。
+
+    正常情况下 content 就是 {"category": "餐饮"}。兜底两层，因为模型偶尔会裹
+    markdown 代码块或加一句前缀：
+      ① 直接 json.loads；
+      ② 正则截第一个 {...} 再 json.loads；
+      ③ 直接正则抠 "category": "..." 的值。
+    """
+    try:
+        data = json.loads(content)
+    except (ValueError, TypeError):
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("category"), str):
+        return data["category"].strip()
+
+    match = re.search(r"\{.*\}", content, re.S)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+        except (ValueError, TypeError):
+            data = None
+        if isinstance(data, dict) and isinstance(data.get("category"), str):
+            return data["category"].strip()
+
+    match = re.search(r'"category"\s*:\s*"([^"]*)"', content)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def classify_category(merchant: str, description: str, api_key: str, categories: list[str]) -> str:
+    """让 DeepSeek 从 categories 里选一个分类，返回该分类字符串。
+
+    失败一律抛 CategoryError（中文 message）：
+      · api_key 为空            → "未配置 DEEPSEEK_API_KEY..."（且**不发请求**）；
+      · 候选分类为空            → 无法分类（且不发请求）；
+      · 超时 / 连接失败         → 对应中文提示；
+      · 非 200                  → 带状态码的提示；
+      · 响应不是 JSON / 没有有效 content / 分类不在候选列表 → 对应中文提示。
+    日志只记商户与分类（成功）/ 异常类型（失败），**绝不**记 api_key 或请求头。
+    """
+    # ① api_key：先查它，没 key 时不该先花一次网络往返。
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise CategoryError("未配置 DEEPSEEK_API_KEY，AI 分类不可用")
+    api_key = api_key.strip()
+
+    # ② 候选分类：空列表时模型无从选择，直接拒绝（同样不发请求）。
+    if not isinstance(categories, (list, tuple)) or not categories:
+        raise CategoryError("候选分类列表为空，无法进行 AI 分类")
+    category_list = [str(item).strip() for item in categories if str(item).strip()]
+    if not category_list:
+        raise CategoryError("候选分类列表为空，无法进行 AI 分类")
+
+    merchant_text = "" if merchant is None else str(merchant).strip()
+    description_text = "" if description is None else str(description).strip()
+    payload = {
+        "model": CATEGORY_MODEL,
+        "messages": [
+            {"role": "system", "content": CATEGORY_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": _build_category_user_content(merchant_text, description_text, category_list),
+            },
+        ],
+        # temperature=0 保分类稳定；max_tokens=32 只够 JSON，不给"解释"留空间。
+        "temperature": 0,
+        "max_tokens": 32,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ③ 发请求：超时/连接失败翻译成用户能看懂的句子（不把异常对象漏到页面）。
+    try:
+        resp = requests.post(DEEPSEEK_CHAT_URL, headers=headers, json=payload, timeout=15)
+    except requests.Timeout:
+        logger.warning("AI 分类请求超时（商户=%s）", merchant_text)
+        raise CategoryError("AI 分类超时，请稍后再试") from None
+    except requests.ConnectionError:
+        logger.warning("AI 分类请求连接失败（商户=%s）", merchant_text)
+        raise CategoryError("网络连接失败，AI 分类暂不可用") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：日志只记异常类型（确保不把 headers / key 带出去）。
+        logger.warning("AI 分类请求失败（商户=%s，异常=%s）", merchant_text, type(exc).__name__)
+        raise CategoryError("网络连接失败，AI 分类暂不可用") from None
+
+    # ④ 非 200：只带状态码，不把响应体拼进 message（响应体可能含请求回显）。
+    if resp.status_code != 200:
+        logger.warning("AI 分类接口返回 HTTP %s（商户=%s）", resp.status_code, merchant_text)
+        raise CategoryError(f"AI 分类服务返回异常（HTTP {resp.status_code}）")
+
+    # ⑤ 解析：非 JSON / 结构不符 / content 为空 → 同一条"没有有效分类结果"。
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("AI 分类响应不是合法 JSON（商户=%s）", merchant_text)
+        raise CategoryError("AI 没有返回有效的分类结果") from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("AI 分类响应结构不符合预期（商户=%s）", merchant_text)
+        raise CategoryError("AI 没有返回有效的分类结果") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("AI 分类响应 content 为空（商户=%s）", merchant_text)
+        raise CategoryError("AI 没有返回有效的分类结果")
+
+    # ⑥ 分类必须在候选列表内：模型编一个新分类会让分类统计出现"计划外"的组，
+    #    宁可报错让上层回落 "其他"，也不静默接受。
+    category = _extract_category(content.strip())
+    if category is None:
+        logger.warning("AI 分类响应无法解析出 category（商户=%s）", merchant_text)
+        raise CategoryError("AI 没有返回有效的分类结果")
+    if category not in category_list:
+        logger.warning("AI 分类结果不在候选列表（商户=%s，结果=%s）", merchant_text, category)
+        raise CategoryError(f"AI 返回的分类「{category}」不在候选列表中")
+
+    logger.info("AI 分类成功（商户=%s，分类=%s）", merchant_text, category)
+    return category

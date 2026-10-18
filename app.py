@@ -496,7 +496,20 @@ with tab_dash:
     offset = st.session_state.page * page_size
     paginated_df = get_bills_paginated(st.session_state.user_id, limit=page_size, offset=offset)
 
-    st.dataframe(paginated_df, use_container_width=True)
+    # 分类列只在迁移 012 执行后才存在：有列就在 merchant 之后展示，没列则原样展示并提示一次
+    if "category" in paginated_df.columns:
+        # 固定列序（category 紧跟 merchant），其余列保持原顺序补在后面，不依赖 db 返回顺序
+        base_cols = ["date", "merchant", "category", "amount", "payment_method", "type"]
+        display_cols = [col for col in base_cols if col in paginated_df.columns]
+        display_cols += [col for col in paginated_df.columns if col not in display_cols]
+        df_display = paginated_df[display_cols].copy()
+        # NULL / 空串 / 纯空白统一归一为「其他」，与 db 层口径保持一致
+        cat_series = df_display["category"].fillna("其他").astype(str).str.strip()
+        df_display["category"] = cat_series.where(cat_series != "", "其他")
+        st.dataframe(df_display, use_container_width=True)
+    else:
+        st.caption("提示：执行 migrations/012 后这里会显示消费分类")
+        st.dataframe(paginated_df, use_container_width=True)
 
     btn_left, btn_mid, btn_right = st.columns(3)
     with btn_left:
@@ -555,6 +568,45 @@ with tab_dash:
     }
     with chart_col2:
         st_echarts(line_option, height="400px")
+
+    # 环形玫瑰图：本月支出按消费分类聚合（category 列在迁移 012 执行后才存在）
+    st.subheader("消费分类占比")
+    st.caption("本月支出按消费分类聚合，扇形半径越大代表该类花得越多")
+    month_exp_df = df_current_month[df_current_month["type"] == "支出"]
+    if "category" not in df_current_month.columns:
+        st.info("分类功能未启用：请先执行 migrations/012_bills_category.sql")
+    elif month_exp_df.empty:
+        st.caption("本月还没有支出，先记几笔吧")
+    else:
+        # NULL / 空串 / 纯空白统一归到「其他」，与上方明细表口径一致
+        month_cat = month_exp_df["category"].fillna("其他").astype(str).str.strip()
+        cat_totals = (
+            month_exp_df.assign(_category=month_cat.where(month_cat != "", "其他"))
+            .groupby("_category")["amount"]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        rose_data = [
+            {"name": str(cat_name), "value": round(float(cat_amount), 2)}
+            for cat_name, cat_amount in cat_totals.items()
+            if float(cat_amount) > 0
+        ]
+        if not rose_data:
+            st.caption("本月还没有支出，先记几笔吧")
+        else:
+            rose_option = {
+                "tooltip": {"trigger": "item", "formatter": "{b}: {c} 元 ({d}%)"},
+                "legend": {"orient": "vertical", "left": "left"},
+                "series": [{
+                    "type": "pie",
+                    "radius": ["30%", "70%"],
+                    "center": ["50%", "55%"],
+                    "roseType": "radius",
+                    "itemStyle": {"borderRadius": 6},
+                    "data": rose_data
+                }]
+            }
+            st_echarts(rose_option, height=320)
 
     # Export
     st.subheader("数据导出")

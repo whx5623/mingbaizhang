@@ -732,7 +732,7 @@ def verify_user(username, password):
     _touch_last_login(user_id)
     return user_id
 
-def add_bill(user_id, date, merchant, amount, payment_method, type):
+def add_bill(user_id, date, merchant, amount, payment_method, type, category=None):
     global engine
     # 参数名 date 是历史遗留（遮蔽了 datetime.date），本函数里不再用 date 类型，只当值用。
     #
@@ -746,33 +746,58 @@ def add_bill(user_id, date, merchant, amount, payment_method, type):
     bill_date = _normalize_bill_date(date)
     bill_type = normalize_bill_type(type, strict=True)
     amt = _normalize_amount(amount, bill_type)
+    # 分类在开连接之前算好。auto_categorize 内部已经吞掉 AI/导入异常并回落 "其他"，
+    # 所以分类失败绝不会让这笔账记不上（这是本功能的硬约束）。
+    # category 显式传了就尊重调用方（app.py 目前不传，保持位置参数兼容）。
+    category_value = category or auto_categorize(merchant, "", api_key=_deepseek_key())
+    # 列存在性探测放在开写连接之前：避免在一条已检出的连接上再借第二条连接做元数据查询。
+    write_category = _bills_category_supported()
     with engine.connect() as conn:
-        stmt = text("""
-            INSERT INTO bills(user_id, date, merchant, amount, payment_method, type)
-            VALUES (:uid, :dt, :mer, :amt, :pm, :tp)
-        """)
-        conn.execute(stmt, {
-            "uid": user_id,
-            "dt": bill_date,
-            "mer": merchant,
-            "amt": amt,
-            "pm": payment_method,
-            "tp": bill_type
-        })
+        if write_category:
+            stmt = text("""
+                INSERT INTO bills(user_id, date, merchant, amount, payment_method, type, category)
+                VALUES (:uid, :dt, :mer, :amt, :pm, :tp, :cat)
+            """)
+            params = {
+                "uid": user_id,
+                "dt": bill_date,
+                "mer": merchant,
+                "amt": amt,
+                "pm": payment_method,
+                "tp": bill_type,
+                "cat": category_value,
+            }
+        else:
+            # 迁移 012 未执行：列不存在，INSERT 不能带 category，否则整笔账单都会失败。
+            # 降级只发生在这里，告警由 _bills_category_supported() 负责（每个进程一次）。
+            stmt = text("""
+                INSERT INTO bills(user_id, date, merchant, amount, payment_method, type)
+                VALUES (:uid, :dt, :mer, :amt, :pm, :tp)
+            """)
+            params = {
+                "uid": user_id,
+                "dt": bill_date,
+                "mer": merchant,
+                "amt": amt,
+                "pm": payment_method,
+                "tp": bill_type,
+            }
+        conn.execute(stmt, params)
         conn.commit()
 
 def get_all_bills(user_id):
     global engine
     sql = text("SELECT * FROM bills WHERE user_id = :uid")
     df = pd.read_sql(sql, engine, params={"uid": user_id})
-    # 顺序无所谓，但两列都必须收口：type 归一化（字符串口径）+ amount 转 float（数值口径）
-    return _normalize_type_column(_normalize_amount_column(df))
+    # 顺序无所谓，但三列都必须收口：type 归一化（字符串口径）+ amount 转 float（数值口径）
+    # + category 空值收敛（列不存在时原样返回，绝不凭空造列）。
+    return _normalize_category_column(_normalize_type_column(_normalize_amount_column(df)))
 
 def get_bills_paginated(user_id, limit, offset):
     global engine
     sql = text("SELECT * FROM bills WHERE user_id = :uid ORDER BY date DESC LIMIT :lim OFFSET :off")
     df = pd.read_sql(sql, engine, params={"uid": user_id, "lim": limit, "off": offset})
-    return _normalize_type_column(_normalize_amount_column(df))
+    return _normalize_category_column(_normalize_type_column(_normalize_amount_column(df)))
 
 def get_total_bill_count(user_id):
     global engine
@@ -794,16 +819,27 @@ def insert_demo_bills(user_id):
         {"date":"2026-10-09","merchant":"家教兼职","amount":300.0,"payment_method":"微信","type":"收入"},
         {"date":"2026-10-10","merchant":"超市","amount":56.2,"payment_method":"支付宝","type":"支出"},
     ]
+    write_category = _bills_category_supported()
     with engine.connect() as conn:
         conn.execute(text("DELETE FROM bills WHERE user_id = :uid"), {"uid": user_id})
-        for row in demo_data:
+        if write_category:
+            stmt = text("""
+                INSERT INTO bills(user_id, date, merchant, amount, payment_method, type, category)
+                VALUES (:uid, :dt, :mer, :amt, :pm, :tp, :cat)
+            """)
+        else:
+            # 012 未执行：不带 category 写入（降级，记账优先）
             stmt = text("""
                 INSERT INTO bills(user_id, date, merchant, amount, payment_method, type)
                 VALUES (:uid, :dt, :mer, :amt, :pm, :tp)
             """)
+        for row in demo_data:
             # 演示数据里本来就是中文字面量，归一化是幂等的（防止以后有人改数据源）
             bill_type = normalize_bill_type(row["type"], strict=True)
-            conn.execute(stmt, {
+            # 演示数据只走规则（不传 api_key）：结果确定、不依赖外部 AI 是否可用；
+            # 规则命不中的（兼职 / 白条分期）落 "其他"，仍保证在 BILL_CATEGORIES 内。
+            category_value = auto_categorize(row["merchant"], "")
+            params = {
                 "uid": user_id,
                 # 日期也过同一个校验：本表数据全部是 ISO（幂等、结果不变），
                 # 接入的目的是把"以后有人改 demo_data"钉在和 add_bill / CSV 完全相同的
@@ -815,7 +851,10 @@ def insert_demo_bills(user_id):
                 "amt": _normalize_amount(row["amount"], bill_type),
                 "pm": row["payment_method"],
                 "tp": bill_type
-            })
+            }
+            if write_category:
+                params["cat"] = category_value
+            conn.execute(stmt, params)
         conn.commit()
     return True
 
@@ -917,13 +956,22 @@ def import_csv_to_bills(user_id, df):
             result["skipped"].append({"row": row_no, "reason": reason})
             print(f"[import_csv_to_bills] 第 {row_no} 行 {reason}，已跳过该行")
             continue
+        # 分类：CSV 有 category 列且值在 BILL_CATEGORIES 内就用它（先 strip），
+        # 否则按商户/描述走规则自动打标。这里**不传 api_key**：批量导入可能有几百行，
+        # 逐行调 AI 既慢又贵，规则未命中直接落 "其他"（仍可后续人工改）。
+        raw_category = r.get("category") if "category" in df.columns else None
+        if isinstance(raw_category, str) and raw_category.strip() in BILL_CATEGORIES:
+            category_value = raw_category.strip()
+        else:
+            category_value = auto_categorize(r.get("merchant"), "")
         rows.append({
             "uid": user_id,
             "dt": bill_date,
             "mer": r.get("merchant"),
             "amt": amt,
             "pm": r.get("payment_method"),
-            "tp": bill_type
+            "tp": bill_type,
+            "cat": category_value
         })
 
     if not rows:
@@ -931,13 +979,22 @@ def import_csv_to_bills(user_id, df):
         print("[import_csv_to_bills] 没有可导入的有效行，本次不写库（库里原账单保持不变）")
         return result
 
+    write_category = _bills_category_supported()
     try:
         with engine.connect() as conn:
             conn.execute(text("DELETE FROM bills WHERE user_id = :uid"), {"uid": user_id})
-            stmt = text("""
-                INSERT INTO bills(user_id, date, merchant, amount, payment_method, type)
-                VALUES (:uid, :dt, :mer, :amt, :pm, :tp)
-            """)
+            if write_category:
+                stmt = text("""
+                    INSERT INTO bills(user_id, date, merchant, amount, payment_method, type, category)
+                    VALUES (:uid, :dt, :mer, :amt, :pm, :tp, :cat)
+                """)
+            else:
+                # 012 未执行：去掉 category 键再插入（降级，导入优先）
+                stmt = text("""
+                    INSERT INTO bills(user_id, date, merchant, amount, payment_method, type)
+                    VALUES (:uid, :dt, :mer, :amt, :pm, :tp)
+                """)
+                rows = [{k: v for k, v in row.items() if k != "cat"} for row in rows]
             for row in rows:
                 conn.execute(stmt, row)
             conn.commit()
@@ -1748,3 +1805,198 @@ def add_to_goal(user_id, amount) -> dict:
         # 提交之后、读取之前目标被删掉（并发删号）。宁可报错，也不返回缺字段的 dict。
         raise ValueError("心愿目标不存在（可能已被删除），请刷新后重试")
     return {"deposited": deposited, **goal}
+
+
+# ---------------------------------------------------------------------------
+# 账单分类（bills.category，迁移 012）
+# ---------------------------------------------------------------------------
+# 设计口径：
+#   · 分类是**尽力而为**的附加信息，不是记账的前置条件。规则未命中、没配 key、
+#     AI 超时/报错/返回垃圾 —— 一律回落 "其他"，add_bill 照常成功。
+#     绝不因为分类失败让用户丢一笔账（这是本功能的硬约束）。
+#   · 规则优先、AI 兜底：常见商户（食堂、蜜雪、淘宝、水电费…）用关键词表就能覆盖，
+#     零延迟、零成本、结果稳定可复现；只有规则完全没命中的长尾才值得花一次 API。
+#   · 写入侧兼容「012 未执行」：_bills_category_supported() 探测列是否存在，
+#     不存在时 INSERT 自动去掉 category，只告警一次。
+#   · 读取侧不凭空造列：列存在才把 NULL/空串归一成 "其他"；列不存在原样返回，
+#     由前端自己判断要不要展示分类。
+# ---------------------------------------------------------------------------
+
+# 分类枚举：与 migrations/012_bills_category.sql 的 VARCHAR(50) 以及前端下拉同口径。
+# 顺序也是前端展示顺序（"其他"永远垫底）。
+BILL_CATEGORIES = ["餐饮", "奶茶咖啡", "购物", "生活费", "交通", "娱乐", "学习", "医疗", "其他"]
+
+# 兜底分类：规则/AI 都给不出结果时用它；也是 DB 列的 DEFAULT，两处必须一致。
+FALLBACK_CATEGORY = "其他"
+
+# 关键词规则：(关键词列表, 分类)，**顺序即优先级**。
+# 为什么奶茶咖啡排在餐饮前面：蜜雪/瑞幸这类商户名里常带"咖啡/茶"，但它们是独立品类，
+# 若先匹配餐饮的宽泛词就容易串味；先命中先返回，所以顺序本身就是业务口径。
+CATEGORY_RULES = [
+    (["蜜雪", "瑞幸", "星巴克", "库迪", "奶茶", "咖啡", "茶百道", "喜茶", "霸王茶姬"], "奶茶咖啡"),
+    (["食堂", "外卖", "美团", "饿了么", "餐厅", "饭店", "快餐", "麦当劳", "肯德基", "面馆", "米饭"], "餐饮"),
+    (["京东", "淘宝", "天猫", "拼多多", "唯品会", "超市", "便利店", "商场"], "购物"),
+    (["水电", "电费", "水费", "网费", "话费", "房租", "物业", "住宿"], "生活费"),
+    (["地铁", "公交", "打车", "滴滴", "高铁", "火车", "机票", "共享单车"], "交通"),
+    (["电影", "游戏", "会员", "KTV", "演出", "门票"], "娱乐"),
+    (["书", "教材", "文具", "打印", "考试", "课程"], "学习"),
+    (["药", "医院", "挂号", "体检", "诊所"], "医疗"),
+]
+
+# bills.category 是否存在的进程级缓存：None = 还没探测过；True/False = 探测结果。
+# 只缓存**探测成功**的结果：探测本身失败（库暂时不可用）时不缓存，
+# 否则一次网络抖动就会让整个进程永久降级、执行 012 后也必须重启才能恢复。
+_BILLS_CATEGORY_SUPPORT = None
+
+# DEEPSEEK_API_KEY 的懒加载缓存：{"loaded": bool, "value": str|None}。
+# 不在模块顶层读 secrets：db.py 会被脚本/测试直接 import，没装 streamlit 或没有
+# secrets 文件时也不该在 import 阶段就失败。读取失败缓存成 None（本进程不再重试）。
+_DEEPSEEK_KEY_CACHE = {"loaded": False, "value": None}
+
+
+def _deepseek_key():
+    """懒加载并缓存 DEEPSEEK_API_KEY；没配置 / 读取失败都返回 None。
+
+    分类是可选增强，读不到 key 只代表"不用 AI 兜底"，不是错误。
+    """
+    cache = _DEEPSEEK_KEY_CACHE
+    if not cache["loaded"]:
+        cache["loaded"] = True
+        try:
+            from config import get_secret
+            raw = get_secret("DEEPSEEK_API_KEY")
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "[db] 读取 DEEPSEEK_API_KEY 失败，AI 分类不可用（记账不受影响）", exc_info=True
+            )
+            raw = None
+        cache["value"] = raw.strip() if isinstance(raw, str) and raw.strip() else None
+    return cache["value"]
+
+
+def _bills_category_supported():
+    """探测 bills.category 是否存在（迁移 012 是否已执行），结果进程内缓存。
+
+    False 时调用方必须走"不带 category 的 INSERT"：012 未执行时硬塞 category
+    会让整笔账单写入失败 —— 分类是可选信息，绝不能拖垮记账主路径。
+    这里只告警一次（缓存 False 之后的调用直接返回，不再刷日志）。
+    """
+    global _BILLS_CATEGORY_SUPPORT
+    if _BILLS_CATEGORY_SUPPORT is not None:
+        return _BILLS_CATEGORY_SUPPORT
+    if engine is None:
+        # 正常入口 app.py 会先 init_db()；这里兜底，避免脚本里直接调 add_bill 时
+        # 把"引擎没建"误判成"列不存在"并永久缓存。
+        try:
+            init_db()
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "[db] 探测 bills.category 前初始化数据库失败，本次按「无 category 列」处理", exc_info=True
+            )
+            return False
+    try:
+        with engine.connect() as conn:
+            exists = bool(conn.execute(text("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'bills'
+                      AND column_name = 'category'
+                )
+            """)).scalar())
+    except Exception:
+        # 探测失败不等于列不存在：不写缓存，下次再探（写库本身也会失败并照常抛出）。
+        logging.getLogger(__name__).warning(
+            "[db] 探测 bills.category 失败，本次按「无 category 列」写入（不带分类）", exc_info=True
+        )
+        return False
+    _BILLS_CATEGORY_SUPPORT = exists
+    if not exists:
+        logging.getLogger(__name__).warning(
+            "[db] bills.category 不存在（migrations/012_bills_category.sql 未执行）："
+            "账单将不带分类写入，请执行 012 迁移后重启应用"
+        )
+    return exists
+
+
+def _normalize_category_value(value):
+    """把单个分类值收敛成非空字符串：None / NaN / 空串 / 纯空白 → "其他"。
+
+    不校验是否在 BILL_CATEGORIES 内：读取侧只负责让前端拿到的分类列没有空值，
+    未知值原样保留（可能是执行 012 之前人工写入的标签，悄悄改写会掩盖数据问题）。
+    """
+    if value is None:
+        return FALLBACK_CATEGORY
+    try:
+        if pd.isna(value):
+            return FALLBACK_CATEGORY
+    except (TypeError, ValueError):
+        # pd.isna 对 list / dict 之类返回数组，真值判断会抛错；这类值交给 str()。
+        pass
+    text = str(value).strip()
+    return text or FALLBACK_CATEGORY
+
+
+def _normalize_category_column(df):
+    """读取兜底：category 列的 NULL/空串归一成 "其他"；**没有该列时不造列**。
+
+    与 _normalize_type_column 同样"绝不抛异常"：归一化失败就返回原始数据，
+    页面最多显示空分类，不会因为兜底逻辑崩掉。
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty or "category" not in df.columns:
+        return df
+    try:
+        df = df.copy()
+        df["category"] = df["category"].map(_normalize_category_value)
+    except Exception as exc:  # 兜底逻辑本身不能把页面搞崩，异常时退回原始数据
+        print(f"[db] category 列归一化失败，返回原始数据：{exc}")
+    return df
+
+
+def auto_categorize(merchant, description="", api_key=None) -> str:
+    """给一笔账单推断分类，返回 BILL_CATEGORIES 中的一个（失败一律 "其他"）。
+
+    优先级：
+      ① 关键词规则（CATEGORY_RULES 顺序，命中即返回）：零延迟、零成本、可复现；
+      ② 规则未命中且 api_key 非空 → 懒加载 ai_agent.classify_category 问一次 AI；
+      ③ 其余所有情况（无 key / 空输入 / AI 异常 / AI 返回值不在枚举内）→ "其他"。
+
+    为什么 from ai_agent import classify_category 放在函数内部：
+    db.py 与 ai_agent.py 在 `import db` 时不能互相顶层 import（循环依赖，
+    ai_agent 顶层还会立刻 create_client 初始化 Supabase）。放到函数里既避开
+    循环依赖，也让"没配 AI 的部署"完全不加载 ai_agent。
+
+    这个函数**永不抛异常**：调用方（add_bill / CSV 导入 / 示例数据）都把它当
+    可选信息，分类失败只能降级，不能影响记账。
+    """
+    merchant_text = "" if merchant is None else str(merchant).strip()
+    description_text = "" if description is None else str(description).strip()
+    if not merchant_text and not description_text:
+        return FALLBACK_CATEGORY
+
+    haystack = f"{merchant_text} {description_text}".casefold()
+    for keywords, category in CATEGORY_RULES:
+        for keyword in keywords:
+            if keyword.casefold() in haystack:
+                return category
+
+    if not api_key or not str(api_key).strip():
+        return FALLBACK_CATEGORY
+    try:
+        from ai_agent import classify_category
+        category = classify_category(merchant_text, description_text, str(api_key), BILL_CATEGORIES)
+    except Exception as exc:
+        # 只记异常类型与商户片段：日志里绝不出现 api_key，也不把整段描述倒进日志。
+        logging.getLogger(__name__).warning(
+            "[db] AI 分类失败，回落「%s」（商户=%r，异常=%s）",
+            FALLBACK_CATEGORY, merchant_text[:50], type(exc).__name__,
+        )
+        return FALLBACK_CATEGORY
+
+    if category in BILL_CATEGORIES:
+        return category
+    logging.getLogger(__name__).warning(
+        "[db] AI 返回分类 %r 不在 BILL_CATEGORIES 内，回落「%s」（商户=%r）",
+        category, FALLBACK_CATEGORY, merchant_text[:50],
+    )
+    return FALLBACK_CATEGORY
