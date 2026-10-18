@@ -495,12 +495,18 @@ hr {
 
 
 def inject_styles() -> None:
-    """在 app.py 顶部调用一次；内部 st.markdown(CSS, unsafe_allow_html=True)。
+    """在 app.py 顶部调用一次，把 CSS 以 <style> 节点注入页面。
 
-    - 只在 Streamlit 脚本 run 内调用，每次 run 渲染一个 <style> 节点（Streamlit 会随
-      元素树重建回收旧节点，不会在页面里累积）。
-    - 本函数不吞异常：由 app.py 顶层 try/except 兜底并打印，做到「样式失败不阻塞业务」。
+    关键点：CSS 字符串本身**不含** <style> 标签；unsafe_allow_html=True 时
+    Streamlit 会把内容当 HTML 解析，裸 CSS 会被当成纯文本渲染到页面顶部
+    （这正是「页面上方出现一大段 CSS 源码」的原因）。因此这里必须显式包一层
+    <style>…</style>。
+
+    - 每次 run 渲染一个 <style> 节点，Streamlit 随元素树重建回收旧节点，不会累积。
+    - 若 CSS 里意外出现 </style>（不可能出现在本项目样式中），先移除以免提前闭合。
+    - 本函数不吞异常：由 app.py 顶层 try/except 兜底并打印，样式失败不阻塞业务。
     """
     import streamlit as st
 
-    st.markdown(CSS, unsafe_allow_html=True)
+    safe_css = CSS.replace("</style", "<\\/style")
+    st.markdown(f"<style>{safe_css}</style>", unsafe_allow_html=True)
