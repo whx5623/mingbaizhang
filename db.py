@@ -3569,3 +3569,79 @@ def get_username(user_id) -> str:
     if row is None:
         raise ValueError("用户不存在")
     return row.username
+
+
+def get_daily_expense_totals(user_id, months: int = 3, today=None) -> dict[str, float]:
+    """按天汇总某用户**支出**，返回 {"YYYY-MM-DD": float}，**零填充**（供日历热力图）。
+
+    区间口径（闭区间，左闭右闭）
+    --------------------------
+    · 起点 = 今天所在月往前推 months-1 个月的**1 号**；终点 = 今天（含）。
+      例：today=2026-10-18、months=3 → 2026-08-01 ~ 2026-10-18（共 79 个键）；
+          months=1 → 2026-10-01 ~ 2026-10-18（= today.day 个键）。
+    · **零填充**：区间内每一天都有键，没消费的那天是 0.0 —— 热力图靠"键存在且值为 0"
+      区分"这天没花钱"与"这天没数据"，缺键会让日历出现空洞。键数恒等于
+      (today - start).days + 1，按日期升序（dict 插入序即升序）。
+    · 只看 type = '支出'，收入不计入；bills.date 是 VARCHAR（历史遗留），按
+      ``b.date::date`` 比较。007 的 CHECK 保证库里都是 ISO 日期；cast 失败的脏数据
+      让异常原样上抛，**不静默漏算** —— 少算会让花钱的日子在热力图上变成空白。
+
+    参数校验（都在**开连接之前**完成，非法入参不浪费一次连接）
+    --------------------------------------------------------
+    · user_id 复用 _normalize_budget_user_id（正整数，拒绝 bool / float）；
+    · months 必须是 1~12 的 int（bool / float / 字符串一律拒绝，不静默转换：
+      ``int(2.9)`` 截断成 2 会把"写错区间"伪装成"写对区间"）；
+    · today 复用 _normalize_forecast_today（date / datetime / "YYYY-MM-DD"，
+      默认 date.today()）。
+
+    实现口径
+    --------
+    · **单条 SQL + Python 零填充**：库里只 GROUP BY 一次，日期序列由 Python 生成
+      （不在 SQL 里 generate_series：少一层方言依赖，也方便纯逻辑单测）；
+    · 金额经 _money_to_float 定量到两位小数；SUM 为 NULL 的日期按 0.0 处理；
+    · 用户不存在 / 该区间没记过账 → 返回**全 0 字典**而不是报错：新注册用户也可能
+      刚打开日历，返回 {} 或抛错都会逼调用方写分支；
+    · 参数全部绑定（:uid / :expense / :start / :end），months 只参与 Python 侧
+      date 运算，绝不被拼进 SQL；本函数不写日志，从根源上不泄漏账单明细。
+    """
+    uid = _normalize_budget_user_id(user_id)
+    if isinstance(months, bool) or not isinstance(months, int):
+        raise ValueError(f"months 必须是 1~12 的整数：{months!r}")
+    if not 1 <= months <= 12:
+        raise ValueError(f"months 必须是 1~12 的整数：{months!r}")
+    end = _normalize_forecast_today(today)
+
+    # 往前推 months-1 个月：先算「月份序号」（= 年 * 12 + 月 - 1）再减。
+    # 借 Python 对负数的 // 与 % 是 floor 语义，跨年（2026-01 往前 2 个月 → 2025-11）
+    # 自动落到上一年，不必再写一堆 year == 1 的分支。9999-12 之后的越界日期让
+    # date() 自己抛 ValueError，不额外造边界逻辑。
+    month_index = (end.year * 12 + end.month - 1) - (months - 1)
+    start = date(month_index // 12, month_index % 12 + 1, 1)
+
+    if engine is None:
+        init_db()
+    with engine.connect() as conn:
+        # 顺序由 Python 零填充决定，SQL 不需要 ORDER BY。
+        rows = conn.execute(
+            text("""
+                SELECT b.date::date AS day, SUM(b.amount) AS total
+                FROM public.bills AS b
+                WHERE b.user_id = :uid
+                  AND b.type = :expense
+                  AND b.date::date >= :start
+                  AND b.date::date <= :end
+                GROUP BY 1
+            """),
+            {"uid": uid, "expense": EXPENSE_TYPE, "start": start, "end": end},
+        ).fetchall()
+
+    # amount 全为 NULL 的那天 SUM 也是 NULL：按 0.0 处理，别让 _money_to_float(None) 抛。
+    totals = {
+        row.day: _money_to_float(row.total) for row in rows if row.total is not None
+    }
+    result: dict[str, float] = {}
+    day = start
+    while day <= end:
+        result[day.isoformat()] = totals.get(day, 0.0)
+        day += timedelta(days=1)
+    return result

@@ -11,6 +11,16 @@ except ImportError as _health_import_exc:
     print(f"[health] 健康分模块不可用：{type(_health_import_exc).__name__}: {_health_import_exc}")
 from finance_math import compute_irr, payment_from_fee, debt_ratio
 from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, get_user_auth_state, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data, get_login_daily_stats, login_events_available, LoginThrottled, set_goal, get_goal, add_to_goal, get_budget_details, save_budget_details, generate_smart_budget
+# 消费日历热力图后端由并行方提供（见 db.get_daily_expense_totals）：
+# 尚未合入时先降级成 None，页面只显示一行提示，绝不因 ImportError 红屏。
+try:
+    from db import get_daily_expense_totals
+except ImportError as _cal_import_exc:
+    get_daily_expense_totals = None
+    print(
+        f"[calendar] 每日支出统计不可用："
+        f"{type(_cal_import_exc).__name__}: {_cal_import_exc}"
+    )
 import db
 import requests
 import uuid
@@ -1316,6 +1326,148 @@ with tab_dash:
                 }]
             }
             st_echarts(rose_option, height=320)
+
+    # ===== 消费日历热力图（本月 / 近三个月）=====
+    # 数据由并行方 db.get_daily_expense_totals 提供（连续零填充的每日支出合计）：
+    # 函数缺失 / 取数异常 / 返回空 dict 都只降级成一行提示，绝不红屏。
+    # 放在玫瑰图之后、AI 洞察之前；与上方玫瑰图不同，这里不依赖 df 的 category 列。
+    st.subheader("🗓️ 消费日历热力图")
+    _cal_range = st.radio("范围", ["本月", "近三个月"], horizontal=True, key="cal_range")
+    _cal_months = 1 if _cal_range == "本月" else 3
+
+    # 用项目统一的 UTC+8 日报时钟确定「今天」，避免部署机为 UTC 时月份错位；
+    # 时钟异常时退回本机 date.today()，只影响月份归属，不影响其它区块。
+    _cal_today_fn = getattr(db, "_report_today", None)
+    try:
+        _cal_today = _cal_today_fn() if callable(_cal_today_fn) else None
+    except Exception as _cal_today_exc:
+        print(
+            f"[calendar] 读取日报时钟失败："
+            f"{type(_cal_today_exc).__name__}: {_cal_today_exc}"
+        )
+        _cal_today = None
+    _cal_base_today = _cal_today if isinstance(_cal_today, date) else date.today()
+
+    # 近 N 个月：以今天所在月为最后一个月往前推（升序，方便日历从上到下按时间排列）
+    _cal_month_keys = []
+    for _cal_back in range(_cal_months - 1, -1, -1):
+        _cal_m = _cal_base_today.month - _cal_back
+        _cal_y = _cal_base_today.year
+        while _cal_m <= 0:
+            _cal_m += 12
+            _cal_y -= 1
+        _cal_month_keys.append(f"{_cal_y:04d}-{_cal_m:02d}")
+
+    # 优先取 db 模块属性：并行方稍后合入、或测试里 patch db.get_daily_expense_totals 都能生效；
+    # 模块属性不存在时退回顶部 guarded import 绑定的名字（同样可能为 None）。
+    _cal_lookup = getattr(db, "get_daily_expense_totals", None)
+    if _cal_lookup is None:
+        _cal_lookup = get_daily_expense_totals
+
+    _cal_daily = None
+    _cal_unavailable = False
+    if _cal_lookup is None:
+        # 后端函数尚未合入：与取数异常同样处理，只给一行提示
+        _cal_unavailable = True
+    else:
+        try:
+            _cal_daily = _cal_lookup(
+                st.session_state.user_id, months=_cal_months, today=_cal_today
+            )
+        except Exception as _cal_exc:
+            print(f"[calendar] 读取每日支出失败：{type(_cal_exc).__name__}: {_cal_exc}")
+            _cal_daily = None
+            _cal_unavailable = True
+
+    if _cal_unavailable or not isinstance(_cal_daily, dict) or not _cal_daily:
+        # 空 dict 视为后端未能给出连续序列（正常契约至少含零填充日期），同样降级
+        st.caption("日历热力图暂不可用")
+    else:
+        # 归一成 [["YYYY-MM-DD", float], ...]；跳过非法键 / NaN / 负数 / 非数字值，
+        # 一条脏数据不拖垮整块日历。
+        _cal_points = []
+        for _cal_date, _cal_value in _cal_daily.items():
+            try:
+                _cal_amount = float(_cal_value)
+            except (TypeError, ValueError):
+                continue
+            _cal_date_str = str(_cal_date).strip()
+            if (
+                len(_cal_date_str) != 10
+                or _cal_date_str[4] != "-"
+                or _cal_date_str[7] != "-"
+                or not math.isfinite(_cal_amount)
+                or _cal_amount < 0
+            ):
+                continue
+            _cal_points.append((_cal_date_str, _cal_amount))
+        _cal_points.sort(key=lambda _item: _item[0])
+
+        _cal_vmax = max((_value for _, _value in _cal_points), default=0.0)
+        if _cal_vmax <= 0:
+            # 契约里零填充的日期也会有 0 值：全 0 说明这段时间没有支出，不画空图
+            st.caption("这段时间还没有支出记录，先记几笔吧")
+        else:
+            _cal_height = 260 if _cal_months == 1 else 430
+            # 近三个月时三个 calendar 用显式 top 纵向堆叠（本月在最下，时间向下流动）
+            _cal_tops = ["5%", "38%", "71%"] if _cal_months > 1 else [None]
+            _cal_calendars = []
+            _cal_series = []
+            for _cal_index, _cal_month_key in enumerate(_cal_month_keys):
+                _cal_calendar = {
+                    "range": [_cal_month_key],
+                    "cellSize": ["auto", 16],
+                    "yearLabel": {"show": False},
+                    "dayLabel": {"nameMap": "ZH"},
+                    "monthLabel": {"nameMap": "ZH"},
+                    "itemStyle": {"color": "transparent", "borderWidth": 0},
+                    "splitLine": {"show": False},
+                }
+                if _cal_tops[_cal_index] is not None:
+                    _cal_calendar["top"] = _cal_tops[_cal_index]
+                _cal_calendars.append(_cal_calendar)
+                _cal_series.append(
+                    {
+                        "type": "heatmap",
+                        "coordinateSystem": "calendar",
+                        "calendarIndex": _cal_index,
+                        "data": [
+                            [_date_str, _value]
+                            for _date_str, _value in _cal_points
+                            if _date_str[:7] == _cal_month_key
+                        ],
+                        "itemStyle": {"borderRadius": 3},
+                    }
+                )
+
+            # tooltip 用 ECharts 默认的 item 触发（显示「日期, 值」）：
+            # st_echarts 通过 JSON 传参，JS 函数字符串不会被执行，故不写 formatter 函数。
+            _cal_option = {
+                "tooltip": {"trigger": "item"},
+                "visualMap": {
+                    "min": 0,
+                    "max": _cal_vmax,
+                    "orient": "horizontal",
+                    "left": "center",
+                    "bottom": 0,
+                    "calculable": False,
+                    "itemWidth": 12,
+                    "itemHeight": 80,
+                    "inRange": {
+                        "color": [
+                            "#f1f3f5",
+                            "#ffe3e3",
+                            "#ffb3b3",
+                            "#ff6b6b",
+                            "#c92a2a",
+                        ]
+                    },
+                    "text": ["高", "低"],
+                },
+                "calendar": _cal_calendars,
+                "series": _cal_series,
+            }
+            st_echarts(_cal_option, height=_cal_height)
 
     # ===== AI 洞察：本月消费图表解读（玫瑰图下方、数据导出之前）=====
     # 统计口径与上方玫瑰图一致：本月 + 支出。无支出时只给引导，不显示按钮。
