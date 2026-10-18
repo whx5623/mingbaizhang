@@ -1446,3 +1446,305 @@ def register_user(username, password):
     if new_id:
         record_login_event(username, new_id, LOGIN_EVENT_SUCCESS)
     return new_id
+
+
+# ---------------------------------------------------------------------------
+# 心愿存钱罐（migrations/011_savings_goals.sql）
+# ---------------------------------------------------------------------------
+# 一张表、一个人一个目标：savings_goals 上有 UNIQUE (user_id)，
+# set_goal() 靠它做 INSERT ... ON CONFLICT (user_id) DO UPDATE 的 upsert
+# （有则改目标、无则新建），并**刻意不写 created_at** —— 创建时间不该因为
+# 用户改了一次目标金额就被重置（"这个心愿我坚持了多久"是产品要展示的信息）。
+#
+# 金额口径：数据库列是 NUMERIC(12,2)，这里与 bills.amount 用**同一套**定量规则
+# （Decimal + ROUND_HALF_UP 到两位小数、上界 MAX_ABS_AMOUNT）。理由与
+# _normalize_amount 的长注释相同：Python 的 round() 是银行家舍入，
+# 会和 PG 的 numeric 舍入差 1 分钱；不定量则可能 numeric field overflow。
+# 读取侧仍然统一转 float：app.py 的进度条/图表全程按 float 用
+# （理由与 _normalize_amount_column 相同 —— Decimal 除以 float 会 TypeError、
+# 也无法被 JSON 序列化）。
+#
+# ⚠ 表不存在（011 还没执行）：42P01 一律转成 RuntimeError + 中文提示，
+#   **绝不**静默返回 None / 假数据 —— 那会让页面显示"还没有心愿目标"，
+#   用户以为自己没设过，实际是功能没启用、数据可能就在库里。
+#   app.py 捕获 RuntimeError 后显示提示，不会红屏。
+# ---------------------------------------------------------------------------
+
+GOAL_NAME_MAX_LEN = 50            # 与 savings_goals_name_len CHECK 同口径（btrim 后 1~50 字符）
+GOAL_TABLE_MISSING_MESSAGE = "心愿存钱罐功能未启用：请先执行 migrations/011_savings_goals.sql"
+
+
+def _raise_goal_table_missing(exc):
+    """把 42P01 统一翻译成 RuntimeError（带中文可操作提示），保留原始异常链。"""
+    raise RuntimeError(GOAL_TABLE_MISSING_MESSAGE) from exc
+
+
+def _normalize_goal_name(goal_name) -> str:
+    """心愿名称：strip 后必须是 1~50 个字符。
+
+    与 011 的 CHECK 同口径（char_length(btrim(goal_name)) BETWEEN 1 AND 50）：
+    数据库里存的是 strip 后的值，所以这里也先 strip 再判长度 ——
+    否则"名字是 50 个空格 + 1 个字"会先通过 Python 的长度检查、再被 CHECK 拒绝，
+    错误就会以 psycopg2 栈的形式漏到页面上。
+    """
+    if not isinstance(goal_name, str):
+        raise ValueError("心愿名称不能为空")
+    text = goal_name.strip()
+    if not text:
+        raise ValueError("心愿名称不能为空")
+    if len(text) > GOAL_NAME_MAX_LEN:
+        raise ValueError(f"心愿名称最多 {GOAL_NAME_MAX_LEN} 个字符")
+    return text
+
+
+def _normalize_goal_amount(value, field: str) -> float:
+    """金额校验 + 两位小数定量，**任何非法输入都抛 ValueError（中文文案）**。
+
+    field 用于拼报错文案（"目标金额" / "存入金额"），两个调用点的规则完全一样：
+    - 不是数字 / nan / inf → ValueError；
+    - 定量到两位小数后必须 > 0（0.001 会被定量成 0.00，因此同样被拒）；
+    - 不得超过 NUMERIC(12,2) 的上界 MAX_ABS_AMOUNT（与 migrations/003 同口径）。
+    顺序是"先定量、再判正、最后判上界"：9999999999.995 会定量成 10000000000.00，
+    必须在定量之后才拦得住。
+    """
+    try:
+        num = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field}非法：{value!r}（不是数字）") from exc
+    if not math.isfinite(num):
+        raise ValueError(f"{field}非法：{value!r}（必须是有限数字，不允许 nan/inf）")
+    try:
+        num = float(Decimal(str(num)).quantize(_CENT, rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"{field}超出上限 {MAX_ABS_AMOUNT}") from exc
+    if num <= 0:
+        raise ValueError(f"{field}必须大于 0")
+    if num > MAX_ABS_AMOUNT:
+        raise ValueError(f"{field}超出上限 {MAX_ABS_AMOUNT}")
+    return num
+
+
+def _normalize_goal_date(target_date):
+    """目标日期：None / "YYYY-MM-DD" / datetime.date → datetime.date 或 None。
+
+    口径与 bills.date 的 _normalize_bill_date 一致（严格 ISO、校验真实日历日），
+    区别只是这里的列是**真正的 DATE**、且允许"没定 deadline"（None）：
+    - None（以及空串/纯空白 —— 页面上的空输入框）→ None；
+    - 字符串必须整串匹配 ^\\d{4}-\\d{2}-\\d{2}$ 且是真实日历日，否则 ValueError；
+    - datetime.date 原样返回；datetime.datetime 是 date 的子类，先拦下来取 .date()，
+      否则 psycopg2 会把"带时分秒的值"写进 DATE 列（PG 会静默截断，口径就模糊了）。
+    非 ISO 写法（"2026/10/1"、"2026-1-5"、"2026-02-30"）一律拒绝，**不做自动转换**：
+    顺手转一下会让写入侧长期存在两种格式，而"能不能转"只在写入那一刻成立。
+    """
+    if target_date is None:
+        return None
+    if isinstance(target_date, datetime):
+        return target_date.date()
+    if isinstance(target_date, date):
+        return target_date
+    if isinstance(target_date, str):
+        text = target_date.strip()
+        if not text:
+            return None  # 空输入框 = 没定日期，与传 None 等价
+        if not _ISO_DATE_PATTERN.fullmatch(text):
+            raise ValueError(f"目标日期格式必须是 YYYY-MM-DD：{target_date!r}")
+        try:
+            parsed = datetime.strptime(text, "%Y-%m-%d")
+        except ValueError as exc:
+            # 格式对但日子不存在（2026-02-30 / 2026-13-01 / 2025-02-29）
+            raise ValueError(f"目标日期格式必须是 YYYY-MM-DD：{target_date!r}") from exc
+        return parsed.date()
+    raise ValueError(f"目标日期格式必须是 YYYY-MM-DD：{target_date!r}")
+
+
+def _goal_row_to_dict(row) -> dict:
+    """把 savings_goals 的一行转成给页面用的 dict。
+
+    - 金额转 float（与项目其余读取一致，见 _normalize_amount_column 的注释）；
+    - target_date 输出 "YYYY-MM-DD" 字符串（页面/JSON 直接可用），没有则 None；
+    - created_at 保持数据库返回的 tz-aware datetime（timestamptz 原样，不擅自格式化）；
+    - progress = min(1, current/target)，**封顶 1**：超目标的进度条不该画到 150%；
+      读到的目标金额理论上恒 > 0（CHECK 保证），这里仍兜一个 target <= 0 的分支，
+      避免脏数据/绕过 CHECK 的极端情况下 ZeroDivisionError 把页面弄崩；
+    - remaining = max(0, target - current)：存满之后剩余应显示 0，而不是负数；
+    - reached = current >= target：已完成（用于页面换成"已达成"样式）。
+    """
+    target = float(row.target_amount)
+    current = float(row.current_amount)
+    progress = min(1.0, current / target) if target > 0 else 1.0
+    deadline = row.target_date
+    return {
+        "id": int(row.id),
+        "user_id": int(row.user_id),
+        "goal_name": row.goal_name,
+        "target_amount": target,
+        "current_amount": current,
+        "target_date": deadline.strftime("%Y-%m-%d") if deadline is not None else None,
+        "created_at": row.created_at,
+        "progress": progress,
+        "remaining": max(0.0, target - current),
+        "reached": current >= target,
+    }
+
+
+def set_goal(user_id, goal_name, target_amount, target_date=None) -> dict:
+    """新建 / 更新心愿目标（一人一个），返回 get_goal() 的同一结构。
+
+    - 入参校验全部在**开连接之前**完成：非法入参连库都不碰；
+    - 幂等 upsert：`INSERT ... ON CONFLICT (user_id) DO UPDATE`，
+      已存在时只更新 goal_name / target_amount / target_date，
+      **不更新 created_at、也不重置 current_amount** ——
+      用户改目标金额不应该把已经攒下的钱清零；
+    - 返回值统一走 get_goal()，避免"写入口"和"读入口"各算一套字段（口径漂移）；
+    - 表不存在（011 未执行）→ RuntimeError（中文提示），不静默返回假数据。
+    """
+    global engine
+    goal = _normalize_goal_name(goal_name)
+    target = _normalize_goal_amount(target_amount, "目标金额")
+    deadline = _normalize_goal_date(target_date)
+    with engine.connect() as conn:
+        try:
+            # RETURNING * 只为把这条语句收尾成"确认写成功"（结果本身不直接用；
+            # 下面的返回值统一由 get_goal() 生成，保证读写口径完全一致）。
+            # 参数全部走绑定：金额/日期都不是 f-string 拼进 SQL 的。
+            conn.execute(
+                text("""
+                    INSERT INTO savings_goals (user_id, goal_name, target_amount, target_date)
+                    VALUES (:uid, :name, :target, :deadline)
+                    ON CONFLICT (user_id) DO UPDATE
+                       SET goal_name     = EXCLUDED.goal_name,
+                           target_amount = EXCLUDED.target_amount,
+                           target_date   = EXCLUDED.target_date
+                    RETURNING *
+                """),
+                {"uid": user_id, "name": goal, "target": target, "deadline": deadline},
+            ).fetchone()
+            conn.commit()
+        except ProgrammingError as exc:
+            conn.rollback()
+            if _is_undefined_table(exc):
+                _raise_goal_table_missing(exc)
+            raise
+        except SQLAlchemyError:
+            conn.rollback()
+            raise
+    result = get_goal(user_id)
+    if result is None:
+        # 写成功了却读不到：极少见（并发删号 / 连接串指向别的库）。不返回 None，
+        # 否则调用方会拿到一个与签名不符的返回值，页面随后就 AttributeError。
+        raise RuntimeError("心愿目标保存后未能读回，请重试")
+    return result
+
+
+def get_goal(user_id) -> dict | None:
+    """读取某个用户的心愿目标；没有则返回 **None**（这是"还没有目标"，不是错误）。
+
+    只在 user_id 上取单条（UNIQUE 保证最多一条）。表不存在（011 未执行）时抛
+    RuntimeError 而不是 None —— None 会被页面理解成"用户还没设置过"，
+    但真实原因是功能没启用；这两种状态给用户的下一步动作完全不同。
+    """
+    global engine
+    with engine.connect() as conn:
+        try:
+            row = conn.execute(
+                text("""
+                    SELECT id, user_id, goal_name, target_amount, current_amount,
+                           target_date, created_at
+                    FROM savings_goals
+                    WHERE user_id = :uid
+                """),
+                {"uid": user_id},
+            ).fetchone()
+        except ProgrammingError as exc:
+            conn.rollback()
+            if _is_undefined_table(exc):
+                _raise_goal_table_missing(exc)
+            raise
+    if row is None:
+        return None
+    return _goal_row_to_dict(row)
+
+
+def add_to_goal(user_id, amount) -> dict:
+    """往心愿存钱罐里存一笔，返回 {"deposited": 实际增加额, **get_goal(...)}。
+
+    封顶语义：`LEAST(target_amount, current_amount + :amt)` ——
+    存满之后继续存**不会**让 current_amount 超过目标（已达成的心愿不该显示 150%），
+    所以"实际增加额"可能小于传入的 amount（已存满时是 0）。
+
+    一个 LEAST 本身挡不住的边界：set_goal 允许把目标金额下调到**低于已存金额**
+    （已存 5000、目标改成 1000）。此时 current > target，再跑
+    LEAST(target, current + amt) 会把已存金额**往下调**（5000 → 1000）——
+    用户一存钱反而少了 4000 的记录。所以先判"是否已存满"：
+    已满就不执行 UPDATE、deposited 记 0。这与 current == target 时 LEAST 的结果完全一致
+    （LEAST(target, target + amt) 就是 target，本来就是无写入），只是额外挡住了
+    current > target 时的倒退。
+
+    为什么要先 SELECT ... FOR UPDATE 再 UPDATE：
+      只发一条 UPDATE 拿不到"存之前是多少"，算不出 deposited；而先读后写之间若没有行锁，
+      两个并发请求会各自按旧值算 deposited（都显示 +500，实际只加了 500）。
+      行锁一直持到 commit，读到的旧值和随后写入的新值一定是同一个事务视图。
+      另外"没有目标"就在这里用同一个查询判掉（ValueError，中文提示），
+      不靠 UPDATE 的 rowcount —— rowcount=0 既可能是"没目标"也可能是"目标被并发删了"。
+
+    金额校验在开连接之前：amount 必须 > 0 且有限（"存 0 元"没有意义，
+    "存负数"会被误当成取钱，而本功能不支持取钱），走 btrim/定量同一套规则。
+    """
+    global engine
+    amt = _normalize_goal_amount(amount, "存入金额")
+    with engine.connect() as conn:
+        try:
+            # FOR UPDATE：锁住这一行，直到 commit 才释放；没有目标时返回 None。
+            row = conn.execute(
+                text("""
+                    SELECT current_amount, target_amount
+                    FROM savings_goals
+                    WHERE user_id = :uid
+                    FOR UPDATE
+                """),
+                {"uid": user_id},
+            ).fetchone()
+            if row is None:
+                raise ValueError("还没有心愿目标，请先创建一个")
+            old_current = row.current_amount  # Decimal（NUMERIC 列），保留精度用于算 deposited
+            if old_current >= row.target_amount:
+                # 已存满（含"目标被下调到低于已存金额"）：不写库。
+                # rollback 只用于释放 FOR UPDATE 行锁；这里没有任何写入。
+                conn.rollback()
+                new_current = old_current
+                already_full = True
+            else:
+                new_current = conn.execute(
+                    text("""
+                        UPDATE savings_goals
+                           SET current_amount = LEAST(target_amount, current_amount + :amt)
+                         WHERE user_id = :uid
+                        RETURNING current_amount
+                    """),
+                    {"uid": user_id, "amt": amt},
+                ).scalar()
+                conn.commit()
+                already_full = False
+        except ProgrammingError as exc:
+            conn.rollback()
+            if _is_undefined_table(exc):
+                _raise_goal_table_missing(exc)
+            raise
+        except SQLAlchemyError:
+            conn.rollback()
+            raise
+    # deposited 用 Decimal 相减后再定量：float 相减可能出现 499.99999999999994，
+    # 而"这次实际存进去多少钱"要能原样显示给用户（两位小数）。
+    if already_full:
+        deposited = 0.0
+    else:
+        deposited = float(
+            (Decimal(str(new_current)) - Decimal(str(old_current))).quantize(
+                _CENT, rounding=ROUND_HALF_UP
+            )
+        )
+    goal = get_goal(user_id)
+    if goal is None:
+        # 提交之后、读取之前目标被删掉（并发删号）。宁可报错，也不返回缺字段的 dict。
+        raise ValueError("心愿目标不存在（可能已被删除），请刷新后重试")
+    return {"deposited": deposited, **goal}

@@ -2,6 +2,7 @@
 import base64
 import json
 import logging
+import math
 import os
 import re
 import tomllib
@@ -555,3 +556,185 @@ def extract_bill_from_image(image_bytes: bytes, mime_type: str, zhipu_api_key: s
         "confidence": round(confidence, 4),
         "raw": content,
     }
+
+
+# ============================================================================
+# 月度复盘（DeepSeek Chat，纯文本点评，无工具调用）
+# ----------------------------------------------------------------------------
+# 与 get_embedding / get_ai_response 的区别：这里不查知识库、不带 tools，
+# 只做「把 app.py 算好的月度统计交给模型，换回一段 100 字左右的点评」。
+# 所有面向用户的失败统一走 MonthReviewError(message)，message 是可直接展示的中文；
+# app.py 捕获后 st.warning/st.error 显示即可，不需要再看异常类型分支。
+# ⚠ 日志绝不记录 api_key：本文件只在 headers 里用它，任何 logger 调用都不带它。
+# ============================================================================
+
+# 系统提示词必须**逐字**保持（产品口径，改一个字点评风格就跑偏）。
+MONTH_REVIEW_SYSTEM_PROMPT = (
+    "你是一个懂大学生、说话幽默略带毒舌的理财学长。请根据我的账单，用 100 字左右点评我的本月消费。"
+    "如果超支了，请无情吐槽我（比如拿奶茶、外卖开刀）；如果省钱了，请狠狠夸我。不要废话，直接输出点评内容。"
+)
+
+DEEPSEEK_CHAT_URL = "https://api.deepseek.com/chat/completions"
+MONTH_REVIEW_MODEL = "deepseek-chat"
+
+
+class MonthReviewError(Exception):
+    """月度复盘失败。message 是面向用户的中文提示，可直接展示。"""
+
+    def __init__(self, message):
+        self.message = message
+        super().__init__(message)
+
+
+def _review_amount(value) -> float:
+    """把 stats 里的金额宽松转成 float（None / 坏值 / nan / inf → 0.0）。
+
+    为什么宽容而不是抛错：stats 由 app.py 汇总而来，某个键缺失/为 None 只说明
+    "这项没有数据"（例如本月没有收入），不该让整段复盘失败；而**总支出**这个
+    关键值另有一条硬校验（<= 0 直接 MonthReviewError），不会被这里悄悄放过。
+    """
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(amount):
+        return 0.0
+    return amount
+
+
+def _build_month_review_user_content(stats: dict) -> str:
+    """把 app.py 汇总的 stats 排成中文条目（金额一律两位小数）。"""
+    month = str(stats.get("month") or "本月")
+    total_expense = _review_amount(stats.get("total_expense"))
+    total_income = _review_amount(stats.get("total_income"))
+    balance = _review_amount(stats.get("balance"))
+    budget = _review_amount(stats.get("budget"))
+    over_budget = _coerce_bool(stats.get("over_budget"), default=False)
+    save_target = stats.get("save_target")
+
+    # 前三大消费商户：stats 里已按金额降序，这里再截前 3 条兜底；
+    # 结构不对的条目直接跳过（宁可少列一个，也不要 KeyError 把复盘搞挂）。
+    merchant_lines = []
+    top_merchants = stats.get("top_merchants") or []
+    if isinstance(top_merchants, (list, tuple)):
+        for item in top_merchants[:3]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip() or "未知商户"
+            merchant_lines.append(
+                f"  {len(merchant_lines) + 1}. {name} {_review_amount(item.get('amount')):.2f} 元"
+            )
+    if not merchant_lines:
+        merchant_lines.append("  无")
+
+    # 最高单笔：可能为 None（本月没有支出时 app.py 会给 None）。
+    max_single = stats.get("max_single")
+    if isinstance(max_single, dict) and max_single:
+        max_merchant = str(max_single.get("merchant") or "").strip() or "未知商户"
+        max_date = str(max_single.get("date") or "").strip() or "日期未知"
+        max_single_text = f"{max_merchant} / {_review_amount(max_single.get('amount')):.2f} 元 / {max_date}"
+    else:
+        max_single_text = "无"
+
+    if budget <= 0:
+        budget_text = "未设置"
+    else:
+        budget_text = f"{budget:.2f} 元"
+
+    # 存钱目标：None / 0 都按"未设置"处理（0 元目标对学生没有意义，页面也不会让填 0）。
+    target_amount = _review_amount(save_target)
+    save_target_text = "未设置" if target_amount <= 0 else f"{target_amount:.2f} 元"
+
+    lines = [
+        f"月份：{month}",
+        f"总支出：{total_expense:.2f} 元",
+        f"总收入：{total_income:.2f} 元",
+        f"结余：{balance:.2f} 元",
+        f"预算：{budget_text}",
+        f"是否超支：{'是' if over_budget else '否'}",
+        "前三大消费商户：",
+        *merchant_lines,
+        f"最高单笔：{max_single_text}",
+        f"存钱目标：{save_target_text}",
+    ]
+    return "这是我的本月消费数据，请按系统要求点评：\n" + "\n".join(lines)
+
+
+def generate_month_review(stats: dict, api_key: str) -> str:
+    """生成一段约 100 字的本月消费点评，返回去除首尾空白后的文本。
+
+    失败一律抛 MonthReviewError（中文 message，可直接上页面）：
+      · api_key 为空          → 未配置提示（且**不发请求**）；
+      · 总支出 <= 0           → "本月还没有消费记录"（且**不发请求**）；
+      · 超时 / 连接失败       → 对应中文提示；
+      · 非 200                → 带状态码的提示；
+      · 响应不是 JSON / 没有有效 content → "AI 没有返回有效点评"。
+    日志只记月份与字数，**绝不**记 api_key 或请求头。
+    """
+    # ① api_key：先查它，没有 key 时不该先花一次网络往返。
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise MonthReviewError("未配置 DEEPSEEK_API_KEY，AI 复盘暂不可用")
+    api_key = api_key.strip()
+
+    # ② 本月没有任何支出：让用户先记几笔，而不是让模型对着一堆 0 硬编点评。
+    #    stats.get 缺失/不是数字时 _review_amount 给 0.0，同样落到这条分支。
+    if not isinstance(stats, dict):
+        raise MonthReviewError("本月复盘数据不完整，请刷新后重试")
+    if _review_amount(stats.get("total_expense")) <= 0:
+        raise MonthReviewError("本月还没有消费记录，先记几笔再来复盘吧")
+
+    month = str(stats.get("month") or "本月")
+    user_content = _build_month_review_user_content(stats)
+    payload = {
+        "model": MONTH_REVIEW_MODEL,
+        "messages": [
+            {"role": "system", "content": MONTH_REVIEW_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        # temperature 0.9：点评要有"人味"，不宜太保守；max_tokens 400 足够 100 字 + 余量。
+        "temperature": 0.9,
+        "max_tokens": 400,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ③ 发请求：超时/连接失败翻译成用户能看懂的句子（不把异常对象漏到页面）。
+    try:
+        resp = requests.post(DEEPSEEK_CHAT_URL, headers=headers, json=payload, timeout=30)
+    except requests.Timeout:
+        logger.warning("月度复盘请求超时（月份=%s）", month)
+        raise MonthReviewError("生成点评超时，请稍后再试") from None
+    except requests.ConnectionError:
+        logger.warning("月度复盘请求连接失败（月份=%s）", month)
+        raise MonthReviewError("网络连接失败，请检查网络") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：对用户统一成网络问题；
+        # 日志只记异常类型（确保不把 headers / key 带出去）。
+        logger.warning("月度复盘请求失败（月份=%s，异常=%s）", month, type(exc).__name__)
+        raise MonthReviewError("网络连接失败，请检查网络") from None
+
+    # ④ 非 200：只带状态码，不把响应体拼进 message（响应体可能含请求回显）。
+    if resp.status_code != 200:
+        logger.warning("月度复盘接口返回 HTTP %s（月份=%s）", resp.status_code, month)
+        raise MonthReviewError(f"AI 服务返回异常（HTTP {resp.status_code}）")
+
+    # ⑤ 解析：非 JSON / 结构不符 / content 为空 → 同一条"没有有效点评"。
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("月度复盘响应不是合法 JSON（月份=%s）", month)
+        raise MonthReviewError("AI 没有返回有效点评，请重试") from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("月度复盘响应结构不符合预期（月份=%s）", month)
+        raise MonthReviewError("AI 没有返回有效点评，请重试") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("月度复盘响应 content 为空（月份=%s）", month)
+        raise MonthReviewError("AI 没有返回有效点评，请重试")
+
+    content = content.strip()
+    logger.info("月度复盘生成成功（月份=%s，字数=%d）", month, len(content))
+    return content

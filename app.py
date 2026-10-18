@@ -4,7 +4,7 @@ from streamlit_echarts import st_echarts
 from datetime import datetime, date, timedelta
 from config import get_deepseek_api_key
 from finance_math import compute_irr, payment_from_fee, debt_ratio
-from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, get_user_auth_state, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data, get_login_daily_stats, login_events_available, LoginThrottled
+from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, get_user_auth_state, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data, get_login_daily_stats, login_events_available, LoginThrottled, set_goal, get_goal, add_to_goal
 import requests
 import json
 import hashlib
@@ -74,6 +74,7 @@ def logout():
     st.session_state.pop("last_upload_sig", None)        # 换人登录后不能沿用上一个人的文件签名
     st.session_state.pop("last_screenshot_sig", None)     # 截图签名同理：换人后同一张图应能重新识别
     st.session_state.pop("flash", None)             # 上一个人的提示（可能含商户名）不能带给下一个人
+    st.session_state.pop("month_review", None)      # AI 复盘含本月消费明细，绝不能带给下一个登录的人
     st.session_state["page"] = 0
     st.session_state["chat_history"] = []           # 换人登录不应看到上一个人的 AI 聊天记录
     st.cache_data.clear()
@@ -641,6 +642,121 @@ with st.expander("算算分期有多贵？", expanded=False):
                         f"✅ 负债率 {ratio * 100:.1f}%，处于可承受范围（未超过 30% 警戒线）。"
                     )
 
+# ========== 我的心愿单 ==========
+with st.expander("🏺 我的心愿单", expanded=True):
+    try:
+        goal = get_goal(st.session_state.user_id)
+    except Exception as goal_exc:
+        # 数据层不可用（如 011 迁移未执行）：细节只进服务端日志，页面给黄色提示，不红屏
+        print(f"[goal] 读取心愿目标失败：{type(goal_exc).__name__}: {goal_exc}")
+        goal = None
+        goal_available = False
+    else:
+        goal_available = True
+
+    if not goal_available:
+        st.warning("心愿单功能暂不可用（请确认已执行 migrations/011）")
+    elif goal is None:
+        # 还没有目标：用表单一次性收集名称 / 金额 / 截止日期
+        st.caption("给未来的自己存点期待：先定一个小目标，存钱也会变得有点上头 ✨")
+        with st.form("goal_form"):
+            new_goal_name = st.text_input("心愿名称", max_chars=50, placeholder="换一台新手机")
+            new_goal_amount = st.number_input(
+                "目标金额（元）",
+                min_value=1.0,
+                value=1000.0,
+                step=100.0,
+                format="%.2f",
+            )
+            new_goal_date = st.date_input("目标日期（可选）", value=date.today() + timedelta(days=1))
+            goal_submit = st.form_submit_button("创建心愿目标")
+        if goal_submit:
+            goal_name_clean = (new_goal_name or "").strip()
+            if not goal_name_clean:
+                st.warning("先给心愿起个名字吧～")
+            else:
+                try:
+                    set_goal(
+                        st.session_state.user_id,
+                        goal_name_clean,
+                        float(new_goal_amount),
+                        new_goal_date.strftime("%Y-%m-%d") if new_goal_date else None,
+                    )
+                except ValueError as goal_err:
+                    st.error(str(goal_err))
+                except Exception as goal_err:
+                    print(f"[goal] 创建心愿目标失败：{type(goal_err).__name__}: {goal_err}")
+                    st.error("创建失败，请稍后再试")
+                else:
+                    # 成功提示走 flash：紧跟 rerun 的 st.success 会被吞掉
+                    st.session_state["flash"] = {"level": "success", "msg": "心愿目标已创建"}
+                    st.rerun()
+    else:
+        # 已有目标：名称是用户输入，只交给 st.subheader 渲染（纯文本，不拼 HTML）
+        st.subheader(str(goal.get("goal_name") or "未命名心愿"))
+        goal_progress = float(goal.get("progress") or 0)
+        st.progress(min(1.0, max(0.0, goal_progress)))
+        goal_current = float(goal.get("current_amount") or 0)
+        goal_target = float(goal.get("target_amount") or 0)
+        goal_remaining = float(goal.get("remaining") or 0)
+        metric_col1, metric_col2, metric_col3 = st.columns(3)
+        with metric_col1:
+            st.metric("已存", f"¥{goal_current:,.2f}")
+        with metric_col2:
+            st.metric("目标", f"¥{goal_target:,.2f}")
+        with metric_col3:
+            st.metric("还差", f"¥{goal_remaining:,.2f}")
+        goal_target_date = goal.get("target_date")
+        if goal_target_date:
+            st.caption(f"目标日期：{goal_target_date}")
+        if goal.get("reached"):
+            st.success("🎉 心愿达成！你太自律了，给自己一点掌声")
+
+        st.divider()
+        deposit_col, month_balance_col = st.columns(2)
+        with deposit_col:
+            deposit_amount = st.number_input(
+                "存入金额（元）",
+                min_value=1.0,
+                value=50.0,
+                step=10.0,
+                format="%.2f",
+            )
+            deposit_clicked = st.button("存入心愿", key="goal_deposit_btn")
+        with month_balance_col:
+            can_save_balance = float(month_balance) > 0
+            balance_clicked = st.button(
+                "把本月结余存进去",
+                key="goal_balance_btn",
+                disabled=not can_save_balance,
+            )
+            if not can_save_balance:
+                st.caption("本月没有结余")
+
+        if deposit_clicked or balance_clicked:
+            deposit_value = float(deposit_amount) if deposit_clicked else float(month_balance)
+            if deposit_value <= 0:
+                st.info("本月没有结余，等有结余再来存一笔吧")
+            else:
+                try:
+                    deposit_result = add_to_goal(st.session_state.user_id, deposit_value)
+                except ValueError as deposit_err:
+                    st.error(str(deposit_err))
+                except RuntimeError as deposit_err:
+                    st.error(str(deposit_err))
+                except Exception as deposit_err:
+                    print(f"[goal] 存入心愿失败：{type(deposit_err).__name__}: {deposit_err}")
+                    st.error("存入失败，请稍后再试")
+                else:
+                    after_progress = 0.0
+                    if isinstance(deposit_result, dict):
+                        after_progress = float(deposit_result.get("progress") or 0)
+                    st.session_state["flash"] = {
+                        "level": "success",
+                        "msg": f"已存入 ¥{deposit_value:.2f}，心愿进度 {after_progress * 100:.0f}%",
+                    }
+                    st.rerun()
+
 # Metric cards
 st.subheader("收支概览")
 col1, col2 = st.columns(2)
@@ -722,6 +838,86 @@ with chart_col2:
 
 # AI Chat
 st.subheader("AI 金融导师")
+
+# ========== AI 月度消费复盘 ==========
+# 放在聊天历史之前：按钮 + 结果块独立渲染，rerun 后仍能看到上一次的复盘
+month_review_clicked = st.button("🧾 一键生成本月消费复盘", key="month_review_btn")
+if month_review_clicked:
+    if st.session_state.ai_daily_count >= 20:
+        st.warning("今日免费额度已用完，请明天再来")
+    else:
+        # 组装本月支出统计：Top3 商户 + 单笔最高，空数据时保持 [] / None
+        month_expense_df = df_current_month[df_current_month["type"] == "支出"]
+        top_merchants = []
+        max_single = None
+        try:
+            if not month_expense_df.empty:
+                merchant_totals = (
+                    month_expense_df.groupby("merchant")["amount"]
+                    .sum()
+                    .sort_values(ascending=False)
+                    .head(3)
+                )
+                top_merchants = [
+                    {"name": str(name), "amount": float(amount)}
+                    for name, amount in merchant_totals.items()
+                ]
+                max_row = month_expense_df.loc[month_expense_df["amount"].idxmax()]
+                max_single = {
+                    "merchant": str(max_row["merchant"]),
+                    "amount": float(max_row["amount"]),
+                    "date": str(max_row["date"]),
+                }
+        except Exception as stats_exc:
+            # 统计组装失败不该阻断复盘：退化为不带明细的复盘
+            print(f"[month_review] 统计组装失败：{type(stats_exc).__name__}: {stats_exc}")
+            top_merchants, max_single = [], None
+
+        review_stats = {
+            "month": current_month_str,
+            "total_expense": float(total_expense),
+            "total_income": float(total_income),
+            "balance": float(balance),
+            "budget": float(budget),
+            "over_budget": bool(month_expense > budget),
+            "top_merchants": top_merchants,
+            "max_single": max_single,
+            "save_target": float(st.session_state.save_target),
+        }
+
+        # 调用前计一次额度：失败也算一次，避免反复点按钮刷额度
+        st.session_state.ai_daily_count += 1
+        try:
+            from ai_agent import generate_month_review, MonthReviewError
+        except ImportError as import_exc:
+            print(f"[month_review] 复盘模块不可用：{type(import_exc).__name__}: {import_exc}")
+            st.error("复盘生成失败，请稍后再试")
+        else:
+            try:
+                review_text = generate_month_review(review_stats, get_deepseek_api_key())
+            except MonthReviewError as review_err:
+                st.error(str(review_err))
+            except ValueError as review_err:
+                st.warning(str(review_err))
+            except Exception as review_err:
+                print(f"[month_review] 生成失败：{type(review_err).__name__}: {review_err}")
+                st.error("复盘生成失败，请稍后再试")
+            else:
+                # 不 rerun：结果存 session_state 就地在下方渲染，rerun 后也能继续展示
+                st.session_state["month_review"] = {
+                    "month": current_month_str,
+                    "text": review_text,
+                    "over_budget": bool(review_stats["over_budget"]),
+                }
+
+saved_month_review = st.session_state.get("month_review")
+if saved_month_review and saved_month_review.get("month") == current_month_str:
+    st.caption(f"📅 {saved_month_review['month']} 消费复盘 · 由 AI 生成，仅供参考")
+    if saved_month_review.get("over_budget"):
+        st.info(saved_month_review["text"])
+    else:
+        st.success(saved_month_review["text"])
+
 if len(st.session_state.chat_history) == 0:
     st.session_state.chat_history.append({"role": "assistant", "content": "你好！我是明白账AI财务管家，可以帮你分析账单，也可以直接帮你记账，有什么想问我的吗？"})
 
