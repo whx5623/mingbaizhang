@@ -10,9 +10,10 @@ except ImportError as _health_import_exc:
     compute_health_score = None
     print(f"[health] 健康分模块不可用：{type(_health_import_exc).__name__}: {_health_import_exc}")
 from finance_math import compute_irr, payment_from_fee, debt_ratio
-from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, get_user_auth_state, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data, get_login_daily_stats, login_events_available, LoginThrottled, set_goal, get_goal, add_to_goal
+from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, get_user_auth_state, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data, get_login_daily_stats, login_events_available, LoginThrottled, set_goal, get_goal, add_to_goal, get_budget_details, save_budget_details, generate_smart_budget
 import requests
 import json
+import math
 import hashlib
 import os
 import tomllib
@@ -607,6 +608,55 @@ with tab_dash:
         with col_b:
             st.metric("当前结余", f"{balance:.2f}")
 
+    # ===== 本月预算进度（细分预算来自 Tab2「AI 智能预算」的采纳结果）=====
+    # 未设置 / 015 未执行 / 读库异常：一律不显示该区块，页面上不会出现空标题。
+    try:
+        _budget_details = get_budget_details(st.session_state.user_id)
+    except Exception as _budget_exc:
+        # 静默降级：预算进度只是锦上添花，绝不能影响下方账单明细 / 图表 / 导出
+        print(f"[budget] 读取细分预算失败：{type(_budget_exc).__name__}: {_budget_exc}")
+        _budget_details = {}
+    if isinstance(_budget_details, dict) and _budget_details:
+        st.subheader("🎯 本月预算进度")
+        # 本月各分类实际支出（category 列在迁移 012 后才存在，缺列时全部按 0 算）
+        _spent_by_category = {}
+        if "category" in df_current_month.columns:
+            _spent_df = df_current_month[df_current_month["type"] == "支出"].copy()
+            if not _spent_df.empty:
+                _spent_cat = _spent_df["category"].fillna("其他").astype(str).str.strip()
+                _spent_df = _spent_df.assign(
+                    _category=_spent_cat.where(_spent_cat != "", "其他")
+                )
+                _spent_by_category = {
+                    str(_cat): float(_amt)
+                    for _cat, _amt in _spent_df.groupby("_category")["amount"].sum().items()
+                }
+        # 预算金额统一转 float；脏值（非数字 / NaN / 非正数）直接跳过，一条坏数据不拖垮整块
+        _budget_items = []
+        for _cat, _amount in _budget_details.items():
+            try:
+                _budget_value = float(_amount)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(_budget_value) or _budget_value <= 0:
+                continue
+            _cat_name = str(_cat).strip()
+            if not _cat_name:
+                continue
+            _budget_items.append((_cat_name, _budget_value))
+        _budget_items.sort(key=lambda _item: _item[1], reverse=True)
+        for _cat_name, _budget_value in _budget_items:
+            _spent = float(_spent_by_category.get(_cat_name, 0.0))
+            _ratio = _spent / _budget_value
+            st.progress(min(1.0, max(0.0, _ratio)))
+            _progress_text = f"{_cat_name}：已花 ¥{_spent:.2f} / ¥{_budget_value:.2f}"
+            if _ratio > 1:
+                _progress_text += f" · ⚠️ 已超支 ¥{_spent - _budget_value:.2f}"
+            st.caption(_progress_text)
+            if _ratio > 1:
+                # 只给一条红色文字提示，不把整块渲染成 error（会影响下方其它内容）
+                st.caption(f":red[⚠️ {_cat_name} 已超出预算，建议控制该类支出]")
+
     # Bill table with pagination
     st.subheader("账单明细")
     total_count = get_total_bill_count(st.session_state.user_id)
@@ -1048,6 +1098,162 @@ with tab_tools:
                             "msg": f"已存入 ¥{deposit_value:.2f}，心愿进度 {after_progress * 100:.0f}%",
                         }
                         st.rerun()
+
+    # ---- AI 智能预算（放在心愿单之后）----
+    with st.container(border=True):
+        st.subheader("🤖 AI 智能预算")
+        try:
+            _budget_details = get_budget_details(st.session_state.user_id)
+        except RuntimeError as _budget_exc:
+            # 015 未执行：这是已知的“功能未启用”，给黄色提示，不红屏
+            print(f"[budget] 读取细分预算失败：{type(_budget_exc).__name__}: {_budget_exc}")
+            st.warning("智能预算功能未启用（请确认已执行 migrations/015）")
+        except Exception as _budget_exc:
+            print(f"[budget] 读取细分预算失败：{type(_budget_exc).__name__}: {_budget_exc}")
+            st.error("智能预算暂时不可用，请稍后再试")
+        else:
+            # 已有细分预算：展示表格 + 合计；契约不支持清空，只提供“重新生成”
+            _existing_items = {}
+            if isinstance(_budget_details, dict):
+                for _cat, _amount in _budget_details.items():
+                    try:
+                        _value = float(_amount)
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(_value) or _value <= 0:
+                        continue
+                    _cat_name = str(_cat).strip()
+                    if not _cat_name:
+                        continue
+                    _existing_items[_cat_name] = _value
+
+            if _existing_items:
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {"类别": _cat, "预算金额": f"¥{_value:.2f}"}
+                            for _cat, _value in _existing_items.items()
+                        ]
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.caption(
+                    f"本月总预算 {st.session_state.monthly_budget:.0f} 元，"
+                    f"细分合计 {sum(_existing_items.values()):.0f} 元"
+                )
+                _budget_clicked = st.button("重新生成预算", key="budget_regen_btn")
+            else:
+                st.caption("让 AI 参考你上个月的账单，给出本月的分类预算建议")
+                _budget_clicked = st.button(
+                    "根据上月账单，让 AI 帮我做预算", key="budget_gen_btn"
+                )
+
+            if _budget_clicked:
+                if st.session_state.ai_daily_count >= 20:
+                    st.warning("今日免费额度已用完，请明天再来")
+                else:
+                    # 延迟导入：不在 app 启动时就拉起 ai_agent 的 Supabase 依赖
+                    try:
+                        from ai_agent import BudgetPlanError
+                    except Exception as _ai_import_exc:
+                        print(
+                            f"[budget] AI 预算模块不可用：{type(_ai_import_exc).__name__}: {_ai_import_exc}"
+                        )
+
+                        class BudgetPlanError(Exception):
+                            """降级占位：ai_agent 不可用时仅用于异常归口。"""
+
+                    with st.spinner("AI 正在为你规划本月预算…"):
+                        try:
+                            _plan_result = generate_smart_budget(
+                                st.session_state.user_id,
+                                float(st.session_state.monthly_budget),
+                            )
+                        except ValueError as _plan_exc:
+                            # 业务前置条件不满足（如上个月还没有账单）：蓝色提示，不消耗额度
+                            st.info(str(_plan_exc))
+                        except BudgetPlanError as _plan_exc:
+                            st.error(str(_plan_exc))
+                        except RuntimeError as _plan_exc:
+                            st.error(str(_plan_exc))
+                        except Exception as _plan_exc:
+                            # 其它异常可能含实现细节，只进服务端日志，页面给通用文案
+                            if type(_plan_exc).__name__ == "BudgetPlanError":
+                                st.error(str(_plan_exc))
+                            else:
+                                print(
+                                    f"[budget] AI 预算生成失败：{type(_plan_exc).__name__}: {_plan_exc}"
+                                )
+                                st.error("AI 预算生成失败，请稍后再试")
+                        else:
+                            st.session_state.ai_daily_count += 1
+                            # 不 rerun：就地渲染下方方案，避免闪一下空白
+                            st.session_state["budget_plan"] = _plan_result
+
+            # 方案跨 rerun 显示：source_month 与「上个月」不一致时视为过期，直接丢弃
+            _plan = st.session_state.get("budget_plan")
+            _last_month_str = (date.today().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+            if isinstance(_plan, dict):
+                _plan_source_month = str(_plan.get("source_month") or "")
+                if _plan_source_month and _plan_source_month != _last_month_str:
+                    st.session_state.pop("budget_plan", None)
+                    _plan = None
+
+            if isinstance(_plan, dict) and isinstance(_plan.get("items"), dict) and _plan["items"]:
+                _plan_rows = []
+                for _cat, _amount in _plan["items"].items():
+                    try:
+                        _value = float(_amount)
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(_value) or _value <= 0:
+                        continue
+                    _cat_name = str(_cat).strip()
+                    if not _cat_name:
+                        continue
+                    _plan_rows.append({"类别": _cat_name, "预算金额": f"¥{_value:.2f}"})
+                if _plan_rows:
+                    st.dataframe(
+                        pd.DataFrame(_plan_rows),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    try:
+                        _plan_total = float(
+                            _plan.get("total") or sum(float(v) for v in _plan["items"].values())
+                        )
+                    except (TypeError, ValueError):
+                        _plan_total = sum(
+                            float(row["预算金额"].lstrip("¥")) for row in _plan_rows
+                        )
+                    try:
+                        _plan_total_budget = float(
+                            _plan.get("total_budget") or st.session_state.monthly_budget
+                        )
+                    except (TypeError, ValueError):
+                        _plan_total_budget = float(st.session_state.monthly_budget)
+                    st.caption(
+                        f"参考 {_plan.get('source_month') or '上月'} 账单 · "
+                        f"合计 ¥{_plan_total:.2f} / 总预算 ¥{_plan_total_budget:.2f}"
+                    )
+                    if _plan.get("scaled"):
+                        st.info("已按总预算等比压缩")
+                    if st.button("采纳此预算", key="budget_adopt_btn"):
+                        try:
+                            save_budget_details(st.session_state.user_id, _plan["items"])
+                        except Exception as _save_exc:
+                            print(
+                                f"[budget] 采纳预算失败：{type(_save_exc).__name__}: {_save_exc}"
+                            )
+                            st.error("保存预算失败，请稍后再试")
+                        else:
+                            st.session_state["flash"] = {
+                                "level": "success",
+                                "msg": "预算已采纳，可在财务看板查看进度",
+                            }
+                            st.session_state.pop("budget_plan", None)
+                            st.rerun()
 
 with tab_ai:
     # AI Chat

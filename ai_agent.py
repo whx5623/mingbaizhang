@@ -1157,3 +1157,235 @@ def generate_evening_comment(stats: dict, api_key: str) -> str:
         content = content[:EVENING_COMMENT_MAX_CHARS] + "…"
     logger.info("晚间点评生成成功（字数=%d）", len(content))
     return content
+
+
+# ============================================================================
+# AI 智能预算（DeepSeek Chat，输出严格 JSON：类别 → 预算金额）
+# ----------------------------------------------------------------------------
+# 输入是 app.py 汇总的上月消费分类，输出是本月各类别的建议预算。
+# 与其它 AI 能力的区别：结果是**可程序消费的 JSON**，所以解析/校验都比点评严格：
+#   · 先整体 json.loads，失败再抠 ```json 代码块，仍失败统一报“不是合法 JSON”；
+#   · 类别必须是非空字符串；金额必须是正有限数（"800" 这类数字字符串可转）；
+#   · 模型给多了（合计 > 总预算）不让用户背锅：按比例缩放到总预算，末项吸收误差；
+#   · 返回 {类别: float}，不含 total —— 元数据由 db.generate_smart_budget 组装。
+# 所有面向用户的失败统一走 BudgetPlanError(message)，message 是可直接展示的中文。
+# ⚠ 日志绝不记录 api_key：本文件只在 headers 里用它，任何 logger 调用都不带它。
+# ============================================================================
+
+# 系统提示词必须**逐字**保持（产品口径，改一个字输出格式就可能跑偏）。
+BUDGET_PLAN_SYSTEM_PROMPT = (
+    "你是一个贴心的理财学长，请根据我上个月的消费分类，帮我制定本月各项（餐饮、购物、娱乐、学习等）"
+    "的具体预算金额，总和不能超过我设定的总预算。只输出 JSON，格式为 "
+    '{"餐饮": 800, "购物": 300, "其他": 400}，不要输出 JSON 之外的任何文字。'
+)
+
+BUDGET_PLAN_MODEL = "deepseek-chat"
+BUDGET_PLAN_TEMPERATURE = 0.3
+BUDGET_PLAN_MAX_TOKENS = 300
+BUDGET_PLAN_TIMEOUT = 25
+
+
+class BudgetPlanError(Exception):
+    """AI 预算方案失败。message 是面向用户的中文提示，可直接展示。"""
+
+    def __init__(self, message):
+        self.message = message
+        super().__init__(message)
+
+
+def _normalize_total_budget(total_budget) -> float:
+    """把总预算转成正的有限 float；非法（≤0 / NaN / 非数字）抛 BudgetPlanError。"""
+    try:
+        value = float(total_budget)
+    except (TypeError, ValueError):
+        raise BudgetPlanError("总预算必须是大于 0 的数字") from None
+    if not math.isfinite(value) or value <= 0:
+        raise BudgetPlanError("总预算必须是大于 0 的数字")
+    return value
+
+
+def _build_budget_plan_user_content(stats: dict, total_budget: float) -> str:
+    """把上月统计排成 user 消息：月份、总支出、各类别金额与占比、本月总预算上限。"""
+    month = str(stats.get("month") or "上月")
+    total = _review_amount(stats.get("total"))
+
+    # 分类金额按降序排列，占比基于上月总支出；脏值/非正数直接跳过（不影响其余类别）。
+    parsed = []
+    categories = stats.get("category_totals")
+    if isinstance(categories, dict):
+        for name, amount in categories.items():
+            cat_name = str(name).strip()
+            if not cat_name:
+                continue
+            value = _review_amount(amount)
+            if value <= 0:
+                continue
+            parsed.append((cat_name, value))
+    parsed.sort(key=lambda item: item[1], reverse=True)
+
+    category_lines = []
+    for cat_name, value in parsed:
+        share = value / total * 100 if total > 0 else 0.0
+        category_lines.append(f"  - {cat_name}：{value:.2f} 元（占比 {share:.1f}%）")
+    if not category_lines:
+        category_lines.append("  - 无分类数据")
+
+    return (
+        f"上月月份：{month}\n"
+        f"上月总支出：{total:.2f} 元\n"
+        "上月各消费类别金额与占比：\n"
+        + "\n".join(category_lines)
+        + f"\n本月总预算上限：{total_budget:.2f} 元\n"
+        "请按系统要求只输出 JSON。"
+    )
+
+
+def _parse_budget_plan_json(content: str) -> dict:
+    """解析模型返回的预算 JSON：整体 json.loads → ```json 代码块 → 统一报错。"""
+    text = content.strip()
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        fenced = re.search(
+            r"```(?:json)?\s*(.+?)```", text, flags=re.IGNORECASE | re.DOTALL
+        )
+        if not fenced:
+            raise BudgetPlanError("AI 返回的预算不是合法 JSON，请重试") from None
+        try:
+            data = json.loads(fenced.group(1).strip())
+        except (ValueError, TypeError):
+            raise BudgetPlanError("AI 返回的预算不是合法 JSON，请重试") from None
+
+    if not isinstance(data, dict) or not data:
+        raise BudgetPlanError("AI 没有返回有效的预算分类，请重试")
+
+    items = {}
+    for raw_name, raw_amount in data.items():
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise BudgetPlanError("AI 返回的预算类别不合法，请重试")
+        cat_name = raw_name.strip()
+        # 允许 "800" 这类数字字符串；bool 是 int 子类，单独排除，避免 True → 1.0。
+        if isinstance(raw_amount, bool):
+            raise BudgetPlanError("AI 返回的预算金额不合法，请重试")
+        try:
+            amount = float(raw_amount)
+        except (TypeError, ValueError):
+            raise BudgetPlanError("AI 返回的预算金额不合法，请重试") from None
+        if not math.isfinite(amount) or amount <= 0:
+            raise BudgetPlanError("AI 返回的预算金额不合法，请重试")
+        items[cat_name] = amount
+
+    return items
+
+
+def _scale_budget_items(items: dict, total_budget: float) -> dict:
+    """合计超预算时按比例缩放到总预算（两位小数，末项吸收四舍五入误差）。"""
+    total = sum(items.values())
+    if total <= total_budget:
+        return {name: float(value) for name, value in items.items()}
+
+    factor = total_budget / total
+    names = list(items)
+    scaled = {}
+    running = 0.0
+    for index, name in enumerate(names):
+        if index == len(names) - 1:
+            # 末项 = 预算 - 已分配，保证合计精确等于预算（不会因逐项四舍五入多出 1 分）。
+            amount = round(max(0.0, total_budget - running), 2)
+        else:
+            amount = round(items[name] * factor, 2)
+            running = round(running + amount, 2)
+        scaled[name] = float(amount)
+    return scaled
+
+
+def generate_budget_plan(stats: dict, total_budget: float, api_key: str) -> dict:
+    """根据上月消费分类生成本月分类预算，返回 {类别: float}（不含 total）。
+
+    失败一律抛 BudgetPlanError（中文 message，可直接上页面）：
+      · api_key 为空                → 未配置提示（且**不发请求**）；
+      · 总预算 ≤ 0 / NaN / 非数字    → "总预算必须是大于 0 的数字"（且**不发请求**）；
+      · 超时 / 连接失败              → 对应中文提示；
+      · 非 200                       → 带状态码的提示；
+      · 响应不是 JSON / 没有 content → "AI 没有返回有效预算"；
+      · 模型输出不是合法 JSON        → "AI 返回的预算不是合法 JSON，请重试"。
+    合计超过总预算时按比例缩放（保留 2 位，末项吸收误差）。
+    日志只记月份与类别数，**绝不**记 api_key 或请求头。
+    """
+    # ① api_key：先查它，没有 key 时不该先花一次网络往返。
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise BudgetPlanError("未配置 DEEPSEEK_API_KEY，AI 智能预算暂不可用")
+    api_key = api_key.strip()
+
+    # ② 总预算：非法值不发请求，直接给用户一句可操作的提示。
+    budget = _normalize_total_budget(total_budget)
+
+    if not isinstance(stats, dict):
+        raise BudgetPlanError("预算数据不完整，请刷新后重试")
+    month = str(stats.get("month") or "上月")
+    user_content = _build_budget_plan_user_content(stats, budget)
+    payload = {
+        "model": BUDGET_PLAN_MODEL,
+        "messages": [
+            {"role": "system", "content": BUDGET_PLAN_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        # temperature 0.3：预算要稳定、可复现；max_tokens 300 足够十来个类别。
+        "temperature": BUDGET_PLAN_TEMPERATURE,
+        "max_tokens": BUDGET_PLAN_MAX_TOKENS,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ③ 发请求：超时/连接失败翻译成用户能看懂的句子（不把异常对象漏到页面）。
+    try:
+        resp = requests.post(
+            DEEPSEEK_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=BUDGET_PLAN_TIMEOUT,
+        )
+    except requests.Timeout:
+        logger.warning("AI 预算请求超时（月份=%s）", month)
+        raise BudgetPlanError("生成预算超时，请稍后再试") from None
+    except requests.ConnectionError:
+        logger.warning("AI 预算请求连接失败（月份=%s）", month)
+        raise BudgetPlanError("网络连接失败，请检查网络") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：日志只记异常类型（确保不把 headers / key 带出去）。
+        logger.warning("AI 预算请求失败（月份=%s，异常=%s）", month, type(exc).__name__)
+        raise BudgetPlanError("网络连接失败，请检查网络") from None
+
+    # ④ 非 200：只带状态码，不把响应体拼进 message（响应体可能含请求回显）。
+    if resp.status_code != 200:
+        logger.warning("AI 预算接口返回 HTTP %s（月份=%s）", resp.status_code, month)
+        raise BudgetPlanError(f"AI 服务返回异常（HTTP {resp.status_code}）")
+
+    # ⑤ 解析：非 JSON / 结构不符 / content 为空 → 同一条"没有有效预算"。
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("AI 预算响应不是合法 JSON（月份=%s）", month)
+        raise BudgetPlanError("AI 没有返回有效预算，请重试") from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("AI 预算响应结构不符合预期（月份=%s）", month)
+        raise BudgetPlanError("AI 没有返回有效预算，请重试") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("AI 预算响应 content 为空（月份=%s）", month)
+        raise BudgetPlanError("AI 没有返回有效预算，请重试")
+
+    # ⑥ 严格解析 + 校验 + 超预算缩放。
+    items = _parse_budget_plan_json(content)
+    scaled = sum(items.values()) > budget
+    plan = _scale_budget_items(items, budget)
+    logger.info(
+        "AI 预算生成成功（月份=%s，类别数=%d，缩放=%s）",
+        month,
+        len(plan),
+        "是" if scaled else "否",
+    )
+    return plan

@@ -2528,3 +2528,521 @@ def notification_already_sent(user_id, sent_date, channel="webhook") -> bool:
             conn.rollback()
             raise
     return bool(exists)
+
+
+# ---------------------------------------------------------------------------
+# 智能预算（users.budget_details，迁移 015）
+# ---------------------------------------------------------------------------
+# 这组函数服务于「让 AI 按上月真实消费结构分配本月总预算」：
+#   · get_budget_details / save_budget_details 读写 users.budget_details（JSONB 小对象，
+#     {分类: 金额}）。列不存在（015 未执行）→ **RuntimeError + 中文提示**，
+#     绝不静默返回 {} / 假装保存成功 —— 「功能没启用」与「用户没设置过」必须能区分；
+#   · get_month_category_totals 只读 bills，**不依赖 015**：015 没执行也能统计分类支出，
+#     它是 generate_smart_budget 的输入；
+#   · generate_smart_budget 懒加载 ai_agent.generate_budget_plan（函数内 import，
+#     避免 db ↔ ai_agent 的循环依赖）。AI 失败时：BudgetPlanError 原样上抛（保留类型，
+#     前端能按类型显示它自己的中文文案），其它异常包装成 RuntimeError（中文，
+#     **不带 API key、不带原始请求内容**），页面只看到一句可读提示。
+#
+# 口径：
+#   · budget_details 的 key 是分类名，value 是**金额**（float，两位小数）；
+#   · 写入侧**不校验各项之和 == 总预算**：总和由调用方 / AI 层约束（用户可能只想
+#     先分配一部分），这里只校验每个值本身合法；
+#   · NULL = 未设置（不是 {}）；015 的 CHECK 保证非 NULL 时一定是 JSON object；
+#   · 金额统一用 Decimal 定量到两位小数（与 003 的 NUMERIC(12,2)、_CENT 同口径），
+#     避免二进制浮点把 0.1 + 0.2 写成 0.30000000000000004 再落库。
+# ---------------------------------------------------------------------------
+
+BUDGET_DETAILS_MISSING_MESSAGE = (
+    "智能预算功能未启用：请先执行 migrations/015_users_budget_details.sql"
+)
+
+# 与 015 的列 / 约束语义配套的应用层校验口径。
+BUDGET_KEY_MAX_LEN = 20        # 分类名 strip 后 1~20 个字符
+BUDGET_MAX_CATEGORIES = 20     # 一个用户最多 20 个预算分类
+BUDGET_DETAILS_MAX_AMOUNT = MAX_ABS_AMOUNT  # 9999999999.99，与 NUMERIC(12,2) 上界同口径
+
+BUDGET_EMPTY_BILLS_MESSAGE = "上个月还没有账单，先记几笔再让 AI 做预算吧"
+BUDGET_EMPTY_PLAN_MESSAGE = "AI 没有给出有效的预算方案，请重试"
+
+
+def _normalize_budget_user_id(user_id) -> int:
+    """user_id 必须是正整数；非法输入在**开连接之前**就抛 ValueError。
+
+    规则与 _normalize_notification_user_id 相同（与具体表无关），这里独立实现
+    而不是复用：015 的读写不该依赖 014 的函数命名，将来删改 014 也不会牵连预算。
+    只接受 int / 十进制字符串：float / Decimal 即使值是 1.0 也拒绝 ——
+    ``int(1.9)`` 会静默截断成 1，把 "写错用户" 伪装成 "写对用户" 比直接报错更危险。
+    """
+    if isinstance(user_id, bool) or not isinstance(user_id, (int, str)):
+        raise ValueError(f"user_id 必须是正整数：{user_id!r}")
+    try:
+        uid = int(user_id.strip()) if isinstance(user_id, str) else int(user_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"user_id 必须是正整数：{user_id!r}") from exc
+    if uid <= 0:
+        raise ValueError(f"user_id 必须是正整数：{user_id!r}")
+    return uid
+
+
+def _is_budget_storage_missing(exc) -> bool:
+    """42703 = undefined_column（budget_details 不存在）、42P01 = undefined_table。
+
+    42P01 只会在 users 表整个不见了（库 / 连接串指错）时出现；两者都翻译成同一条
+    "先执行 015" 的提示，避免把 psycopg2 栈丢到页面上。
+    """
+    return _pg_sqlstate(exc) in ("42703", "42P01")
+
+
+def _raise_budget_column_missing(exc):
+    """把 42703 / 42P01 统一翻译成 RuntimeError（带中文可操作提示），保留原始异常链。"""
+    raise RuntimeError(BUDGET_DETAILS_MISSING_MESSAGE) from exc
+
+
+def _normalize_budget_amount(category: str, value) -> float:
+    """单个分类的预算金额：有限、> 0、≤ 9999999999.99；返回两位小数的 float。
+
+    顺序是 "先定量、再判正、最后判上界"（与 _normalize_goal_amount 一致）：
+    0.004 会被定量成 0.00 → 判正时被拒；9999999999.995 会定量成 10000000000.00
+    → 必须在上界判断之前定量才拦得住。
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"分类「{category}」的预算金额非法：{value!r}（不是数字）")
+    try:
+        num = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"分类「{category}」的预算金额非法：{value!r}（不是数字）"
+        ) from exc
+    if not math.isfinite(num):
+        raise ValueError(
+            f"分类「{category}」的预算金额非法：{value!r}（必须是有限数字，不允许 nan/inf）"
+        )
+    try:
+        num = float(Decimal(str(num)).quantize(_CENT, rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(
+            f"分类「{category}」的预算金额超出上限 {BUDGET_DETAILS_MAX_AMOUNT}"
+        ) from exc
+    if num <= 0:
+        raise ValueError(f"分类「{category}」的预算金额必须大于 0")
+    if num > BUDGET_DETAILS_MAX_AMOUNT:
+        raise ValueError(f"分类「{category}」的预算金额超出上限 {BUDGET_DETAILS_MAX_AMOUNT}")
+    return num
+
+
+def _normalize_budget_details(details) -> dict[str, float]:
+    """校验并归一化 save_budget_details 的入参，**全部在开连接之前完成**。
+
+    规则：
+      · 必须是 dict 且非空（"清空预算" 是显式删除操作，不是传 {}）；
+      · key 必须是字符串，strip 后 1~20 个字符（中文 / 字母均可）；
+      · value 必须是有限数、> 0、≤ 9999999999.99，定量到两位小数；
+      · 分类数 ≤ 20；
+      · **不校验总和**：总和由调用方 / AI 层约束。
+
+    strip 后重名（"餐饮" 与 " 餐饮 "）直接报错，而不是让后写覆盖前写：
+    那样用户会得到 "少了一个分类" 却毫无提示的结果。
+    """
+    if not isinstance(details, dict):
+        raise ValueError("预算明细必须是字典（{分类: 金额}）")
+    if not details:
+        raise ValueError("预算明细不能为空")
+    if len(details) > BUDGET_MAX_CATEGORIES:
+        raise ValueError(f"预算分类最多 {BUDGET_MAX_CATEGORIES} 个")
+    normalized: dict[str, float] = {}
+    for raw_key, raw_value in details.items():
+        if not isinstance(raw_key, str):
+            raise ValueError(f"预算分类名必须是字符串：{raw_key!r}")
+        key = raw_key.strip()
+        if not 1 <= len(key) <= BUDGET_KEY_MAX_LEN:
+            raise ValueError(
+                f"预算分类名必须是 1~{BUDGET_KEY_MAX_LEN} 个字符：{raw_key!r}"
+            )
+        if key in normalized:
+            raise ValueError(f"预算分类名重复（strip 后都是「{key}」）：{raw_key!r}")
+        normalized[key] = _normalize_budget_amount(key, raw_value)
+    return normalized
+
+
+def _normalize_budget_total(total_budget) -> float:
+    """总预算：有限、> 0；定量到两位小数后仍须 > 0（0.001 会被定量成 0.00 而被拒）。"""
+    if isinstance(total_budget, bool):
+        raise ValueError(f"总预算非法：{total_budget!r}（不是数字）")
+    try:
+        num = float(total_budget)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"总预算非法：{total_budget!r}（不是数字）") from exc
+    if not math.isfinite(num):
+        raise ValueError(f"总预算非法：{total_budget!r}（必须是有限数字，不允许 nan/inf）")
+    try:
+        num = float(Decimal(str(num)).quantize(_CENT, rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"总预算超出可计算范围：{total_budget!r}") from exc
+    if num <= 0:
+        raise ValueError(f"总预算必须大于 0：{total_budget!r}")
+    return num
+
+
+def _previous_month(today: date | None = None) -> str:
+    """返回上一个自然月的 "YYYY-MM"（UTC+8 口径，与 _report_today 同一时钟）。
+
+    用 date 计算而不是减 30 天：3 月 1 日减 30 天会落到 2 月，而各月天数不固定；
+    12 月还要跨年。"本月 1 日 - 1 天" 永远是上个月最后一天，没有闰年 / 月长分支。
+    例：2026-10-18 → "2026-09"；2026-01-05 → "2025-12"。
+    """
+    current = today or _report_today()
+    first_of_month = current.replace(day=1)
+    return (first_of_month - timedelta(days=1)).strftime("%Y-%m")
+
+
+def _normalize_ai_budget_plan(raw_plan) -> dict[str, float]:
+    """把 AI 返回的 {分类: 金额} 收敛成合法预算：未知分类丢弃、非法值丢弃、定量两位小数。
+
+    · key 不在 BILL_CATEGORIES 内 → 丢弃 + warning（AI 偶尔会自造 "房租" 之类，
+      页面下拉里没有这个分类，存进去也无法展示 / 编辑）；
+    · value 不是有限数 / <= 0 → 丢弃 + warning；
+    · 非字典（AI 回了字符串 / 数组）→ 返回 {}，由调用方统一报 "没有有效方案"；
+    · 同一 key 重复（strip 后）→ 金额合并（AI 的 JSON 理论上不会有重复键，
+      但这里不假设它守规矩）。
+    """
+    log = logging.getLogger(__name__)
+    if not isinstance(raw_plan, dict):
+        log.warning(
+            "[db] AI 预算方案不是 dict（%s），按空方案处理", type(raw_plan).__name__
+        )
+        return {}
+    allowed = set(BILL_CATEGORIES)
+    items: dict[str, float] = {}
+    for raw_key, raw_value in raw_plan.items():
+        if not isinstance(raw_key, str):
+            log.warning("[db] AI 预算方案含非字符串分类名，已丢弃：%r", raw_key)
+            continue
+        key = raw_key.strip()
+        if key not in allowed:
+            log.warning(
+                "[db] AI 预算方案含未知分类 %r（不在 BILL_CATEGORIES 内），已丢弃", raw_key
+            )
+            continue
+        if isinstance(raw_value, bool):
+            log.warning("[db] AI 预算方案分类 %r 的金额不是数字，已丢弃：%r", key, raw_value)
+            continue
+        try:
+            num = float(raw_value)
+        except (TypeError, ValueError):
+            log.warning("[db] AI 预算方案分类 %r 的金额不是数字，已丢弃：%r", key, raw_value)
+            continue
+        if not math.isfinite(num):
+            log.warning(
+                "[db] AI 预算方案分类 %r 的金额不是有限数，已丢弃：%r", key, raw_value
+            )
+            continue
+        try:
+            num = float(Decimal(str(num)).quantize(_CENT, rounding=ROUND_HALF_UP))
+        except (InvalidOperation, ValueError):
+            log.warning(
+                "[db] AI 预算方案分类 %r 的金额超出可处理范围，已丢弃：%r", key, raw_value
+            )
+            continue
+        if num <= 0:
+            log.warning("[db] AI 预算方案分类 %r 的金额不是正数，已丢弃：%r", key, raw_value)
+            continue
+        items[key] = items.get(key, 0.0) + num
+    return items
+
+
+def _scale_budget_items(items: dict[str, float], total_budget: float) -> dict[str, float]:
+    """把一组预算按比例缩放到 total_budget（两位小数，最后一项吸收舍入误差）。
+
+    为什么用 "整数分" 算：浮点乘比例再 round 容易出现 599.9999999999999 /
+    1200.0000000000002 —— 页面显示两位小数没问题，但 sum 断言 / 对账会失败。
+    全部换算成 "分" 做整数运算后，总和**精确**等于 int(total_budget * 100)。
+
+    为什么最后一项吸收误差：逐项 HALF_UP 的舍入误差最多累计 n * 0.5 分；
+    让最后一项 = 总分 - 已分配，总和必定精确。极端小的总预算下逐项 HALF_UP
+    可能把前 n-1 项加过头（最后一项变负），这里从金额最大的几项往回扣，
+    保证不出现负数；扣不回来（总预算小到无法分配）宁可报错也不返回错的总和。
+    """
+    keys = list(items)
+    raw_total_cents = sum(Decimal(str(items[k])) * 100 for k in keys)
+    total_cents = int(
+        (Decimal(str(total_budget)) * 100).to_integral_value(rounding=ROUND_HALF_UP)
+    )
+    cents: list[int] = []
+    for key in keys[:-1]:
+        share = Decimal(str(items[key])) * 100 / raw_total_cents * total_cents
+        cents.append(int(share.to_integral_value(rounding=ROUND_HALF_UP)))
+    cents.append(total_cents - sum(cents))
+
+    deficit = -cents[-1] if cents[-1] < 0 else 0
+    if cents[-1] < 0:
+        cents[-1] = 0
+    # 从最大项开始扣，避免把某个分类扣成负数；前 n-1 项之和恰好等于
+    # total_cents + deficit，所以 deficit 一定能扣完。
+    for idx in sorted(range(len(cents) - 1), key=lambda i: cents[i], reverse=True):
+        if deficit <= 0:
+            break
+        take = min(deficit, cents[idx])
+        cents[idx] -= take
+        deficit -= take
+    if deficit > 0:
+        raise RuntimeError("预算缩放失败：总预算过小，无法按比例分配到每个分类")
+    return {key: float(Decimal(c) / 100) for key, c in zip(keys, cents)}
+
+def get_budget_details(user_id) -> dict:
+    """读取某个用户的预算明细；未设置返回 {}。
+
+    契约：
+      · 列值是 SQL NULL → `{}`（"还没设置过"，不是错误）；
+      · 行不存在（id 不存在 / 会话里的 id 已过期被删）→ ValueError("用户不存在")；
+      · budget_details 列不存在（015 未执行，42703）或 users 表不存在（42P01）
+        → RuntimeError（中文提示先执行 015），**不返回 {}** —— 否则页面会把
+        "功能没启用" 显示成 "还没设置预算"，用户以为自己的数据丢了；
+      · 返回值是 `{分类: float}`：金额统一转 float 并定量两位小数（_money_to_float），
+        与页面 / JSON 的口径一致（psycopg2 的 Decimal 不能直接 JSON 序列化）；
+      · 只读、单条语句、不写库、**不做缓存**：015 是否执行在进程生命周期内可能变化
+        （运维中途跑迁移），缓存 False 会让功能一直不可用。
+
+    脏数据（非 JSON object / 非数字金额）只 warning 并跳过，不让一条坏行把页面弄崩；
+    "跳过" 是安全的降级方向：最坏情况是页面少显示一个分类，而不是整块功能报错。
+    """
+    uid = _normalize_budget_user_id(user_id)
+    if engine is None:
+        init_db()
+    with engine.connect() as conn:
+        try:
+            row = conn.execute(
+                text("SELECT budget_details FROM public.users WHERE id = :uid"),
+                {"uid": uid},
+            ).fetchone()
+        except ProgrammingError as exc:
+            conn.rollback()
+            if _is_budget_storage_missing(exc):
+                _raise_budget_column_missing(exc)
+            raise
+        except SQLAlchemyError:
+            conn.rollback()
+            raise
+
+    if row is None:
+        raise ValueError("用户不存在")
+
+    raw = row[0]
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        # 防御性分支：psycopg2 会把 jsonb 直接反序列化成 dict；换成不注册 json
+        # 适配器的驱动（或某些连接池配置）时可能拿到原始 JSON 文本。
+        import json
+
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            logging.getLogger(__name__).warning(
+                "[db] budget_details 不是合法 JSON，按未设置处理（user_id=%r）", uid
+            )
+            return {}
+    if not isinstance(raw, dict):
+        logging.getLogger(__name__).warning(
+            "[db] budget_details 不是 JSON object（%s），按未设置处理（user_id=%r）",
+            type(raw).__name__,
+            uid,
+        )
+        return {}
+
+    details: dict[str, float] = {}
+    for key, value in raw.items():
+        if value is None or isinstance(value, bool):
+            logging.getLogger(__name__).warning(
+                "[db] budget_details 里的金额非法，已跳过：key=%r value=%r", key, value
+            )
+            continue
+        try:
+            details[str(key)] = _money_to_float(value)
+        except (TypeError, ValueError, InvalidOperation):
+            logging.getLogger(__name__).warning(
+                "[db] budget_details 里的金额无法转成数字，已跳过：key=%r value=%r",
+                key,
+                value,
+            )
+    return details
+
+
+def save_budget_details(user_id, details: dict) -> dict:
+    """整体覆盖保存预算明细，返回 get_budget_details() 的同一结构。
+
+    - 入参校验（dict / 非空 / key 长度 / value 范围 / 分类数）全部在**开连接之前**
+      完成：非法输入连库都不碰；
+    - `UPDATE ... SET budget_details = CAST(:d AS jsonb)`：整对象覆盖，不做部分合并
+      （页面提交的是完整表单，合并语义会让 "删掉一个分类" 永远删不掉）。
+      JSON 文本由 json.dumps(ensure_ascii=False) 生成后**绑定成参数**，不拼 SQL；
+      这里用 CAST(:d AS jsonb) 而不是 :d::jsonb：SQLAlchemy 的 text() 不把
+      `:d::jsonb` 识别成绑定参数（实测会原样发给 PostgreSQL 报 syntax error），
+      CAST 与 :: 语义完全等价；
+    - rowcount=0 → 用户不存在 → ValueError("用户不存在")（不静默成功）；
+    - 列不存在（015 未执行）→ RuntimeError（中文提示），不假装保存成功；
+    - 返回值统一走 get_budget_details()：写入口 / 读入口只有一套字段与精度口径，
+      也顺带确认 "写进去的就是能读出来的"。
+    """
+    uid = _normalize_budget_user_id(user_id)
+    normalized = _normalize_budget_details(details)
+    import json
+
+    payload = json.dumps(
+        normalized, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+    )
+    if engine is None:
+        init_db()
+    with engine.connect() as conn:
+        try:
+            result = conn.execute(
+                text(
+                    "UPDATE public.users SET budget_details = CAST(:d AS jsonb) WHERE id = :uid"
+                ),
+                {"uid": uid, "d": payload},
+            )
+            rowcount = result.rowcount
+            conn.commit()
+        except ProgrammingError as exc:
+            conn.rollback()
+            if _is_budget_storage_missing(exc):
+                _raise_budget_column_missing(exc)
+            raise
+        except SQLAlchemyError:
+            conn.rollback()
+            raise
+
+    if rowcount == 0:
+        raise ValueError("用户不存在")
+    return get_budget_details(uid)
+
+
+def get_month_category_totals(user_id, month: str) -> dict[str, float]:
+    """统计某用户某个月（"YYYY-MM"）按分类的**支出**总额，返回 {分类: float}。
+
+    口径：
+      · month 严格 "YYYY-MM"（复用 _parse_report_month：'2026-1'、'2026-13'、
+        '26-10' 一律 ValueError），且**在开连接之前**校验；
+      · bills.date 落在该自然月（左闭右开 [1 日, 下月 1 日)）、type = '支出'；
+      · 按 category 汇总，category 为 NULL / 空白 → 归 "其他"（与 FALLBACK_CATEGORY 一致）；
+      · 无数据返回 {}（"这个月没有支出账"，不是错误）；
+      · 金额从 NUMERIC 转 float 并定量两位小数（_money_to_float），与页面口径一致；
+      · **不依赖 015**：只读 bills，015 没执行也能用；
+      · 所有参数走绑定，month 不会拼进 SQL。
+
+    ⚠ bills.date 是 VARCHAR（历史遗留），这里按 `b.date::date` 比较；007 已用 CHECK
+      保证库里都是 ISO 日期。若历史脏数据导致 cast 失败，异常原样上抛，由调用方决定
+      怎么提示（不静默跳过整月数据 —— 那会让预算基于残缺的统计生成）。
+    """
+    uid = _normalize_budget_user_id(user_id)
+    start, end = _parse_report_month(month)  # 严格校验 "YYYY-MM"
+    if engine is None:
+        init_db()
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT COALESCE(NULLIF(btrim(b.category), ''), :fallback) AS category,
+                       SUM(b.amount) AS total
+                FROM public.bills AS b
+                WHERE b.user_id = :uid
+                  AND b.type = :expense
+                  AND b.date::date >= :start
+                  AND b.date::date < :end
+                GROUP BY 1
+                ORDER BY 1
+            """),
+            {
+                "uid": uid,
+                "expense": EXPENSE_TYPE,
+                "start": start,
+                "end": end,
+                "fallback": FALLBACK_CATEGORY,
+            },
+        ).fetchall()
+    return {row.category: _money_to_float(row.total) for row in rows}
+
+
+def generate_smart_budget(user_id, total_budget, month: str | None = None) -> dict:
+    """让 AI 按某个月的真实分类支出，给出一个总预算 = total_budget 的分配方案。
+
+    流程：
+      1. total_budget 必须是有限数且 > 0（在开连接 / 调 AI 之前校验）；
+      2. month=None → 上个月（UTC+8 口径，用 date 计算，例：2026-10-18 → "2026-09"）；
+         显式传 month 时严格校验 "YYYY-MM"；
+      3. 读 get_month_category_totals(user_id, month)；没有账单 → ValueError
+         （中文提示先记账，不浪费一次 AI 调用）；
+      4. stats = {"month", "total", "category_totals"} 传给 AI；
+      5. 懒加载 ai_agent.generate_budget_plan（函数内 import，避免循环依赖）：
+         `generate_budget_plan(stats, float(total_budget), _deepseek_key())`；
+      6. 校验 AI 返回：分类必须在 BILL_CATEGORIES 内（不在的丢弃 + warning）、
+         金额 > 0；没有有效项 → RuntimeError；总和 > total_budget → 按比例缩放
+         到 total_budget（两位小数，最后一项吸收误差），并标记 scaled=True；
+      7. 异常分层：ai_agent.BudgetPlanError 原样上抛（前端按类型显示自己的中文文案）；
+         其它异常包装成 RuntimeError("AI 预算生成失败：...")，**不含 API key**；
+      8. 返回 {"source_month", "total_budget", "items", "total", "scaled"}。
+
+    ⚠ 本函数**不写库**：只生成方案，用户确认后由调用方 save_budget_details 保存。
+    ⚠ items 与 total 经过定量：缩放时总和严格等于 int(total_budget * 100) / 100。
+    """
+    uid = _normalize_budget_user_id(user_id)
+    total = _normalize_budget_total(total_budget)
+
+    if month is None:
+        month = _previous_month()
+    else:
+        month = month.strip() if isinstance(month, str) else month
+        _parse_report_month(month)  # 只借它的严格校验；边界值在 totals 里重新算
+
+    totals = get_month_category_totals(uid, month)
+    if not totals:
+        raise ValueError(BUDGET_EMPTY_BILLS_MESSAGE)
+
+    stats = {
+        "month": month,
+        "total": _money_to_float(sum(totals.values())),
+        "category_totals": totals,
+    }
+
+    # 懒加载：函数内 import，避免 ai_agent 将来在模块顶层 import db 形成循环依赖。
+    try:
+        import ai_agent
+        from ai_agent import generate_budget_plan
+    except ImportError as exc:
+        raise RuntimeError(
+            "智能预算功能未启用：ai_agent.generate_budget_plan 尚未就绪，请稍后重试"
+        ) from exc
+
+    # BudgetPlanError 可能尚未定义（并行开发中）：用 getattr 取，取不到就只包装
+    # "非预期异常"。绝不把 `except ai_agent.BudgetPlanError` 写成硬引用 ——
+    # 属性不存在时 except 子句求值本身会抛 AttributeError，把原异常换成另一个错。
+    budget_plan_error = getattr(ai_agent, "BudgetPlanError", None)
+
+    key = _deepseek_key()  # None = 没配置；由 generate_budget_plan 抛它自己的中文错误
+    try:
+        raw_plan = generate_budget_plan(stats, total, key)
+    except Exception as exc:  # noqa: BLE001 - 分层：可识别异常原样抛，其它统一包装
+        if budget_plan_error is not None and isinstance(exc, budget_plan_error):
+            raise
+        # 只暴露异常**类名**，不暴露 str(exc)：requests 的异常文本 / 响应体里
+        # 可能带着请求 URL、请求头甚至 key，绝不能进页面或日志。
+        raise RuntimeError(
+            f"AI 预算生成失败：{type(exc).__name__}，请稍后重试"
+        ) from exc
+
+    items = _normalize_ai_budget_plan(raw_plan)
+    if not items:
+        raise RuntimeError(BUDGET_EMPTY_PLAN_MESSAGE)
+
+    raw_total = _money_to_float(sum(items.values()))
+    scaled = raw_total > total
+    if scaled:
+        items = _scale_budget_items(items, total)
+    total_result = _money_to_float(sum(items.values()))
+
+    return {
+        "source_month": month,
+        "total_budget": total,
+        "items": items,
+        "total": total_result,
+        "scaled": scaled,
+    }
