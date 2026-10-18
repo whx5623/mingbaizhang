@@ -78,14 +78,22 @@ def _iter_project_fonts() -> list[str]:
 
 
 def _resolve_font_path() -> str:
-    """按约定顺序找到第一个存在的中文字体文件；全都没有就抛 PosterError。"""
+    """按约定顺序找到第一个存在的中文字体文件；全都没有就抛 PosterError。
+
+    平台隔离是刻意的：云端（Linux）只探测 Linux 字体路径，**不会**去碰
+    C:\\Windows\\Fonts（那些路径在 Linux 上永远不存在，混在候选里只会让排障
+    时误以为是字体路径写错）。本地 Windows 才把 Windows 字体放进候选。
+    """
     env_path = (os.environ.get("POSTER_FONT_PATH") or "").strip()
     candidates: list[str] = []
     if env_path:
         candidates.append(env_path)
     candidates.extend(_iter_project_fonts())
-    candidates.extend(_WINDOWS_FONTS)
-    candidates.extend(_LINUX_FONTS)
+    if os.name == "nt":
+        candidates.extend(_WINDOWS_FONTS)
+    else:
+        # Linux（Streamlit Cloud）：优先 Noto CJK，最后才是 DejaVu 保底
+        candidates.extend(_LINUX_FONTS)
 
     for path in candidates:
         try:
