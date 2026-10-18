@@ -285,6 +285,7 @@ def logout():
     st.session_state.pop("flash", None)             # 上一个人的提示（可能含商户名）不能带给下一个人
     st.session_state.pop("month_review", None)      # AI 复盘含本月消费明细，绝不能带给下一个登录的人
     st.session_state.pop("health_comment", None)    # AI 锐评同样基于本月财务数据，换人后必须失效
+    st.session_state.pop("_title_level_seen", None) # 换人后不能沿用上一人的头衔等级（否则首屏可能误撒花/漏撒花）
     st.session_state["page"] = 0
     st.session_state["chat_history"] = []           # 换人登录不应看到上一个人的 AI 聊天记录
     st.cache_data.clear()
@@ -585,6 +586,43 @@ def _get_subscription_advice_fn():
 
 # Sidebar
 with st.sidebar:
+    # ---- 积分头衔荣誉卡片（纯本地计算；017 未执行 / 读库失败只隐藏卡片）----
+    # 规则见 titles.py：0-100 记账新手 / 101-300 省钱学徒 / 301-600 理财达人 / 601+ 财务自由（预备役）
+    _title_points = None
+    try:
+        _cs = db.get_challenge_state(st.session_state.user_id)
+        _title_points = int(_cs.get("points") or 0)
+    except Exception as exc:  # 017 未执行（RuntimeError）/ 读库失败 → 不显示卡片，不影响其它侧边栏
+        print(f"[title] 读取挑战积分失败：{type(exc).__name__}: {exc}")
+        _title_points = None
+
+    if _title_points is not None:
+        from titles import get_title
+        try:
+            _ti = get_title(_title_points)
+        except Exception as exc:  # 库里的脏积分（负数等）只隐藏卡片，绝不让整页红屏
+            print(f"[title] 计算头衔失败：{type(exc).__name__}: {exc}")
+        else:
+            # 注意：Streamlit 1.65 的 st.info 会把**行首 emoji** 抽成 alert 图标并从正文删掉；
+            # 把 emoji 放进加粗标题内，正文才能稳定保留「🐣 记账新手」这段可断言文案。
+            st.info(f"**{_ti['emoji']} {_ti['title']}**\n\n当前积分：**{_ti['points']}** 分")
+            if not _ti["is_max"]:
+                st.progress(_ti["progress"])
+                st.caption(f"距离「{_ti['next_emoji']} {_ti['next_title']}」还差 {_ti['points_to_next']} 分")
+            else:
+                # 满级也画一条 100% 进度条：视觉上「走完了」，也便于 UI 测试断言 progress == 1.0
+                st.progress(_ti["progress"])
+                st.caption("已满级 · 财务自由预备役 👑")
+
+            # 升级撒花：只在跨越等级门槛的那一次 rerun 触发。
+            # 先把 seen 更新成当前等级，下一次 rerun 两者相等 → 不再撒；
+            # 首次进入（seen is None）只记录、不撒花。
+            _seen_level = st.session_state.get("_title_level_seen")
+            st.session_state["_title_level_seen"] = _ti["level_index"]
+            if _seen_level is not None and _ti["level_index"] > _seen_level:
+                st.balloons()
+                st.success(f"🎉 恭喜升级：{_ti['emoji']} {_ti['title']}！")
+
     # ---- 个人设定（含负债率常驻预警）----
     with st.container(border=True):
         st.header("个人设定")
