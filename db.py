@@ -4102,3 +4102,226 @@ def detect_subscriptions(user_id, months: int = 3, today=None) -> list[dict]:
         len(subscriptions),
     )
     return subscriptions
+
+
+# ===========================================================================
+# 省钱挑战积分（challenge points）
+# ---------------------------------------------------------------------------
+# 只读写 public.users 的 challenge_points / last_challenge_week 两列
+# （列结构见 migrations/017_users_challenge_points.sql）。本段只**追加**：
+# 不改动上面任何既有函数、常量和取数口径，也不在 init_db() 里补列
+# （迁移统一走 017，避免"应用启动顺手改 schema"与"迁移脚本"两条路径打架）。
+#
+# 防刷分（本模块的核心，改之前先读 017 文件头的「为什么用条件 UPDATE」）：
+#   · 发放只有**一条**条件 UPDATE：判定（本周是否已领）与写入（加分 + 记周）
+#     在同一个行锁里完成，不存在"先查后写"的 TOCTOU 窗口；
+#   · 同一用户并发两次请求：后到者等行锁，锁释放后 PostgreSQL 用最新行版本
+#     重新检查 WHERE，发现本周已领 → 0 行 → awarded=False（并发也不会多加分）；
+#   · 周由应用按 ISO 周计算（'YYYY-Www'），跨周自然放行；同周永远只发一次。
+#
+# 错误契约（app.py 依赖它，改语义前先看调用点）：
+#   · 参数非法（user_id 非正整数、week 形状/周号非法、points 非 int 或越界）
+#     → ValueError，且**在开连接之前**就拒绝（非法入参连库都不碰）；
+#   · 017 未执行（42703 undefined_column / 42P01 undefined_table）
+#     → RuntimeError（中文提示先执行 017）。get **不能**静默返回 0 分 ——
+#       那会把"功能没启用"显示成"你还没开始挑战"，用户永远等不到开始；
+#   · 用户不存在 → ValueError("用户不存在")（get 与 award 同一条文案）；
+#   · 其余数据库异常原样上抛（"连不上库"不能被伪装成"0 分"）。
+# 日志只写 user_id / week / 本次发放分值 / awarded，不含任何隐私数据。
+# ---------------------------------------------------------------------------
+
+CHALLENGE_MISSING_MESSAGE = (
+    "省钱挑战功能未启用：请先执行 migrations/017_users_challenge_points.sql"
+)
+
+# ISO 周的形状：4 位年 + 大写 W + 2 位周号（如 2026-W42）。
+# 用 fullmatch（而不是 search）保证整串匹配：'2026-W42x' / ' 2026-W42 ' 之外的
+# 变体一律拒绝（strip 之后才匹配，所以首尾空白仍被容忍，与 token 的处理一致）。
+# ⚠ 光有形状不够：'2026-W99' 也满足这个正则，下面还会用 date.fromisocalendar
+#   校验"这一周是否真实存在"（周号 01~53，且该年确实有这一周），
+#   以免把不存在的周写进 last_challenge_week、把用户锁在"永远领不到"的状态。
+_CHALLENGE_WEEK_PATTERN = re.compile(r"^\d{4}-W\d{2}$")
+
+# 单次发放边界：与 017 文件头、页面提示同口径。1~100 足够覆盖日常打卡/周任务，
+# 又能在数据库 INTEGER 与前端显示上保持"一眼可读"；上界同时挡住"错误地按分转元"
+# 这类数量级 bug（把 10 分写成 1000 分）。
+CHALLENGE_POINTS_MIN = 1
+CHALLENGE_POINTS_MAX = 100
+
+
+def _normalize_challenge_user_id(user_id) -> int:
+    """user_id 必须是正整数；非法输入在**开连接之前**抛 ValueError。
+
+    独立实现（不复用 _normalize_budget_user_id）：017 的读写不该依赖 015 的函数，
+    将来删改预算模块不会牵连挑战积分。规则与 014/015 完全一致：
+    只接受 int / 十进制字符串；float / Decimal 即使值是 1.0 也拒绝 ——
+    ``int(1.9)`` 会静默截断成 1，把"写错用户"伪装成"写对用户"比直接报错更危险。
+    """
+    if isinstance(user_id, bool) or not isinstance(user_id, (int, str)):
+        raise ValueError(f"user_id 必须是正整数：{user_id!r}")
+    try:
+        uid = int(user_id.strip()) if isinstance(user_id, str) else int(user_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"user_id 必须是正整数：{user_id!r}") from exc
+    if uid <= 0:
+        raise ValueError(f"user_id 必须是正整数：{user_id!r}")
+    return uid
+
+
+def _normalize_challenge_week(week) -> str:
+    """ISO 周校验：必须是 'YYYY-Www' 且该周真实存在；否则 ValueError。
+
+    · 只 strip、不改写大小写：'2026-w42' 属于调用方口径错误，静默改成大写会让
+      "同一周"的判定依赖隐式归一化，不如直接拒绝（库里存的一律是大写 W）；
+    · '2026-42'（缺 W）、'2026-W4'（少一位）、'2026-W99'（无此周）全部拒绝；
+    · date.fromisocalendar 同时校验年份/周号范围与该年是否真有第 53 周，
+      比手写 1 <= n <= 53 更严格（例如平年没有 W53）。
+    """
+    if not isinstance(week, str):
+        raise ValueError(f"week 必须是 'YYYY-Www' 形式的字符串：{week!r}")
+    value = week.strip()
+    if not _CHALLENGE_WEEK_PATTERN.fullmatch(value):
+        raise ValueError(f"week 必须是 'YYYY-Www' 形式（如 2026-W42）：{week!r}")
+    year, week_number = int(value[:4]), int(value[6:])
+    try:
+        date.fromisocalendar(year, week_number, 1)
+    except ValueError as exc:
+        raise ValueError(
+            f"week 不是真实存在的 ISO 周（周号 01~53）：{week!r}"
+        ) from exc
+    return value
+
+
+def _normalize_challenge_points(points) -> int:
+    """本次发放分值：必须是 1~100 的 int；bool / float / 字符串一律 ValueError。
+
+    为什么显式拒绝 bool：Python 里 True 是 int 的子类（True == 1），
+    不挡掉就会把 True 静默当成 1 分发放，掩盖调用方的类型错误；
+    为什么拒绝 float / 字符串：1.5 会被截断成 1、'10' 会被隐式转成 10，
+    两者都是"看起来成功了，实际发的不是调用方以为的数"。
+    """
+    if isinstance(points, bool) or not isinstance(points, int):
+        raise ValueError(
+            f"points 必须是 {CHALLENGE_POINTS_MIN}~{CHALLENGE_POINTS_MAX} 的整数：{points!r}"
+        )
+    if not CHALLENGE_POINTS_MIN <= points <= CHALLENGE_POINTS_MAX:
+        raise ValueError(
+            f"points 必须是 {CHALLENGE_POINTS_MIN}~{CHALLENGE_POINTS_MAX} 的整数：{points!r}"
+        )
+    return points
+
+
+def get_challenge_state(user_id) -> dict:
+    """读取用户的挑战积分状态：``{"points": int, "last_challenge_week": str|None}``。
+
+    契约（页面依赖它，改语义前先看调用点）：
+      · ``points`` 是**真 int**（DB 是 INTEGER NOT NULL DEFAULT 0，这里再 int()
+        一次，避免驱动把数值包成 Decimal 之类；调用方会直接做加减与显示）；
+      · ``last_challenge_week`` 原样返回字符串或 None（None = 从没领过）；
+      · 用户不存在 → ValueError("用户不存在")，**不返回 0 分** ——
+        否则页面会把"用户被删 / 会话失效"显示成"你还没开始挑战"；
+      · 017 未执行（42703 缺列 / 42P01 缺表）→ RuntimeError（提示先执行 017），
+        与 award_challenge_points 保持同一条错误契约，**不静默 0 分**；
+      · 只读、单条语句、不写库、不做缓存：award 之后下一次读取立刻看到新值。
+
+    SQL 用 ``WHERE id = :uid`` 走 users 主键，不建索引（见 017 文件头）。
+    """
+    uid = _normalize_challenge_user_id(user_id)
+
+    if engine is None:
+        init_db()
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT challenge_points, last_challenge_week "
+                    "FROM users WHERE id = :uid"
+                ),
+                {"uid": uid},
+            ).fetchone()
+    except ProgrammingError as exc:
+        if _pg_sqlstate(exc) in ("42703", "42P01"):  # 017 未执行（缺列 / 缺表）
+            raise RuntimeError(CHALLENGE_MISSING_MESSAGE) from exc
+        raise
+
+    if row is None:
+        raise ValueError("用户不存在")
+
+    return {
+        # NOT NULL DEFAULT 0 保证非 NULL；`or 0` 只防御驱动返回 None 的极端情况，
+        # 且不会把合法的 0 分改错（0 or 0 == 0）。
+        "points": int(row.challenge_points or 0),
+        "last_challenge_week": row.last_challenge_week,
+    }
+
+
+def award_challenge_points(user_id, week: str, points: int) -> dict:
+    """为某用户发放**本周**挑战积分；同周只发一次（幂等，防刷新 / 并发刷分）。
+
+    返回 ``{"awarded": bool, "points": int, "week": str}``：
+      · 发放成功    → awarded=True、points=**发放后的新总分**；
+      · 本周已领过  → awarded=False、points=当前总分（不报错，页面显示"已领取"）；
+      · 用户不存在  → ValueError("用户不存在")；
+      · 017 未执行  → RuntimeError（提示先执行 017）。
+
+    参数（全部在**开连接之前**校验，非法入参不占用连接、不开事务）：
+      · user_id：正整数（bool / float / 非数字串拒绝，见 _normalize_challenge_user_id）；
+      · week：'YYYY-Www' 且真实存在的 ISO 周（见 _normalize_challenge_week）；
+      · points：1~100 的 int（bool / float / 字符串拒绝，见 _normalize_challenge_points）。
+
+    实现要点（**不要**改成"先 SELECT 再 UPDATE"）：
+      · 单条条件 UPDATE + RETURNING：判定与写入在同一个行锁里完成，
+        并发同周请求只有一条会命中，另一条得到 0 行 → awarded=False；
+      · ``last_challenge_week IS NULL OR last_challenge_week <> :w`` 才更新：
+        三值逻辑下 ``NULL <> :w`` 求值为 NULL（不满足），必须显式放行 NULL；
+      · 0 行影响时再做一次只读 SELECT，区分"本周已领"与"用户不存在" ——
+        这次 SELECT 发生在 UPDATE **之后**，不可能造成重复发放；
+      · 显式 commit：否则连接归还时事务回滚，RETURNING 出来的值只是假象；
+        异常路径由 with 块关闭连接自动回滚（加分与记周是一行、同时生效/回滚）。
+    """
+    uid = _normalize_challenge_user_id(user_id)
+    normalized_week = _normalize_challenge_week(week)
+    normalized_points = _normalize_challenge_points(points)
+
+    if engine is None:
+        init_db()
+    try:
+        with engine.connect() as conn:
+            awarded_row = conn.execute(
+                text(
+                    "UPDATE users "
+                    "SET challenge_points = challenge_points + :p, "
+                    "    last_challenge_week = :w "
+                    "WHERE id = :uid "
+                    "  AND (last_challenge_week IS NULL OR last_challenge_week <> :w) "
+                    "RETURNING challenge_points"
+                ),
+                {"p": normalized_points, "w": normalized_week, "uid": uid},
+            ).fetchone()
+            if awarded_row is not None:
+                total = int(awarded_row[0])
+                awarded = True
+                conn.commit()
+            else:
+                # 0 行只可能是"本周已领"或"用户不存在"。只读区分，不写库、不提交。
+                current = conn.execute(
+                    text("SELECT challenge_points FROM users WHERE id = :uid"),
+                    {"uid": uid},
+                ).fetchone()
+                if current is None:
+                    raise ValueError("用户不存在")
+                total = int(current[0] or 0)
+                awarded = False
+    except ProgrammingError as exc:
+        if _pg_sqlstate(exc) in ("42703", "42P01"):  # 017 未执行（缺列 / 缺表）
+            raise RuntimeError(CHALLENGE_MISSING_MESSAGE) from exc
+        raise
+
+    logging.getLogger(__name__).info(
+        "[db] award_challenge_points user_id=%s week=%s points=%s awarded=%s",
+        uid,
+        normalized_week,
+        normalized_points,
+        awarded,
+    )
+    return {"awarded": awarded, "points": total, "week": normalized_week}

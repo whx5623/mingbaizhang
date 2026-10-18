@@ -2388,3 +2388,284 @@ def generate_subscription_advice(subscriptions: list[dict], api_key: str) -> dic
         "订阅建议生成成功（请求=%d 条，命中=%d 条）", len(items), len(result)
     )
     return result
+
+
+# ===========================================================================
+# 每周省钱挑战 · AI 生成（deepseek-chat）
+# ---------------------------------------------------------------------------
+# 输入是 app.py 组装的本月消费 stats，输出一条可展示、可领积分的挑战。
+# 设计边界：
+#   · 只做"文案生成"，不写库、不发积分（发/去重完全由 db.award_challenge_points 负责）；
+#   · 没有 key / 本月支出 <= 0 时**一个请求都不发**（省一次网络往返，
+#     也避免让模型对着 0 元硬编一个"省钱挑战"）；
+#   · 模型的任何越界都收敛到可展示的值（title/detail 截断，points 夹到 10~50），
+#     只有"结构不可用"才抛 parse 让 app 走本地兜底；
+#   · 日志只记周次、状态码与异常类型，**绝不**记 api_key / 请求头 / 消费明细原文。
+# ===========================================================================
+
+WEEKLY_CHALLENGE_SYSTEM_PROMPT = "你是一个懂大学生、说话像游戏 NPC 的省钱教练。请根据这名用户的本月消费数据，设计一个本周可执行的省钱小挑战：必须具体、可量化、一天内能开始做（例如“少喝 3 杯奶茶，预计省下 45 元”）。只输出 JSON 对象，格式为 {\"title\": \"少喝 3 杯奶茶\", \"detail\": \"本周把奶茶控制在 2 杯以内，想喝时先喝一杯水\", \"estimated_saving\": 45, \"points\": 20}，不要输出 JSON 之外的任何文字。title 不超过 20 字，estimated_saving 为整数元，points 为 10~50 的整数。"
+
+WEEKLY_CHALLENGE_MODEL = "deepseek-chat"
+WEEKLY_CHALLENGE_TEMPERATURE = 0.8
+WEEKLY_CHALLENGE_MAX_TOKENS = 300
+WEEKLY_CHALLENGE_TIMEOUT = 20
+WEEKLY_CHALLENGE_TITLE_MAX_CHARS = 20  # title 硬上限（超过直接截断，不补省略号）
+WEEKLY_CHALLENGE_DETAIL_MAX_CHARS = 80  # detail 硬上限（同上）
+WEEKLY_CHALLENGE_POINTS_MIN = 10
+WEEKLY_CHALLENGE_POINTS_MAX = 50
+
+# ```json ... ``` 代码块（也接受裸 ``` ... ```）；DOTALL 让块内换行不被吃掉。
+_WEEKLY_CHALLENGE_FENCE_RE = re.compile(
+    r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE
+)
+
+
+class ChallengeError(Exception):
+    """每周省钱挑战生成失败。
+
+    code 取值：
+      no_api_key   未配置 DeepSeek API Key（**未发请求**）
+      empty_stats  stats 不是 dict / 本月支出 <= 0（**未发请求**）
+      network      网络异常（超时 / 连接失败 / 其它请求层异常）
+      http         接口返回非 200（message 只带状态码，不带响应体）
+      parse        响应不是合法 JSON / 不是对象 / 字段缺失或不合规 / content 为空
+
+    message 为面向用户的中文提示，可直接展示。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"ChallengeError(code={self.code!r}, message={self.message!r})"
+
+
+def _challenge_amount(value):
+    """金额宽松转 float：None / bool / 非数字 / nan / inf → None（表示"没有这项数据"）。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(amount):
+        return None
+    return amount
+
+
+def _challenge_count(value) -> int:
+    """笔数转 int：非法/负数 → 0（笔数只用于提示词文案，不值得为此报错）。"""
+    amount = _challenge_amount(value)
+    if amount is None or amount < 0:
+        return 0
+    return int(amount)
+
+
+def _build_weekly_challenge_user_content(stats: dict) -> str:
+    """把 app.py 汇总的 stats 排成中文条目（金额两位小数，使用率一位小数）。"""
+    week = str(stats.get("week") or "").strip() or "本周"
+    month = str(stats.get("month") or "").strip() or "本月"
+    month_expense = _challenge_amount(stats.get("month_expense")) or 0.0
+    budget = _challenge_amount(stats.get("budget")) or 0.0
+    budget_used_pct = _challenge_amount(stats.get("budget_used_pct"))
+    if budget_used_pct is None:
+        # stats 没带使用率时按支出/预算现算；预算为 0 时记 0%（不除零）。
+        budget_used_pct = (month_expense / budget * 100.0) if budget > 0 else 0.0
+
+    # Top1 类别：缺失时写占位词，不带出任何原始数据结构。
+    top_category = str(stats.get("top_category") or "").strip() or "无"
+    top_amount = _challenge_amount(stats.get("top_amount"))
+    top_amount_text = f"{top_amount:.2f} 元" if top_amount is not None else "金额未知"
+    tx_count = _challenge_count(stats.get("tx_count"))
+
+    lines = [
+        "这是我的消费数据，请按系统要求设计本周省钱挑战：",
+        f"周次：{week}",
+        f"月份：{month}",
+        f"本月支出：{month_expense:.2f} 元 / 预算：{budget:.2f} 元（已使用 {budget_used_pct:.1f}%）",
+        f"消费最多的类别：{top_category} / {top_amount_text}",
+        f"本月消费笔数：{tx_count} 笔",
+    ]
+    return "\n".join(lines)
+
+
+def _parse_weekly_challenge(content: str) -> dict:
+    """把模型输出解析成挑战字段：先整体 json.loads，失败再抠 ```json 代码块。
+
+    校验规则（任何一条不过都抛 ChallengeError("parse")）：
+      · 解析结果必须是 dict；
+      · title / detail 必须是非空字符串 → 去空白后分别截断到 20 / 80 字；
+      · estimated_saving 必须是正数 → 转 float；
+      · points 必须是数字 → int，越界夹到 [10, 50]。
+    返回 {"title", "detail", "estimated_saving", "points"}，week / raw 由调用方补。
+    """
+    raw = content.strip()
+    parsed = None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        parsed = None
+    if not isinstance(parsed, dict):
+        # 整体解析不出对象时：依次尝试每个 ```json 代码块，仍不行就 parse。
+        parsed = None
+        for block in _WEEKLY_CHALLENGE_FENCE_RE.findall(raw):
+            block = block.strip()
+            if not block:
+                continue
+            try:
+                candidate = json.loads(block)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(candidate, dict):
+                parsed = candidate
+                break
+    if not isinstance(parsed, dict):
+        raise ChallengeError("parse", "AI 没有返回有效的省钱挑战，请重试")
+
+    title = parsed.get("title")
+    detail = parsed.get("detail")
+    if not isinstance(title, str) or not title.strip():
+        raise ChallengeError("parse", "AI 没有返回有效的省钱挑战，请重试")
+    if not isinstance(detail, str) or not detail.strip():
+        raise ChallengeError("parse", "AI 没有返回有效的省钱挑战，请重试")
+    title = title.strip()
+    detail = detail.strip()
+    if len(title) > WEEKLY_CHALLENGE_TITLE_MAX_CHARS:
+        title = title[:WEEKLY_CHALLENGE_TITLE_MAX_CHARS]
+    if len(detail) > WEEKLY_CHALLENGE_DETAIL_MAX_CHARS:
+        detail = detail[:WEEKLY_CHALLENGE_DETAIL_MAX_CHARS]
+
+    estimated_saving = _challenge_amount(parsed.get("estimated_saving"))
+    if estimated_saving is None or estimated_saving <= 0:
+        raise ChallengeError("parse", "AI 没有返回有效的省钱挑战，请重试")
+
+    points_value = parsed.get("points")
+    if isinstance(points_value, bool):
+        raise ChallengeError("parse", "AI 没有返回有效的省钱挑战，请重试")
+    try:
+        points = int(round(float(points_value)))
+    except (TypeError, ValueError):
+        raise ChallengeError("parse", "AI 没有返回有效的省钱挑战，请重试") from None
+    points = max(WEEKLY_CHALLENGE_POINTS_MIN, min(WEEKLY_CHALLENGE_POINTS_MAX, points))
+
+    return {
+        "title": title,
+        "detail": detail,
+        "estimated_saving": float(estimated_saving),
+        "points": points,
+    }
+
+
+def generate_weekly_challenge(stats: dict, api_key: str) -> dict:
+    """根据本月消费 stats 生成一条本周省钱挑战。
+
+    返回：
+        {"week": str, "title": str, "detail": str,
+         "estimated_saving": float, "points": int, "raw": str}
+    raw 是模型原始输出（JSON 字符串），仅用于排查，不直接展示给用户。
+
+    失败一律抛 ChallengeError（中文 message，可直接上页面）：
+      · api_key 为空                     → no_api_key（且**不发请求**）；
+      · stats 不是 dict                  → empty_stats（且**不发请求**）；
+      · 本月支出 <= 0 / 缺失 / 非数字     → empty_stats（且**不发请求**）；
+      · 超时 / 连接失败 / 其它请求层异常  → network；
+      · 非 200                           → http（只带状态码，不拼响应体）；
+      · 响应不是 JSON / 结构不符 / content 为空 / 字段不合规 → parse。
+    日志只记周次、状态码与异常类型，**绝不**记 api_key 或用户消费明细原文。
+    """
+    # ① api_key：先查它，没有 key 时不该先花一次网络往返。
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise ChallengeError(
+            "no_api_key",
+            "未配置 DEEPSEEK_API_KEY，AI 省钱挑战暂不可用",
+        )
+    api_key = api_key.strip()
+
+    # ② 数据前置校验：stats 结构不对 / 本月没有支出，都不该让模型对着 0 硬编。
+    if not isinstance(stats, dict):
+        raise ChallengeError("empty_stats", "消费数据不完整，暂时无法生成省钱挑战")
+    month_expense = _challenge_amount(stats.get("month_expense"))
+    if month_expense is None or month_expense <= 0:
+        raise ChallengeError(
+            "empty_stats",
+            "本月还没有消费记录，先记几笔再来生成省钱挑战吧",
+        )
+    week = str(stats.get("week") or "").strip()
+
+    user_content = _build_weekly_challenge_user_content(stats)
+    payload = {
+        "model": WEEKLY_CHALLENGE_MODEL,
+        "messages": [
+            {"role": "system", "content": WEEKLY_CHALLENGE_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        # temperature 0.8：挑战要有点游戏 NPC 的"花样"，但 JSON 结构由提示词锁死。
+        "temperature": WEEKLY_CHALLENGE_TEMPERATURE,
+        "max_tokens": WEEKLY_CHALLENGE_MAX_TOKENS,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ③ 发请求：超时/连接失败翻译成用户能看懂的句子（不把异常对象漏到页面）。
+    try:
+        resp = requests.post(
+            DEEPSEEK_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=WEEKLY_CHALLENGE_TIMEOUT,
+        )
+    except requests.Timeout:
+        logger.warning("省钱挑战请求超时（周次=%s）", week)
+        raise ChallengeError("network", "生成省钱挑战超时，请稍后再试") from None
+    except requests.ConnectionError:
+        logger.warning("省钱挑战请求连接失败（周次=%s）", week)
+        raise ChallengeError("network", "网络连接失败，请检查网络") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：日志只记异常类型（确保不把 headers / key 带出去）。
+        logger.warning(
+            "省钱挑战请求失败（周次=%s，异常=%s）", week, type(exc).__name__
+        )
+        raise ChallengeError("network", "网络连接失败，请检查网络") from None
+
+    # ④ 非 200：只带状态码，不把响应体拼进 message（响应体可能含请求回显）。
+    if resp.status_code != 200:
+        logger.warning("省钱挑战接口返回 HTTP %s（周次=%s）", resp.status_code, week)
+        raise ChallengeError(
+            "http",
+            f"AI 服务返回异常（HTTP {resp.status_code}），请稍后重试",
+        )
+
+    # ⑤ 响应结构：非 JSON / 缺 choices / content 为空 → 同一条"没有有效挑战"。
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("省钱挑战响应不是合法 JSON（周次=%s）", week)
+        raise ChallengeError("parse", "AI 没有返回有效的省钱挑战，请重试") from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("省钱挑战响应结构不符合预期（周次=%s）", week)
+        raise ChallengeError("parse", "AI 没有返回有效的省钱挑战，请重试") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("省钱挑战响应 content 为空（周次=%s）", week)
+        raise ChallengeError("parse", "AI 没有返回有效的省钱挑战，请重试")
+
+    parsed = _parse_weekly_challenge(content)
+    logger.info(
+        "省钱挑战生成成功（周次=%s，积分=%d）", week, parsed["points"]
+    )
+    return {
+        "week": week,
+        "title": parsed["title"],
+        "detail": parsed["detail"],
+        "estimated_saving": parsed["estimated_saving"],
+        "points": parsed["points"],
+        "raw": content.strip(),
+    }

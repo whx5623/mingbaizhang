@@ -11,6 +11,18 @@ except ImportError as _health_import_exc:
     print(f"[health] 健康分模块不可用：{type(_health_import_exc).__name__}: {_health_import_exc}")
 from finance_math import compute_irr, payment_from_fee, debt_ratio
 from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, get_user_auth_state, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data, get_login_daily_stats, login_events_available, LoginThrottled, set_goal, get_goal, add_to_goal, get_budget_details, save_budget_details, generate_smart_budget, query_bills, delete_bills, detect_subscriptions
+# 每周省钱挑战后端由并行方提供（db.get_challenge_state / db.award_challenge_points + migrations/017）：
+# 与 get_daily_expense_totals 同样处理——db.py 可能晚于 app.py 合入，这里先降级成 None，
+# 卡片内按名字取模块属性（便于测试打桩），函数缺失时只显示「未启用」，绝不让整页 ImportError 红屏。
+try:
+    from db import get_challenge_state, award_challenge_points
+except ImportError as _challenge_import_exc:
+    get_challenge_state = None
+    award_challenge_points = None
+    print(
+        f"[challenge] 省钱挑战后端不可用："
+        f"{type(_challenge_import_exc).__name__}: {_challenge_import_exc}"
+    )
 # 消费日历热力图后端由并行方提供（见 db.get_daily_expense_totals）：
 # 尚未合入时先降级成 None，页面只显示一行提示，绝不因 ImportError 红屏。
 try:
@@ -143,6 +155,18 @@ def _remember_db_func(name):
     函数可能晚于 app.py 落地；模块属性取用可避免 import 失败，也方便测试打桩。
     """
     return getattr(db, name, None)
+
+
+def _challenge_db_func(name):
+    """按名字取 db 里的省钱挑战函数；缺失时返回 None，由卡片降级成「未启用」。
+
+    优先走 db 模块属性（与 _remember_db_func 同理：并行开发期可缺失、也方便测试打桩），
+    再退回顶部 `from db import ...` 的绑定，保证两种打桩方式都能生效。
+    """
+    func = getattr(db, name, None)
+    if func is None:
+        func = globals().get(name)
+    return func
 
 
 def _issue_remember_token(uid):
@@ -2455,6 +2479,314 @@ with tab_tools:
                             st.cache_data.clear()      # 让指标/图表/明细立刻反映新账单
                             st.session_state.page = 0  # 新账单按日期倒序，通常在第一页
                             st.rerun()
+
+    # ---- 🏆 我的挑战（放在语音记账之后，Tab2 最后一张卡片）----
+    # AI 生成每周省钱挑战 + 完成领积分。后端：db.get_challenge_state / db.award_challenge_points
+    # （migrations/017）。后端缺失 / 017 未执行时整卡降级成一行提示，绝不红屏。
+    with st.container(border=True):
+        st.subheader("🏆 我的挑战")
+        _challenge_uid = st.session_state.user_id
+        _challenge_state = None
+        _challenge_ready = True
+
+        _challenge_state_fn = _challenge_db_func("get_challenge_state")
+        if _challenge_state_fn is None:
+            st.caption("省钱挑战功能未启用（请确认已执行 migrations/017）")
+            _challenge_ready = False
+        else:
+            try:
+                _challenge_state = _challenge_state_fn(_challenge_uid)
+            except RuntimeError:
+                # 017 未执行时数据层主动抛 RuntimeError：整卡只留一行提示
+                st.caption("省钱挑战功能未启用（请确认已执行 migrations/017）")
+                _challenge_ready = False
+            except Exception as _challenge_read_exc:
+                # 其它读库异常：细节只进服务端日志，页面给通用文案
+                print(
+                    f"[challenge] 读取挑战状态失败："
+                    f"{type(_challenge_read_exc).__name__}: {_challenge_read_exc}"
+                )
+                st.caption("挑战暂不可用")
+                _challenge_ready = False
+
+        if _challenge_ready:
+            if not isinstance(_challenge_state, dict):
+                _challenge_state = {}
+            try:
+                _challenge_points_now = int(_challenge_state.get("points") or 0)
+            except (TypeError, ValueError):
+                _challenge_points_now = 0
+
+            # ISO 周（周一为一周第一天）：与 db.award_challenge_points 的周次口径保持一致。
+            _challenge_iso = date.today().isocalendar()
+            current_week = f"{_challenge_iso.year}-W{_challenge_iso.week:02d}"
+
+            st.metric("挑战积分", f"{_challenge_points_now} 分")
+            st.caption(f"本周：{current_week}（ISO 周）")
+
+            # 挑战跨 rerun 常驻 session；周次不匹配（换周）视为没有挑战，自动失效。
+            _challenge = st.session_state.get("weekly_challenge")
+            if not (
+                isinstance(_challenge, dict)
+                and _challenge.get("week") == current_week
+                and isinstance(_challenge.get("data"), dict)
+            ):
+                if _challenge is not None:
+                    st.session_state.pop("weekly_challenge", None)
+                _challenge = None
+
+            # awarded=False 时就地切到「已完成」，不用 rerun；成功则 rerun 后靠 session 保留。
+            _challenge_show_completed = False
+
+            # ---- 还没有挑战：生成入口 ----
+            if _challenge is None:
+                st.caption("让 AI 根据你本周的消费习惯，生成一个能打的小挑战")
+                if st.button(
+                    "⚔️ 生成本周挑战", key=f"challenge_generate_{_challenge_uid}"
+                ):
+                    if st.session_state.ai_daily_count >= 20:
+                        st.warning("今日免费额度已用完，请明天再来")
+                    else:
+                        # 组装 stats：本月 + 支出，分类口径与「消费分类占比」一致；
+                        # 012 未执行（无 category 列）时退回商户，和图表洞察口径一致。
+                        _ch_exp_df = df_current_month[df_current_month["type"] == "支出"]
+                        _ch_month_expense = float(_ch_exp_df["amount"].sum())
+                        _ch_tx_count = int(len(_ch_exp_df))
+                        _ch_top_category = "其他"
+                        _ch_top_amount = 0.0
+                        if not _ch_exp_df.empty:
+                            if "category" in _ch_exp_df.columns:
+                                _ch_cat = (
+                                    _ch_exp_df["category"]
+                                    .fillna("其他")
+                                    .astype(str)
+                                    .str.strip()
+                                )
+                                _ch_grouped = (
+                                    _ch_exp_df.assign(
+                                        _ch_cat=_ch_cat.where(_ch_cat != "", "其他")
+                                    )
+                                    .groupby("_ch_cat")["amount"]
+                                    .sum()
+                                )
+                            else:
+                                _ch_grouped = _ch_exp_df.groupby("merchant")[
+                                    "amount"
+                                ].sum()
+                            if not _ch_grouped.empty:
+                                _ch_top_category = str(_ch_grouped.idxmax())
+                                _ch_top_amount = float(_ch_grouped.max())
+
+                        _ch_budget = float(st.session_state.monthly_budget)
+                        _ch_budget_used_pct = (
+                            (_ch_month_expense / _ch_budget * 100.0)
+                            if _ch_budget > 0
+                            else 0.0
+                        )
+                        _challenge_stats = {
+                            "week": current_week,
+                            "month": current_month_str,
+                            "month_expense": _ch_month_expense,
+                            "budget": _ch_budget,
+                            "budget_used_pct": _ch_budget_used_pct,
+                            "top_category": _ch_top_category,
+                            "top_amount": _ch_top_amount,
+                            "tx_count": _ch_tx_count,
+                        }
+
+                        # 延迟导入：不在 app 启动时就拉起 ai_agent 的 Supabase 依赖
+                        try:
+                            from ai_agent import (
+                                ChallengeError,
+                                generate_weekly_challenge,
+                            )
+                        except Exception as _challenge_ai_import_exc:
+                            print(
+                                f"[challenge] AI 挑战模块不可用："
+                                f"{type(_challenge_ai_import_exc).__name__}: "
+                                f"{_challenge_ai_import_exc}"
+                            )
+                            generate_weekly_challenge = None
+
+                            class ChallengeError(Exception):
+                                """降级占位：ai_agent 不可用时仅用于异常归口。"""
+
+                        # AI 契约内失败（no_api_key/network/http/parse/empty_stats）→ 本地兜底；
+                        # 未预期异常 → 只提示「生成失败」，不生成兜底挑战（避免掩盖真的 bug）。
+                        _challenge_ai_data = None
+                        _challenge_ai_failed = False
+                        _challenge_ai_error = False
+                        if not callable(generate_weekly_challenge):
+                            _challenge_ai_failed = True
+                        else:
+                            try:
+                                with st.spinner("AI 正在设计挑战…"):
+                                    _challenge_ai_data = generate_weekly_challenge(
+                                        _challenge_stats, get_deepseek_api_key()
+                                    )
+                            except ChallengeError as _challenge_ai_err:
+                                _challenge_ai_failed = True
+                                print(
+                                    f"[challenge] AI 生成失败"
+                                    f"（{getattr(_challenge_ai_err, 'code', 'parse')}）："
+                                    f"{type(_challenge_ai_err).__name__}"
+                                )
+                            except Exception as _challenge_ai_exc:
+                                _challenge_ai_error = True
+                                print(
+                                    f"[challenge] AI 生成异常："
+                                    f"{type(_challenge_ai_exc).__name__}: "
+                                    f"{_challenge_ai_exc}"
+                                )
+                                st.error("生成失败，请稍后再试")
+
+                        if not _challenge_ai_error:
+                            # 后端违约返回不合规结构（正常不会发生）：同样按 AI 不可用走兜底
+                            if not _challenge_ai_failed and not (
+                                isinstance(_challenge_ai_data, dict)
+                                and str(
+                                    _challenge_ai_data.get("title") or ""
+                                ).strip()
+                            ):
+                                print("[challenge] AI 返回结构不合规，使用本地兜底")
+                                _challenge_ai_failed = True
+
+                            if _challenge_ai_failed:
+                                # 本地兜底挑战：top_amount * 0.3 取整，不消耗 AI 额度
+                                _ch_fallback_saving = int(
+                                    round(_ch_top_amount * 0.3)
+                                )
+                                _ch_fallback_target = max(
+                                    0.0, _ch_top_amount - _ch_fallback_saving
+                                )
+                                _challenge = {
+                                    "week": current_week,
+                                    "data": {
+                                        "week": current_week,
+                                        "title": f"少喝 3 杯{_ch_top_category}",
+                                        "detail": (
+                                            f"本周把「{_ch_top_category}」的花费控制在 "
+                                            f"¥{_ch_fallback_target:.0f} 以内，"
+                                            "每笔先记账再下单，超了就留到下周"
+                                        ),
+                                        "estimated_saving": _ch_fallback_saving,
+                                        "points": 10,
+                                    },
+                                    "completed": False,
+                                }
+                                st.session_state["weekly_challenge"] = _challenge
+                                st.info("AI 暂不可用，已生成本地挑战")
+                            else:
+                                # 成功：只存 AI 结果，额度 +1（失败兜底不扣）
+                                _challenge = {
+                                    "week": current_week,
+                                    "data": _challenge_ai_data,
+                                    "completed": False,
+                                }
+                                st.session_state["weekly_challenge"] = _challenge
+                                st.session_state.ai_daily_count += 1
+
+            # ---- 有挑战：展示 + 完成领积分 ----
+            if _challenge is not None:
+                if _challenge.get("completed"):
+                    _challenge_show_completed = True
+                else:
+                    _challenge_data = _challenge.get("data") or {}
+                    _ch_title = (
+                        str(_challenge_data.get("title") or "").strip()
+                        or "本周省钱挑战"
+                    )
+                    _ch_detail = str(_challenge_data.get("detail") or "").strip()
+                    try:
+                        _ch_saving = float(
+                            _challenge_data.get("estimated_saving") or 0
+                        )
+                    except (TypeError, ValueError):
+                        _ch_saving = 0.0
+                    try:
+                        _ch_points = int(_challenge_data.get("points") or 10)
+                    except (TypeError, ValueError):
+                        _ch_points = 10
+                    _ch_points = max(10, min(50, _ch_points))
+
+                    # 标题来自 AI：用 subheader 纯文本渲染，绝不走 markdown，避免注入。
+                    st.subheader(_ch_title)
+                    if _ch_detail:
+                        st.write(_ch_detail)
+                    st.caption(
+                        f"预计省下 ¥{_ch_saving:.0f} · 完成可得 {_ch_points} 分"
+                    )
+
+                    if st.button(
+                        "✅ 我完成了", key=f"challenge_done_{_challenge_uid}"
+                    ):
+                        _challenge_award_fn = _challenge_db_func(
+                            "award_challenge_points"
+                        )
+                        if _challenge_award_fn is None:
+                            st.error(
+                                "省钱挑战功能未启用（请确认已执行 migrations/017）"
+                            )
+                        else:
+                            try:
+                                with st.spinner("正在登记挑战完成…"):
+                                    _challenge_award_res = _challenge_award_fn(
+                                        _challenge_uid, current_week, _ch_points
+                                    )
+                            except (ValueError, RuntimeError) as _ch_award_exc:
+                                # 业务/数据层错误：中文 message 可直接展示
+                                st.error(str(_ch_award_exc))
+                            except Exception as _ch_award_exc:
+                                print(
+                                    f"[challenge] 领取挑战积分失败："
+                                    f"{type(_ch_award_exc).__name__}: "
+                                    f"{_ch_award_exc}"
+                                )
+                                st.error("领取挑战积分失败，请稍后再试")
+                            else:
+                                if not isinstance(_challenge_award_res, dict):
+                                    print(
+                                        "[challenge] award_challenge_points 返回结构不合规"
+                                    )
+                                    st.error("领取挑战积分失败，请稍后再试")
+                                else:
+                                    try:
+                                        _ch_award_points = int(
+                                            _challenge_award_res.get("points")
+                                            if _challenge_award_res.get("points")
+                                            is not None
+                                            else _challenge_points_now
+                                        )
+                                    except (TypeError, ValueError):
+                                        _ch_award_points = _challenge_points_now
+
+                                    if _challenge_award_res.get("awarded"):
+                                        # 先落 completed 再 rerun：rerun 后卡片保持「已完成」
+                                        _challenge["completed"] = True
+                                        st.session_state["weekly_challenge"] = (
+                                            _challenge
+                                        )
+                                        st.session_state["flash"] = {
+                                            "level": "success",
+                                            "msg": (
+                                                f"挑战完成！+{_ch_points} 分，当前 "
+                                                f"{_ch_award_points} 分"
+                                            ),
+                                        }
+                                        st.rerun()
+                                    else:
+                                        # 同周重复领取：db 已拦下，这里就地切到已完成，无需 rerun
+                                        st.info("本周的挑战积分已经领取过啦")
+                                        _challenge["completed"] = True
+                                        st.session_state["weekly_challenge"] = (
+                                            _challenge
+                                        )
+                                        _challenge_points_now = _ch_award_points
+                                        _challenge_show_completed = True
+
+            if _challenge_show_completed:
+                st.success("🎉 本周挑战已完成，下周再来！")
+                st.caption(f"当前积分：{_challenge_points_now} 分")
 
 with tab_ai:
     # AI Chat
