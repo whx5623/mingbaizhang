@@ -2092,3 +2092,299 @@ def generate_chart_insight(stats: dict, api_key: str) -> str:
         content = content[:CHART_INSIGHT_MAX_CHARS] + "…"
     logger.info("图表洞察生成成功（月份=%s，字数=%d）", month, len(content))
     return content
+
+
+# ===========================================================================
+# 疑似连续包月订阅 · 取消/保留建议（deepseek-chat）
+# ---------------------------------------------------------------------------
+# 输入是 db.detect_subscriptions() 的检测结果，输出 {商户: 建议}。
+# 设计边界：
+#   · 只做"文案生成"，不做检测、不写库、不碰账单表；
+#   · 没有 key / 列表为空时**一个请求都不发**（省一次网络往返，也避免把空列表
+#     当成"用户没有订阅"去让模型硬编）；
+#   · 返回的 key 只可能是输入里出现过的商户（大小写不敏感匹配，返回输入的原写法），
+#     模型编出来的陌生商户一律丢弃；缺失的条目由调用方兜底展示。
+# ===========================================================================
+
+SUBSCRIPTION_ADVICE_SYSTEM_PROMPT = "你是一个懂大学生、说话直接但不刻薄的理财助手。用户被检测出若干疑似连续包月订阅。请针对每一条，用不超过 40 个字写一句取消/保留建议：说明它已经连续扣了几个月、每月多少钱，并给一个具体动作（如去支付宝/微信关闭自动续费、或保留）。只输出 JSON 数组，格式为 [{\"merchant\": \"腾讯视频\", \"advice\": \"…\"}]，不要输出任何解释。"
+
+SUBSCRIPTION_ADVICE_MODEL = "deepseek-chat"
+SUBSCRIPTION_ADVICE_TEMPERATURE = 0.6
+SUBSCRIPTION_ADVICE_MAX_TOKENS = 500
+SUBSCRIPTION_ADVICE_TIMEOUT = 25
+SUBSCRIPTION_ADVICE_MAX_CHARS = 60  # advice 硬上限：超过截断到 60 字并补「…」
+
+# ```json ... ``` 代码块（也接受裸 ``` ... ```）；DOTALL 让块内换行不被吃掉。
+_SUBSCRIPTION_ADVICE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+class SubscriptionAdviceError(Exception):
+    """订阅取消建议生成失败。
+
+    code 取值：
+      no_api_key    未配置 DeepSeek API Key（**未发请求**）
+      empty_items   订阅列表为空 / 没有任何合法条目（**未发请求**）
+      network       网络异常（超时 / 连接失败 / 其它请求层异常）
+      http          接口返回非 200（message 只带状态码，不带响应体）
+      parse         响应不是合法 JSON / 不是数组 / 没有一条合法 advice / content 为空
+
+    message 为面向用户的中文提示，可直接展示。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"SubscriptionAdviceError(code={self.code!r}, message={self.message!r})"
+
+
+def _advice_amount(value):
+    """月均金额宽松转 float：None / bool / 非数字 / nan / inf → None（文案里写"未知"）。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(amount):
+        return None
+    return amount
+
+
+def _advice_occurrences(value):
+    """已扣次数宽松转 int：None / bool / 非整数 / 负数 → None（不静默把 True 当 1 次）。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return None
+    if count < 0:
+        return None
+    return count
+
+
+def _normalize_subscription_advice_items(subscriptions):
+    """把调用方传入的订阅列表收敛成 [(商户, 月均|None, 次数|None, 分类), ...]。
+
+    · 非 list → []（由调用方翻译成 empty_items，**不发请求**）；
+    · 只保留 dict 且 merchant 为非空字符串的条目：检测层已经保证字段完整，
+      这里丢弃残缺条目是防止一条脏数据让整批建议都失败；
+    · 同一商户（strip + casefold 后）重复出现只取第一条，避免模型对同一商户写两段；
+    · monthly_amount / occurrences 转不动就留 None，文案里写"未知"，绝不因此报错；
+    · **merchant 保留输入原写法**（含首尾空白）：调用方按返回的 key 去回查展示，
+      这里若擅自 strip，带空格的商户会查不到建议、静默退成本地兜底。
+    """
+    if not isinstance(subscriptions, list):
+        return []
+    items = []
+    seen: set[str] = set()
+    for entry in subscriptions:
+        if not isinstance(entry, dict):
+            continue
+        merchant = entry.get("merchant")
+        if not isinstance(merchant, str) or not merchant.strip():
+            continue
+        merchant_key = merchant.strip().casefold()
+        if merchant_key in seen:
+            continue
+        seen.add(merchant_key)
+        category = entry.get("category")
+        category = str(category).strip() if category is not None else ""
+        items.append(
+            (
+                merchant,
+                _advice_amount(entry.get("monthly_amount")),
+                _advice_occurrences(entry.get("occurrences")),
+                category or "其他",
+            )
+        )
+    return items
+
+
+def _build_subscription_advice_user_content(items) -> str:
+    """逐条排成「商户 / 月均 / 已扣次数 / 分类」，一条一行，编号便于模型对齐。"""
+    lines = ["请按系统要求，为下面每条疑似连续包月订阅各写一句取消/保留建议："]
+    for index, (merchant, monthly_amount, occurrences, category) in enumerate(items, 1):
+        monthly_text = (
+            f"{monthly_amount:.2f} 元" if monthly_amount is not None else "月均金额未知"
+        )
+        occurrences_text = (
+            f"已扣 {occurrences} 次" if occurrences is not None else "已扣次数未知"
+        )
+        # 展示用 strip 过的商户名：首尾空白对模型没有信息量，还可能让 JSON 对不齐。
+        lines.append(
+            f"{index}. {merchant.strip()} / {monthly_text} / {occurrences_text} / {category}"
+        )
+    return "\n".join(lines)
+
+
+def _parse_subscription_advice(content: str) -> list:
+    """把模型输出解析成 JSON 数组：先整体 json.loads，失败再抠 ```json 代码块。
+
+    解析失败 / 不是 list 一律抛 SubscriptionAdviceError("parse")；
+    返回 []（合法空数组）也交给调用方按 parse 处理（对非空输入而言等于没生成）。
+    """
+    raw = content.strip()
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, list):
+        return parsed
+    # 整体解析不出数组时：依次尝试每个 ```json 代码块，仍不行就 parse。
+    for block in _SUBSCRIPTION_ADVICE_FENCE_RE.findall(raw):
+        block = block.strip()
+        if not block:
+            continue
+        try:
+            parsed = json.loads(block)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, list):
+            return parsed
+    raise SubscriptionAdviceError("parse", "AI 没有返回有效的订阅建议，请重试")
+
+
+def _subscription_advice_entries(parsed) -> list[tuple[str, str]]:
+    """从模型数组里挑出合法条目 [(商户, 建议), ...]，并做 60 字截断。
+
+    元素不是 dict / merchant 或 advice 不是字符串 / 去空白后为空 → 跳过该元素；
+    advice 超过 60 字 → 截断到 60 字并补「…」（与图表洞察的截断口径一致）。
+    """
+    entries: list[tuple[str, str]] = []
+    for element in parsed:
+        if not isinstance(element, dict):
+            continue
+        merchant = element.get("merchant")
+        advice = element.get("advice")
+        if not isinstance(merchant, str) or not isinstance(advice, str):
+            continue
+        merchant = merchant.strip()
+        advice = advice.strip()
+        if not merchant or not advice:
+            continue
+        if len(advice) > SUBSCRIPTION_ADVICE_MAX_CHARS:
+            advice = advice[:SUBSCRIPTION_ADVICE_MAX_CHARS] + "…"
+        entries.append((merchant, advice))
+    return entries
+
+
+def generate_subscription_advice(subscriptions: list[dict], api_key: str) -> dict[str, str]:
+    """为检测出的疑似订阅逐条生成一句取消/保留建议，返回 {商户: 建议}。
+
+    失败一律抛 SubscriptionAdviceError（中文 message，可直接上页面）：
+      · api_key 为空                        → no_api_key（且**不发请求**）；
+      · subscriptions 不是非空 list /      → empty_items（且**不发请求**）
+        没有任何合法条目；
+      · 超时 / 连接失败 / 其它请求层异常    → network；
+      · 非 200                             → http（只带状态码，不拼响应体）；
+      · 响应不是 JSON / 不是数组 / content   → parse。
+        为空 / 没有一条合法 advice；
+
+    返回的 key 只可能是输入里出现过的商户（按 casefold 匹配，key 用输入原写法），
+    模型编造出来的陌生商户会被丢弃；一句话都没命中时返回 {}，由调用方兜底展示。
+    日志只记条数与状态码，**绝不**记 api_key、请求头或金额/商户明细。
+    """
+    # ① api_key：先查它，没有 key 时不该先花一次网络往返。
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise SubscriptionAdviceError(
+            "no_api_key",
+            "未配置 DEEPSEEK_API_KEY，订阅建议暂不可用",
+        )
+    api_key = api_key.strip()
+
+    # ② 输入：没有订阅可分析时不发请求（避免让模型对着空列表硬编）。
+    items = _normalize_subscription_advice_items(subscriptions)
+    if not items:
+        raise SubscriptionAdviceError(
+            "empty_items",
+            "没有检测到可分析的订阅，暂时没有建议",
+        )
+
+    user_content = _build_subscription_advice_user_content(items)
+    payload = {
+        "model": SUBSCRIPTION_ADVICE_MODEL,
+        "messages": [
+            {"role": "system", "content": SUBSCRIPTION_ADVICE_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        # temperature 0.6：建议要有点"人味"但不至于跑题；max_tokens 500 够一批条目。
+        "temperature": SUBSCRIPTION_ADVICE_TEMPERATURE,
+        "max_tokens": SUBSCRIPTION_ADVICE_MAX_TOKENS,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ③ 发请求：超时/连接失败翻译成用户能看懂的句子（不把异常对象漏到页面）。
+    try:
+        resp = requests.post(
+            DEEPSEEK_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=SUBSCRIPTION_ADVICE_TIMEOUT,
+        )
+    except requests.Timeout:
+        logger.warning("订阅建议请求超时（条数=%d）", len(items))
+        raise SubscriptionAdviceError("network", "生成订阅建议超时，请稍后再试") from None
+    except requests.ConnectionError:
+        logger.warning("订阅建议请求连接失败（条数=%d）", len(items))
+        raise SubscriptionAdviceError("network", "网络连接失败，请检查网络") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：日志只记异常类型（确保不把 headers / key 带出去）。
+        logger.warning("订阅建议请求失败（条数=%d，异常=%s）", len(items), type(exc).__name__)
+        raise SubscriptionAdviceError("network", "网络连接失败，请检查网络") from None
+
+    # ④ 非 200：只带状态码，不把响应体拼进 message（响应体可能含请求回显）。
+    if resp.status_code != 200:
+        logger.warning("订阅建议接口返回 HTTP %s（条数=%d）", resp.status_code, len(items))
+        raise SubscriptionAdviceError(
+            "http",
+            f"AI 服务返回异常（HTTP {resp.status_code}），请稍后重试",
+        )
+
+    # ⑤ 响应结构：非 JSON / 缺 choices / content 为空 → 同一条"没有有效建议"。
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("订阅建议响应不是合法 JSON（条数=%d）", len(items))
+        raise SubscriptionAdviceError("parse", "AI 没有返回有效的订阅建议，请重试") from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("订阅建议响应结构不符合预期（条数=%d）", len(items))
+        raise SubscriptionAdviceError("parse", "AI 没有返回有效的订阅建议，请重试") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("订阅建议响应 content 为空（条数=%d）", len(items))
+        raise SubscriptionAdviceError("parse", "AI 没有返回有效的订阅建议，请重试")
+
+    parsed = _parse_subscription_advice(content)
+    entries = _subscription_advice_entries(parsed)
+    if not entries:
+        logger.warning("订阅建议响应没有合法条目（条数=%d）", len(items))
+        raise SubscriptionAdviceError("parse", "AI 没有返回有效的订阅建议，请重试")
+
+    # 只保留输入里出现过的商户：key 用**输入原写法**（含首尾空白），调用方才查得到；
+    # 匹配时两侧都 strip + casefold，模型把大小写写反或多加空格也能对上。
+    wanted: dict[str, str] = {}
+    for merchant, *_ in items:
+        wanted.setdefault(merchant.strip().casefold(), merchant)
+    result: dict[str, str] = {}
+    for merchant, advice in entries:
+        original = wanted.get(merchant.casefold())
+        if original is None or original in result:
+            continue
+        result[original] = advice
+
+    # 只记请求条数 / 命中条数；商户名与金额一律不进日志。
+    logger.info(
+        "订阅建议生成成功（请求=%d 条，命中=%d 条）", len(items), len(result)
+    )
+    return result

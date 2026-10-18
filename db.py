@@ -3802,3 +3802,303 @@ def delete_bills(user_id, start_date, end_date, category=None) -> int:
         "[db] delete_bills user_id=%s range=%s..%s deleted=%s", uid, start, end, deleted
     )
     return deleted
+
+
+# ===========================================================================
+# 周期订阅检测（疑似连续包月）
+# ---------------------------------------------------------------------------
+# 只读 public.bills 一张表，WHERE 首项就是 user_id —— 跨用户取数在语义上不可能。
+# 取数只有一条 SQL，参数全部绑定；months / today 只参与 Python 侧的日期计算，
+# 绝不被拼进 SQL。
+#
+# 为什么是"链式聚类"而不是简单按商户 GROUP BY：
+#   同一商户可能只是"偶尔买了一次"，也可能是"每月固定扣一次"。只有**相邻两次**
+#   扣费同时满足「间隔 ≈ 一个月」与「金额基本不变」，才可能是同一条订阅链；
+#   一旦某次不满足（金额跳变 / 隔了半个月 / 隔了三个月），链就在那里断开，前后
+#   各自成链。这样"25 元 → 60 元 → 25 元"不会被硬凑成三次订阅，而"25、25、25
+#   但中间隔了 3 个月"也不会被误判 —— 宁可漏报，也绝不把日常消费报成订阅。
+#
+# 误报控制（写死在算法里的三道闸，参数集中在下面几个常量）：
+#   ① 间隔闸：相邻两笔必须落在 23~37 天（覆盖 28~31 天的月扣、以及跨月的 30±7）；
+#   ② 金额闸：|差额| <= max(2.0, 12% × 两次金额均值)（容忍会员提价 / 小额优惠券，
+#      但 25→60 这种翻倍一定断开）；
+#   ③ 候选闸：链长 >= 2 才算候选；链长 > 6 的高频消费直接排除；分类为「餐饮」且
+#      商户名不含订阅关键词（会员/VIP/包月/订阅/月卡/连续包月/续费/自动续费）的
+#      直接排除 —— 食堂 / 奶茶这类周期性吃饭是最典型的误报来源。
+# ===========================================================================
+
+SUBSCRIPTION_KEYWORDS = ("会员", "VIP", "包月", "订阅", "月卡", "连续包月", "续费", "自动续费")
+SUBSCRIPTION_KEYWORDS_FOLDED = tuple(keyword.casefold() for keyword in SUBSCRIPTION_KEYWORDS)
+SUBSCRIPTION_MIN_INTERVAL_DAYS = 23
+SUBSCRIPTION_MAX_INTERVAL_DAYS = 37
+SUBSCRIPTION_MAX_CHAIN_OCCURRENCES = 6
+SUBSCRIPTION_AMOUNT_TOLERANCE_MIN = 2.0
+SUBSCRIPTION_AMOUNT_TOLERANCE_RATIO = 0.12
+SUBSCRIPTION_HIGH_CONFIDENCE_MIN_OCCURRENCES = 3
+SUBSCRIPTION_HIGH_CONFIDENCE_INTERVAL_MIN = 27.0
+SUBSCRIPTION_HIGH_CONFIDENCE_INTERVAL_MAX = 33.0
+SUBSCRIPTION_MEAL_CATEGORY = "餐饮"
+# 金额下限：几元的小额固定扣费（共享单车次卡、自动售货等）通常不是订阅，
+# 加一道下限把 9.9 元以下的噪声挡掉；用户要求 10 元起。
+SUBSCRIPTION_MIN_AMOUNT = 10.0
+# 固定月度但明确不是"订阅会员"的支出：房租/话费/定投/保险。
+# 这类支出同样是"每月相近金额"，不加排除会被误报成隐形扣费。
+SUBSCRIPTION_EXCLUDED_KEYWORDS = ("房租", "话费", "定投", "保险")
+SUBSCRIPTION_EXCLUDED_KEYWORDS_FOLDED = tuple(
+    keyword.casefold() for keyword in SUBSCRIPTION_EXCLUDED_KEYWORDS
+)
+
+
+def _subscription_is_excluded(merchant: str) -> bool:
+    """商户名命中房租/话费/定投/保险等「固定但非订阅」关键词时排除。
+
+    用 casefold 包含匹配：``话费充值``、``房租-合租`` 这类带后缀的写法也能拦住。
+    """
+    folded = merchant.casefold()
+    return any(keyword in folded for keyword in SUBSCRIPTION_EXCLUDED_KEYWORDS_FOLDED)
+
+
+def _subscription_merchant_key(merchant) -> str | None:
+    """分组键：商户去首尾空格 + casefold；None / 非字符串 / 空串 / 纯空白 → None。
+
+    casefold 而不是 lower：``VIP`` / ``Vip`` / ``vip`` 视为同一商户，避免同一个
+    连续包月因为显示大小写不同被拆成两条链、双双不够 2 次而漏报。
+    """
+    if not isinstance(merchant, str):
+        return None
+    key = merchant.strip().casefold()
+    return key or None
+
+
+def _subscription_has_keyword(merchant: str) -> bool:
+    """商户名是否带订阅关键词（大小写不敏感），用于「餐饮」豁免与 high 置信度。"""
+    folded = merchant.casefold()
+    return any(keyword in folded for keyword in SUBSCRIPTION_KEYWORDS_FOLDED)
+
+
+def _subscription_amount_matches(previous: float, current: float) -> bool:
+    """相邻两笔金额是否"基本不变"：|差| <= max(2.0 元, 12% × 两次均值)。
+
+    先算浮动阈值再比较：小额订阅（15 元）靠 2 元兜底，大额订阅（100 元）靠 12%
+    兜底，不会因为"比例太小"把 1 元的手续费差异判成断链。
+    """
+    tolerance = max(
+        SUBSCRIPTION_AMOUNT_TOLERANCE_MIN,
+        SUBSCRIPTION_AMOUNT_TOLERANCE_RATIO * ((previous + current) / 2),
+    )
+    return abs(previous - current) <= tolerance
+
+
+def _subscription_amount_or_none(value):
+    """DB 金额 -> 两位小数 float；NULL / bool / 非法数字 / <= 0 → None（跳过该笔）。
+
+    `_money_to_float` 对 None 会返回 0.0，因此必须先挡 None；0 / 负数不可能是
+    "订阅扣费"，参与链运算只会污染金额均值（0 元链还会算出 0 元年费）。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        amount = _money_to_float(value)
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if amount <= 0:
+        return None
+    return amount
+
+
+def _round_half_up(value: float, digits: int) -> float:
+    """十进制四舍五入（内置 round 是银行家舍入：30.5 会被舍成 30）。
+
+    下一期扣费日靠它算：30.5 天的平均间隔必须进位成 31 天，否则预期日期会
+    系统性偏早一天；同时用 Decimal 转换避免 2.675 → 2.67 这类二进制浮点误差。
+    """
+    quant = Decimal(1).scaleb(-digits)
+    return float(Decimal(str(value)).quantize(quant, rounding=ROUND_HALF_UP))
+
+
+def _subscription_cluster_chains(events) -> list[list[tuple]]:
+    """把同一商户的按日期升序事件切成订阅链；只返回长度 >= 2 的链。
+
+    events: [(date, 商户原文, 金额 float, 分类), ...]，日期升序（SQL 已排序）。
+    相邻两次**同时**满足间隔 23~37 天且金额基本不变才续链，否则从当前这笔重启
+    一条链。纯逻辑、不碰库、不写日志，便于单独验证边界。
+    """
+    chains: list[list[tuple]] = []
+    current: list[tuple] = []
+    for event in events:
+        if current:
+            previous = current[-1]
+            gap = (event[0] - previous[0]).days
+            if (
+                SUBSCRIPTION_MIN_INTERVAL_DAYS <= gap <= SUBSCRIPTION_MAX_INTERVAL_DAYS
+                and _subscription_amount_matches(previous[2], event[2])
+            ):
+                current.append(event)
+                continue
+            chains.append(current)
+        current = [event]
+    if current:
+        chains.append(current)
+    return [chain for chain in chains if len(chain) >= 2]
+
+
+def detect_subscriptions(user_id, months: int = 3, today=None) -> list[dict]:
+    """检测某用户近 months 个月的**疑似连续包月订阅**，返回按年花费降序的列表。
+
+    区间口径与 get_daily_expense_totals 完全一致（左闭右闭）：
+      起点 = 今天所在月往前推 months-1 个月的 1 号；终点 = 今天（含）。
+      例：today=2026-10-18、months=3 → 2026-08-01 ~ 2026-10-18。
+    只看 ``type = '支出'``；收入（工资/红包/退款）不计入，少报优于误报。
+
+    参数校验（都在**开连接之前**完成，非法入参不浪费一次连接）：
+      · user_id 复用 _normalize_budget_user_id（正整数，拒绝 bool / float）；
+      · months 必须是 1~12 的 int（bool / float / 字符串一律拒绝，不静默截断）；
+      · today 复用 _normalize_forecast_today（date / datetime / "YYYY-MM-DD"）。
+
+    检测规则（细节见上方 _subscription_cluster_chains / 金额闸 / 关键词）：
+      1. 按「商户去首尾空格 + casefold」分组，组内按日期升序做链式聚类；
+      2. 相邻两次间隔 23~37 天且金额差 <= max(2.0, 12% × 均值) → 同一条链；
+      3. 链长 >= 2 才进入候选；链长 > 6 视为高频消费，排除；
+      4. 分类为「餐饮」且商户名不含订阅关键词 → 排除（食堂/奶茶是最大误报源）；
+      5. 同一商户有多条候选链时**只取最长的一条**（同长取更早出现的那条），
+         再对这条链套用 3、4 两条排除规则 —— 即"取最长链"优先于"排除"，
+         避免把一个月度订阅和高频消费混在一起算出一条假链。
+
+    输出（每条）：
+      merchant 原样商户名（取链内最后一次的写法）、category（空→"其他"）、
+      monthly_amount（链内金额均值，两位小数）、occurrences、first_date、last_date、
+      avg_interval_days（一位小数）、annual_cost = 月均 × 12、
+      next_expected_date = 最后一次 + 四舍五入后的平均间隔、
+      confidence = high（商户名含订阅关键词，或 >=3 次且平均间隔 27~33 天）/ medium。
+      按 annual_cost 降序、occurrences 降序（同值按商户名升序，保证结果可复现）。
+
+    边界与异常：
+      · 用户不存在 / 区间内没记过账 / 没有一条达标 → 返回 ``[]``（**不是 None**）；
+      · 单笔金额为 NULL 或 0/负数、商户名为空的脏行会被跳过，不会让整次检测失败；
+      · 参数非法 → ValueError。连接/DB 错误按原样上抛（**不**伪装成"没有订阅"，
+        否则真出故障时页面会显示"你很省钱"，比报错更危险）。
+    日志只记 user_id / months / 区间 / 候选条数，**绝不**记商户名或金额明细。
+    """
+    uid = _normalize_budget_user_id(user_id)
+    if (
+        isinstance(months, bool)
+        or not isinstance(months, int)
+        or not 1 <= months <= 12
+    ):
+        raise ValueError(f"months 必须是 1~12 的整数：{months!r}")
+    end = _normalize_forecast_today(today)
+
+    # 与 get_daily_expense_totals 同一套"月份序号"算法：跨年时由 floor 除法自然回落。
+    month_index = (end.year * 12 + end.month - 1) - (months - 1)
+    start = date(month_index // 12, month_index % 12 + 1, 1)
+
+    if engine is None:
+        init_db()
+    with engine.connect() as conn:
+        # 单条 SQL：排序交给库（date::date 后按真实日期，同日再按 id 保证稳定）。
+        rows = conn.execute(
+            text("""
+                SELECT b.date::date AS day,
+                       b.merchant AS merchant,
+                       b.amount AS amount,
+                       b.category AS category
+                FROM public.bills AS b
+                WHERE b.user_id = :uid
+                  AND b.type = :expense
+                  AND b.date::date >= :start
+                  AND b.date::date <= :end
+                ORDER BY b.date::date ASC, b.id ASC
+            """),
+            {"uid": uid, "expense": EXPENSE_TYPE, "start": start, "end": end},
+        ).fetchall()
+
+    # 分组在 Python 侧做：SQL 只能按"原样商户名"分组，做不到 trim + casefold，
+    # 而这两个归一化正是避免同一订阅被拆链的关键。
+    grouped: dict[str, list[tuple]] = {}
+    for row in rows:
+        merchant_key = _subscription_merchant_key(row.merchant)
+        if merchant_key is None:
+            continue
+        amount = _subscription_amount_or_none(row.amount)
+        if amount is None:
+            continue
+        # date 列历史上是 TEXT（可空）：NULL 脏行直接跳过，别让后面的日期相减炸掉
+        # 整次检测；datetime 先取 .date()，保证链内做减法的是纯日历日。
+        day = row.day.date() if isinstance(row.day, datetime) else row.day
+        if not isinstance(day, date):
+            continue
+        grouped.setdefault(merchant_key, []).append(
+            (day, row.merchant, amount, _normalize_category_value(row.category))
+        )
+
+    subscriptions: list[dict] = []
+    for events in grouped.values():
+        chains = _subscription_cluster_chains(events)
+        if not chains:
+            continue
+        chain = max(chains, key=len)  # max 返回第一个最大值 → 同长取更早的链
+        if len(chain) > SUBSCRIPTION_MAX_CHAIN_OCCURRENCES:
+            continue
+        merchant = chain[-1][1]
+        category = chain[-1][3]
+        if category == SUBSCRIPTION_MEAL_CATEGORY and not _subscription_has_keyword(merchant):
+            continue  # 周期性吃饭不是订阅：餐饮类必须带订阅关键词才放行
+
+        occurrences = len(chain)
+        amounts = [event[2] for event in chain]
+        monthly_amount = _money_to_float(sum(amounts) / occurrences)
+        # 金额下限：低于 10 元的小额固定扣费不算"隐形订阅"，避免噪声刷屏。
+        if monthly_amount < SUBSCRIPTION_MIN_AMOUNT:
+            continue
+        # 房租/话费/定投/保险：月度固定但明确不是订阅，必须排除。
+        if _subscription_is_excluded(merchant):
+            continue
+        first_day = chain[0][0]
+        last_day = chain[-1][0]
+        avg_interval = _round_half_up(
+            (last_day - first_day).days / (occurrences - 1), 1
+        )
+        # 预期下次扣费日：平均间隔四舍五入成整数天（30.5 → 31）。
+        next_expected = last_day + timedelta(days=int(_round_half_up(avg_interval, 0)))
+
+        # high 置信度的两条独立证据：商户名自带"会员/续费"等字样，或扣费节奏
+        # 稳定在 27~33 天且至少观察满 3 次；其余一律 medium，不吹成"确定"。
+        high_confidence = _subscription_has_keyword(merchant) or (
+            occurrences >= SUBSCRIPTION_HIGH_CONFIDENCE_MIN_OCCURRENCES
+            and SUBSCRIPTION_HIGH_CONFIDENCE_INTERVAL_MIN
+            <= avg_interval
+            <= SUBSCRIPTION_HIGH_CONFIDENCE_INTERVAL_MAX
+        )
+        subscriptions.append(
+            {
+                "merchant": merchant,
+                "category": category,
+                "monthly_amount": monthly_amount,
+                "occurrences": occurrences,
+                "first_date": first_day.isoformat(),
+                "last_date": last_day.isoformat(),
+                "avg_interval_days": float(avg_interval),
+                "annual_cost": _money_to_float(monthly_amount * 12),
+                "next_expected_date": next_expected.isoformat(),
+                "confidence": "high" if high_confidence else "medium",
+            }
+        )
+
+    # 年花费降序、次数降序；再按商户名升序兜底，避免同值条目顺序随数据插入变化。
+    subscriptions.sort(
+        key=lambda item: (
+            -item["annual_cost"],
+            -item["occurrences"],
+            item["merchant"].casefold(),
+        )
+    )
+    # 只记用户、区间、条数；商户名与金额一律不进日志。
+    logging.getLogger(__name__).info(
+        "[db] detect_subscriptions user_id=%s months=%s range=%s..%s candidates=%s",
+        uid,
+        months,
+        start,
+        end,
+        len(subscriptions),
+    )
+    return subscriptions

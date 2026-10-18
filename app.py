@@ -10,7 +10,7 @@ except ImportError as _health_import_exc:
     compute_health_score = None
     print(f"[health] 健康分模块不可用：{type(_health_import_exc).__name__}: {_health_import_exc}")
 from finance_math import compute_irr, payment_from_fee, debt_ratio
-from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, get_user_auth_state, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data, get_login_daily_stats, login_events_available, LoginThrottled, set_goal, get_goal, add_to_goal, get_budget_details, save_budget_details, generate_smart_budget, query_bills, delete_bills
+from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, get_user_auth_state, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data, get_login_daily_stats, login_events_available, LoginThrottled, set_goal, get_goal, add_to_goal, get_budget_details, save_budget_details, generate_smart_budget, query_bills, delete_bills, detect_subscriptions
 # 消费日历热力图后端由并行方提供（见 db.get_daily_expense_totals）：
 # 尚未合入时先降级成 None，页面只显示一行提示，绝不因 ImportError 红屏。
 try:
@@ -503,6 +503,62 @@ def _chart_insight_cached(stats_json: str, api_key: str) -> tuple[str, bool]:
     return text, False
 
 
+# ===== 隐形扣费雷达：AI 取消建议的进程级缓存 =====
+# 与图表洞察同理：命中缓存直接复用、不调 API、不扣额度；未命中才调一次。
+# key 只取影响建议内容的字段（商户 / 月均 / 次数 / 分类），同一批订阅在
+# rerun / 换会话时都能命中；失败兜底结果也写缓存，避免反复打不可用的 API。
+@st.cache_resource(show_spinner=False)
+def _subscription_advice_store() -> dict:
+    """返回进程级缓存：{key: {"map": {merchant: advice}, "fallback": bool}}。"""
+    return {}
+
+
+def _subscription_advice_key(subscriptions: list[dict]) -> str:
+    """把订阅关键信息归一化成稳定 key（字段顺序 / 中文都不影响哈希）。"""
+    payload = [
+        {
+            "merchant": item.get("merchant"),
+            "monthly_amount": item.get("monthly_amount"),
+            "occurrences": item.get("occurrences"),
+            "category": item.get("category"),
+        }
+        for item in subscriptions
+        if isinstance(item, dict)
+    ]
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+
+
+def _subscription_local_advice(subscription: dict) -> str:
+    """AI 不可用时的本地兜底建议（每个商户一句，不消耗额度）。"""
+    merchant = str(subscription.get("merchant") or "该商户")
+    try:
+        occurrences = int(subscription.get("occurrences") or 0)
+    except (TypeError, ValueError):
+        occurrences = 0
+    try:
+        monthly_amount = float(subscription.get("monthly_amount") or 0)
+    except (TypeError, ValueError):
+        monthly_amount = 0.0
+    return (
+        f"{merchant} 已连续扣 {occurrences} 个月、每月约 ¥{monthly_amount:.0f}，"
+        f"建议去支付宝/微信的「自动续费」里关闭。"
+    )
+
+
+def _get_subscription_advice_fn():
+    """按模块属性取 AI 建议函数：并行开发期缺失 / 测试打桩都能感知。"""
+    try:
+        import ai_agent as _ai_agent_mod
+    except Exception as _ai_import_exc:  # pragma: no cover - 依赖缺失时只降级
+        print(
+            f"[subscription] ai_agent 不可用："
+            f"{type(_ai_import_exc).__name__}: {_ai_import_exc}"
+        )
+        return None
+    advice_fn = getattr(_ai_agent_mod, "generate_subscription_advice", None)
+    return advice_fn if callable(advice_fn) else None
+
+
 # Sidebar
 with st.sidebar:
     # ---- 个人设定（含负债率常驻预警）----
@@ -965,6 +1021,149 @@ with tab_dash:
             if _ratio > 1:
                 # 只给一条红色文字提示，不把整块渲染成 error（会影响下方其它内容）
                 st.caption(f":red[⚠️ {_cat_name} 已超出预算，建议控制该类支出]")
+
+    # ===== 隐形扣费雷达：疑似连续包月 + 年费预估 + AI 取消建议 =====
+    # 后端由并行方提供：取数失败只降级成一行 caption，绝不红屏、不影响下方账单明细。
+    _subs = None
+    try:
+        _subs_today_fn = getattr(db, "_report_today", None)
+        _subs_today = _subs_today_fn() if callable(_subs_today_fn) else None
+        # 走模块属性取函数：并行开发期缺失 / AppTest 打桩都能感知
+        _detect_subs_fn = getattr(db, "detect_subscriptions", None)
+        if not callable(_detect_subs_fn):
+            _detect_subs_fn = detect_subscriptions
+        if not callable(_detect_subs_fn):
+            raise RuntimeError("db.detect_subscriptions 不可用")
+        _subs = _detect_subs_fn(
+            st.session_state.user_id, months=3, today=_subs_today
+        )
+        if not isinstance(_subs, list):
+            _subs = []
+        else:
+            # 兜住脏返回：非 dict 项直接丢弃，避免下面 .get 把整块打红
+            _subs = [item for item in _subs if isinstance(item, dict)]
+    except Exception as _subs_exc:
+        print(
+            f"[subscription] 订阅检测失败："
+            f"{type(_subs_exc).__name__}: {_subs_exc}"
+        )
+        st.caption("隐形扣费雷达暂不可用")
+        _subs = None
+
+    if _subs is not None:
+        if not _subs:
+            st.success("🎉 未发现隐形订阅，干得漂亮！")
+        else:
+            st.subheader("📡 隐形扣费雷达")
+            st.caption("近 3 个月疑似连续包月（同商户 + 相近金额 + 约每月一次）")
+
+            _total_annual = 0.0
+            for _sub in _subs:
+                try:
+                    _total_annual += float(_sub.get("annual_cost") or 0)
+                except (TypeError, ValueError, AttributeError):
+                    continue
+            st.metric("预计每年将被扣费", f"¥{_total_annual:,.2f}")
+
+            # 表格：金额统一千分位，置信度只展示「高 / 中 / 低」三档
+            _sub_rows = []
+            for _sub in _subs:
+                try:
+                    _sub_monthly = float(_sub.get("monthly_amount") or 0)
+                except (TypeError, ValueError, AttributeError):
+                    _sub_monthly = 0.0
+                try:
+                    _sub_annual = float(_sub.get("annual_cost") or 0)
+                except (TypeError, ValueError, AttributeError):
+                    _sub_annual = 0.0
+                try:
+                    _sub_occurrences = int(_sub.get("occurrences") or 0)
+                except (TypeError, ValueError, AttributeError):
+                    _sub_occurrences = 0
+                _confidence = {"high": "高", "medium": "中"}.get(
+                    str(_sub.get("confidence") or "").strip().lower(), "低"
+                )
+                _sub_rows.append(
+                    {
+                        "商户": str(_sub.get("merchant") or "未知商户"),
+                        "月均": f"¥{_sub_monthly:,.2f}",
+                        "已扣次数": _sub_occurrences,
+                        "下次预计": str(_sub.get("next_expected_date") or "-"),
+                        "年费": f"¥{_sub_annual:,.2f}",
+                        "置信度": _confidence,
+                    }
+                )
+            st.dataframe(
+                pd.DataFrame(_sub_rows), hide_index=True, use_container_width=True
+            )
+
+            # ---- AI 取消建议：自动生成一次，按订阅批次做进程级缓存 ----
+            _advice_key = _subscription_advice_key(_subs)
+            _advice_store = _subscription_advice_store()
+            _advice_entry = _advice_store.get(_advice_key)
+            _advice_map = {}
+            _advice_is_fallback = False
+            _advice_ready = False
+
+            if isinstance(_advice_entry, dict) and isinstance(
+                _advice_entry.get("map"), dict
+            ):
+                # 缓存命中：不调 API、不扣额度
+                _advice_map = _advice_entry["map"]
+                _advice_is_fallback = bool(_advice_entry.get("fallback"))
+                _advice_ready = True
+            elif st.session_state.get("ai_daily_count", 0) >= 20:
+                # 额度用完：不调用、不写缓存（额度恢复后同批订阅仍可生成）
+                st.caption("今日 AI 额度已用完，暂不生成取消建议")
+            else:
+                try:
+                    _advice_fn = _get_subscription_advice_fn()
+                    if _advice_fn is None:
+                        raise RuntimeError("ai_agent.generate_subscription_advice 不可用")
+                    with st.spinner("AI 正在分析订阅…"):
+                        _text_map = _advice_fn(_subs, get_deepseek_api_key())
+                    if not isinstance(_text_map, dict):
+                        raise ValueError("AI 返回值不是 dict")
+                    _advice_map = {
+                        str(_merchant): str(_text)
+                        for _merchant, _text in _text_map.items()
+                        if str(_text or "").strip()
+                    }
+                    _advice_store[_advice_key] = {
+                        "map": _advice_map,
+                        "fallback": False,
+                    }
+                    st.session_state.ai_daily_count += 1
+                    _advice_is_fallback = False
+                    _advice_ready = True
+                except Exception as _advice_exc:
+                    # SubscriptionAdviceError / 网络 / 解析 / 依赖缺失统一本地兜底
+                    print(
+                        f"[subscription] AI 取消建议失败："
+                        f"{type(_advice_exc).__name__}: {_advice_exc}"
+                    )
+                    _advice_map = {
+                        str(_sub.get("merchant") or "该商户"): _subscription_local_advice(_sub)
+                        for _sub in _subs
+                    }
+                    _advice_store[_advice_key] = {
+                        "map": _advice_map,
+                        "fallback": True,
+                    }
+                    # 已经真的尝试过 API（或至少试过调用），按「已尝试」+1
+                    st.session_state.ai_daily_count += 1
+                    _advice_is_fallback = True
+                    _advice_ready = True
+
+            if _advice_ready:
+                for _sub in _subs:
+                    _merchant = str(_sub.get("merchant") or "该商户")
+                    st.markdown(
+                        f"**{_merchant}**："
+                        f"{_advice_map.get(_merchant, _subscription_local_advice(_sub))}"
+                    )
+                if _advice_is_fallback:
+                    st.caption("以上为本地建议（AI 暂不可用）")
 
     # ===== 账单明细：基于全量 df 的本地筛选 + 本地分页 =====
     # 说明：get_bills_paginated / get_total_bill_count 不再用于表格，但 import 保留
