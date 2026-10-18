@@ -18,3 +18,5 @@ sqlalchemy==2.1.4
 bcrypt==5.0.0
 streamlit-echarts==0.7.0
 supabase==2.32.0
+# extra-streamlit-components：登录页「记住我」需要读写浏览器 Cookie（0.1.81 实测可用）
+extra-streamlit-components==0.1.81

@@ -1,6 +1,7 @@
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
 import pandas as pd
+import hashlib
 import logging
 import math
 import re
@@ -3046,3 +3047,256 @@ def generate_smart_budget(user_id, total_budget, month: str | None = None) -> di
         "total": total_result,
         "scaled": scaled,
     }
+
+
+# ---------------------------------------------------------------------------
+# 登录「记住我」（users.remember_token / token_expires_at，迁移 016）
+# ---------------------------------------------------------------------------
+# 工作方式：
+#   · 用户勾选「记住我」并登录成功后，调用方生成一个 UUID4 原文写进 Cookie，
+#     再调用 set_remember_token(user_id, token, now + 7 天)；
+#   · 下次打开页面时，调用方把 Cookie 原文交给 get_user_by_remember_token(token)：
+#     返回 {"user_id", "username", "is_admin"} 表示会话有效，否则 None；
+#   · 退出登录时调用 clear_remember_token(user_id) 作废旧 token。
+#
+# 安全口径（与 016 文件头的说明一致）：
+#   · **库里只存 sha256(token) 的 64 位小写 hex，Cookie 里存 UUID 原文**。
+#     拖库 / 备份泄露 / SQL 注入读到 remember_token 不能直接登录：sha256 不可逆，
+#     而 token 是 UUID4（122 位随机），穷举与彩虹表都不可行；
+#   · 刻意不用 bcrypt：token 是高熵随机串，不是人选的密码；记住我校验发生在
+#     **登录恢复路径**（每个会话至少一次）上，bcrypt 的 ~200ms 会直接拖慢首屏。不加盐是安全的
+#     （随机 token 不存在"相同密码批量撞库"的问题）。
+#   · 过期判定用数据库的 now()（timestamptz 绝对时刻），不用应用机时钟：
+#     本机是 UTC+8、库是 UTC，拿 Python 的 naive 时间与库里 timestamptz 比较
+#     会整体错 8 小时；用 now() 还能屏蔽应用机时钟漂移（"7 天"不会变成 6 天 16 小时）。
+#   · 日志只写 user_id / 异常类型，**绝不写 token、也不写 hash**。
+#
+# 错误契约（app.py 依赖它，改语义前先看调用点）：
+#   · 参数非法（token 非字符串/空/长度越界、过期时间格式错或已过去）
+#     → ValueError（中文文案），且**在开连接之前**就拒绝，非法入参连库都不碰；
+#   · 016 未执行（42703 undefined_column）→ RuntimeError，提示先执行 016。
+#     get 也**不能**静默返回 None —— 那会让页面把"功能没启用"误判成
+#     "Cookie 失效"，用户反复重新登录也永远好不了；
+#   · set 时用户不存在（rowcount=0）→ ValueError("用户不存在")；
+#   · clear 幂等：用户不存在 / 本来就没有 token 都不报错。
+# ---------------------------------------------------------------------------
+
+REMEMBER_TOKEN_MISSING_MESSAGE = (
+    "记住我功能未启用：请先执行 migrations/016_users_remember_token.sql"
+)
+
+# 与 016 的 CHECK / 索引同口径的边界。UUID 原文 36 字符、uuid4().hex 32 字符都在区间内；
+# 上界 128 是"明显不是我们签发的 token"的廉价拒绝线，避免把超长串送进索引查询。
+REMEMBER_TOKEN_MIN_LEN = 8
+REMEMBER_TOKEN_MAX_LEN = 128
+
+
+def _sha256_hex(value: str) -> str:
+    """sha256 的小写十六进制（恰好 64 字符），与 016 的 CHECK / 索引逐字同口径。"""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _normalize_remember_token(token) -> str:
+    """写入侧：校验并返回用于哈希的 token（strip 后）。
+
+    为什么 strip：Cookie 经传输/框架解码后可能带首尾空白，而 token 本身不含空白；
+    写入与读取必须用**同一个** strip 口径，否则会出现"存进去却永远查不到"。
+    这里只校验长度，不打印 token 本身 —— 错误文案里连片段都不带。
+    """
+    if not isinstance(token, str):
+        raise ValueError(f"记住我 token 必须是字符串：{type(token).__name__}")
+    normalized = token.strip()
+    if not normalized:
+        raise ValueError("记住我 token 不能为空")
+    if not (REMEMBER_TOKEN_MIN_LEN <= len(normalized) <= REMEMBER_TOKEN_MAX_LEN):
+        raise ValueError(
+            f"记住我 token 长度必须在 {REMEMBER_TOKEN_MIN_LEN}~{REMEMBER_TOKEN_MAX_LEN} 个字符之间"
+        )
+    return normalized
+
+
+def _remember_token_digest_or_none(token):
+    """读取侧：非法 token 直接返回 None（**不抛**，脏 Cookie 不能把页面搞崩）。
+
+    非 str / 空 / 过短 / 过长都按"没有这个 token"处理，连一次数据库查询都不发。
+    """
+    if not isinstance(token, str):
+        return None
+    normalized = token.strip()
+    if not (REMEMBER_TOKEN_MIN_LEN <= len(normalized) <= REMEMBER_TOKEN_MAX_LEN):
+        return None
+    return _sha256_hex(normalized)
+
+
+def _normalize_remember_expiry(expires_at) -> datetime:
+    """把过期时间收敛成 **aware UTC datetime**，并保证严格晚于当前 UTC 时刻。
+
+    接受：
+      · datetime：naive 视为 UTC（与 008 起 users.created_at 的"绝对时刻"口径一致），
+        aware 一律 astimezone(UTC)；
+      · ISO 8601 字符串（如 "2026-10-25T12:00:00+00:00"、"...Z"、含空格的形式）。
+    拒绝：date / int / None / 空串 / 解析不了 / 已过去的时间（全部 ValueError）。
+
+    「必须晚于现在」刻意放在这里而不是数据库：过期时间在过去等于一写入就失效，
+    属于调用方 bug（比如把 seconds 和 days 搞混），必须当场暴露，而不是静默存一条废 token。
+    """
+    if isinstance(expires_at, datetime):
+        value = expires_at
+    elif isinstance(expires_at, str):
+        text = expires_at.strip()
+        if not text:
+            raise ValueError("记住我过期时间不能为空")
+        # Python 3.11+ 的 fromisoformat 已接受 "Z"，这里仍显式归一，
+        # 兼容只认 "+00:00" 的旧解释器，避免"本地行、线上不行"。
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        try:
+            value = datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise ValueError(
+                f"记住我过期时间格式非法：{expires_at!r}"
+                "（应为 ISO 8601，如 2026-10-25T12:00:00+00:00）"
+            ) from exc
+    else:
+        raise ValueError(
+            f"记住我过期时间非法：{expires_at!r}（应为 datetime 或 ISO 8601 字符串）"
+        )
+
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)  # naive 视为 UTC
+    else:
+        value = value.astimezone(timezone.utc)
+    if value <= datetime.now(timezone.utc):
+        raise ValueError("记住我过期时间必须晚于当前 UTC 时间")
+    return value
+
+
+def set_remember_token(user_id, token: str, expires_at) -> None:
+    """为用户写入「记住我」token（存 sha256 哈希，不存原文）。
+
+    参数：
+      · token：Cookie 里的原文（UUID 等随机串），strip 后长度 8~128，否则 ValueError；
+      · expires_at：datetime（naive 视为 UTC）或 ISO 字符串，必须晚于当前 UTC 时间。
+    行为：
+      · 同一用户只保留一个 token：UPDATE 直接覆盖旧值（旧 Cookie 立即失效）；
+      · 用户不存在 → ValueError("用户不存在")（rowcount=0，不静默成功）；
+      · 016 未执行（42703）→ RuntimeError（中文提示先执行 016）；
+      · 其余数据库异常原样上抛，由调用方按"系统繁忙"处理。
+    """
+    global engine
+    # 所有校验都在开连接之前：非法参数不会占用连接、不会开事务。
+    normalized = _normalize_remember_token(token)
+    expiry = _normalize_remember_expiry(expires_at)
+    digest = _sha256_hex(normalized)
+
+    if engine is None:
+        init_db()
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(
+                text(
+                    "UPDATE users SET remember_token = :h, token_expires_at = :e "
+                    "WHERE id = :uid"
+                ),
+                {"h": digest, "e": expiry, "uid": user_id},
+            )
+            rowcount = result.rowcount
+            conn.commit()
+    except ProgrammingError as exc:
+        if _pg_sqlstate(exc) == _PGCODE_UNDEFINED_COLUMN:  # 42703 = 016 未执行
+            raise RuntimeError(REMEMBER_TOKEN_MISSING_MESSAGE) from exc
+        raise
+    if rowcount == 0:
+        # 连上了、写成功，但一行都没命中：用户不存在（id 错 / 账号已删）。
+        # 必须报错：调用方不能对"记住了一个不存在的用户"当成功。
+        raise ValueError("用户不存在")
+
+
+def get_user_by_remember_token(token: str) -> dict | None:
+    """用 Cookie 里的 token 原文查「记住我」会话；有效返回用户信息，否则 None。
+
+    返回 ``{"user_id", "username", "is_admin"}``：
+      · is_admin 是**真 bool**（app.py 会直接塞进 session_state / 参与判断）；
+      · **不返回 remember_token / token_expires_at / password_hash** —— 页面上
+        没有任何理由拿到哈希，少一个字段就少一条泄露路径。
+
+    过期处理：
+      · 判定用 SQL 的 `token_expires_at <= now()`（数据库时钟，timestamptz 绝对时刻）；
+      · 过期行会顺手清空该用户的 token（best-effort）：清理失败只打 warning，
+        仍然返回 None —— 过期 token 绝不能因为"清理没跑成"又变成有效。
+    错误契约：
+      · 非法 token（非 str / 空 / 长度越界）→ 直接 None，不抛、不查库；
+      · 没有匹配行 → None（token 错 / 已被覆盖 / 已被 clear）；
+      · 016 未执行（42703）→ RuntimeError（前端据此提示），**不静默 None**；
+      · 其余数据库异常原样上抛（"连不上库"不能被伪装成"Cookie 失效"，
+        否则一次数据库抖动会把所有记住我用户静默踢下线）。
+    """
+    global engine
+    digest = _remember_token_digest_or_none(token)
+    if digest is None:
+        return None
+
+    if engine is None:
+        init_db()
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT id, username, is_admin, token_expires_at, "
+                    "       (token_expires_at IS NULL OR token_expires_at <= now()) AS is_expired "
+                    "FROM users WHERE remember_token = :h"
+                ),
+                {"h": digest},
+            ).fetchone()
+    except ProgrammingError as exc:
+        if _pg_sqlstate(exc) == _PGCODE_UNDEFINED_COLUMN:  # 42703 = 016 未执行
+            raise RuntimeError(REMEMBER_TOKEN_MISSING_MESSAGE) from exc
+        raise
+
+    if row is None:
+        return None
+
+    if bool(row.is_expired):
+        # best-effort 清理：失败只告警，不影响"过期 = 未登录"的结论。
+        # 注意日志里只有 user_id，没有 token / hash。
+        try:
+            clear_remember_token(row.id)
+        except Exception:  # noqa: BLE001 - 清理是附带动作，绝不能改变登录判定
+            logging.getLogger(__name__).warning(
+                "[db] 清理过期「记住我」token 失败（users.id=%r），本次仍按未登录处理",
+                row.id,
+                exc_info=True,
+            )
+        return None
+
+    return {
+        "user_id": row.id,
+        "username": row.username,
+        "is_admin": bool(row.is_admin),
+    }
+
+
+def clear_remember_token(user_id) -> None:
+    """作废用户的「记住我」token（两列同时置 NULL）。
+
+    幂等：用户不存在、本来就没有 token、重复调用都不报错（UPDATE 影响 0 行是正常结果）。
+    016 未执行（42703）→ RuntimeError：与 set/get 保持同一条错误契约，
+    避免"以为已经清掉了，其实列都不存在"的静默状态。
+    """
+    global engine
+    if engine is None:
+        init_db()
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    "UPDATE users SET remember_token = NULL, token_expires_at = NULL "
+                    "WHERE id = :uid"
+                ),
+                {"uid": user_id},
+            )
+            conn.commit()
+    except ProgrammingError as exc:
+        if _pg_sqlstate(exc) == _PGCODE_UNDEFINED_COLUMN:  # 42703 = 016 未执行
+            raise RuntimeError(REMEMBER_TOKEN_MISSING_MESSAGE) from exc
+        raise

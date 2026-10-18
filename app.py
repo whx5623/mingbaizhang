@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 from streamlit_echarts import st_echarts
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from config import get_deepseek_api_key
 try:
     from health_score import compute_health_score
@@ -11,7 +11,9 @@ except ImportError as _health_import_exc:
     print(f"[health] 健康分模块不可用：{type(_health_import_exc).__name__}: {_health_import_exc}")
 from finance_math import compute_irr, payment_from_fee, debt_ratio
 from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, get_user_auth_state, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data, get_login_daily_stats, login_events_available, LoginThrottled, set_goal, get_goal, add_to_goal, get_budget_details, save_budget_details, generate_smart_budget
+import db
 import requests
+import uuid
 import json
 import math
 import hashlib
@@ -19,6 +21,12 @@ import os
 import tomllib
 
 st.set_page_config(layout="wide")
+
+# ========= 「记住我」常量 =========
+# cookie 名固定下来，前后端（登录写入 / 顶层自动登录 / 退出删除）共用同一份，
+# 避免三处字符串漂移导致「退出后还能自动登录」。
+REMEMBER_COOKIE_NAME = "mbz_remember"
+_REMEMBER_TOKEN_DAYS = 7
 
 # ========= PWA注入代码 =========
 pwa_html = '''
@@ -75,7 +83,140 @@ if "chat_history" not in st.session_state:
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
 
+
+# ========== 「记住我」：CookieManager 单例 + 登录写入 + 顶层自动登录 ==========
+# 单例原因：extra_streamlit_components 的组件 key 在**同一次脚本 run 内必须唯一**，
+# 每次 rerun 都 new 一个同 key 的 CookieManager 会报重复组件错误；存进 session_state
+# 后每个 session 只实例化一次（不放在模块级：模块级对象跨 session 共享，
+# 而组件状态本身是 per-session 的）。
+def _get_cookie_manager():
+    manager = st.session_state.get("_remember_cookie_manager")
+    if manager is None:
+        # 延迟导入：依赖缺失/组件异常时只让「记住我」降级，绝不让整页 import 失败
+        from extra_streamlit_components import CookieManager
+        manager = CookieManager(key="remember_cookie_manager")
+        st.session_state["_remember_cookie_manager"] = manager
+    return manager
+
+
+def _remember_db_func(name):
+    """按名字取 db 里的记住我函数；并行开发期尚未提供时返回 None，由调用方降级处理。
+
+    刻意走 db 模块属性而不是 `from db import ...`：db.py 由并行方提供，
+    函数可能晚于 app.py 落地；模块属性取用可避免 import 失败，也方便测试打桩。
+    """
+    return getattr(db, name, None)
+
+
+def _issue_remember_token(uid):
+    """登录成功且勾选「记住我」时调用：先写库（存 sha256），成功后才写浏览器 cookie。
+
+    任何一步失败都只降级 + 提示，**绝不影响登录本身**。
+    """
+    _token = uuid.uuid4().hex
+    # 用 UTC 计算过期时间：db.set_remember_token 把 naive 时间当 UTC 处理，
+    # 这里若用本地时间（UTC+8）会让库里的有效期比 cookie 多 8 小时，口径不一致。
+    _expires_at = datetime.now(timezone.utc) + timedelta(days=_REMEMBER_TOKEN_DAYS)
+    _set_remember = _remember_db_func("set_remember_token")
+    if _set_remember is None:
+        print("[remember] db.set_remember_token 不可用（请确认已执行 migrations/016）")
+        st.warning("记住我暂不可用（请确认已执行 migrations/016）")
+        return
+    try:
+        _set_remember(uid, _token, _expires_at)
+    except Exception as _remember_exc:
+        # 016 未执行时 db 层抛 RuntimeError，这里一并兜住；日志只写异常类型，不写 token
+        print(f"[remember] 写入 remember token 失败：{type(_remember_exc).__name__}: {_remember_exc}")
+        # 登录成功后会立刻 st.rerun()，st.warning 会被这次 rerun 吞掉；
+        # 额外塞一条 flash，让用户在登录后的看板上仍能看到「记住我未生效」。
+        st.warning("记住我暂不可用（请确认已执行 migrations/016）")
+        st.session_state["flash"] = {"level": "warning", "msg": "记住我暂不可用（请确认已执行 migrations/016）"}
+        return
+    try:
+        _get_cookie_manager().set(
+            REMEMBER_COOKIE_NAME,
+            _token,
+            path="/",
+            expires_at=_expires_at,
+            # localhost 被浏览器视为安全上下文，secure=True 在本地也能写入；
+            # 纯 http 内网部署需改为 False，否则浏览器会静默丢弃该 cookie。
+            secure=True,
+            same_site="lax",
+        )
+    except Exception as _cookie_exc:
+        # 库里有 token 但浏览器没写成功：本次登录照常，下次会重新覆盖，不影响使用
+        print(f"[remember] 写入 remember cookie 失败：{type(_cookie_exc).__name__}: {_cookie_exc}")
+        st.warning("记住我暂不可用（浏览器未能保存登录状态）")
+
+
+# 顶层自动登录：必须在「未登录分支」之前执行，否则登录页会先 st.stop() 掉。
+# 首次 get_all() 在真实浏览器里可能返回 None / {}（iframe 还没把 cookie 回传），
+# 这时**不能**写 auto_login_checked：组件就绪后会触发 rerun，下一轮再读；
+# 只有真正拿到了 token 才标记「已尝试」，坏 token 不会每次 rerun 都查一次库。
+if not st.session_state.get("user_id"):
+    _remember_token = st.session_state.get("remember_token_cache")
+    if _remember_token is None:
+        try:
+            _cookies = _get_cookie_manager().get_all() or {}
+        except Exception as _cookie_exc:
+            # 组件缺失 / 首次未就绪 / 浏览器事件异常 → 静默降级成普通登录
+            print(f"[remember] 读取 cookie 失败：{type(_cookie_exc).__name__}: {_cookie_exc}")
+            _cookies = {}
+        # 只接受 dict：None / 组件占位值一律当作「没有 cookie」
+        _token_in_cookie = _cookies.get(REMEMBER_COOKIE_NAME) if isinstance(_cookies, dict) else None
+        if isinstance(_token_in_cookie, str) and _token_in_cookie:
+            # 缓存到 session：同一 session 不再重复渲染组件读 cookie（测试也依赖这一点）
+            st.session_state["remember_token_cache"] = _token_in_cookie
+            _remember_token = _token_in_cookie
+    if _remember_token and not st.session_state.get("auto_login_checked"):
+        st.session_state["auto_login_checked"] = True
+        _remember_user = None
+        _lookup_remember = _remember_db_func("get_user_by_remember_token")
+        if _lookup_remember is None:
+            print("[remember] db.get_user_by_remember_token 不可用（请确认已执行 migrations/016）")
+        else:
+            try:
+                _remember_user = _lookup_remember(_remember_token)
+            except RuntimeError as _remember_exc:
+                # 016 未执行（db 层主动抛的中文提示）：当作未登录，绝不红屏
+                print(f"[remember] 自动登录不可用（016 未执行？）：{type(_remember_exc).__name__}: {_remember_exc}")
+                _remember_user = None
+            except Exception as _remember_exc:
+                print(f"[remember] 自动登录查询异常：{type(_remember_exc).__name__}: {_remember_exc}")
+                _remember_user = None
+        if _remember_user:
+            # 查询失败时**不删 cookie**：可能是 016 未执行或临时故障，删了会让用户莫名掉登录
+            _remember_uid = _remember_user.get("user_id") if isinstance(_remember_user, dict) else None
+            if _remember_uid:
+                # 与手动登录成功分支完全一致：只写 user_id，紧接的 st.rerun() 会在下一次
+                # run 开头的统一鉴权里补 is_admin；page / ai_daily_count / ai_last_count_date /
+                # chat_history 等默认值已在本次 run 顶部初始化过，无需重复设置。
+                st.session_state.user_id = _remember_uid
+                st.session_state["flash"] = {"level": "success", "msg": "已自动登录"}
+                st.rerun()
+
+
 def logout():
+    # 「记住我」双清：先清库（需要当前 user_id），再删浏览器 cookie，最后才清 session。
+    # 顺序关键：delete() 会触发组件 rerun，若此时 user_id / cookie 还在就可能又自动登回来；
+    # 因此先把 auto_login_checked 置 True，本轮/下一轮都不会再尝试自动登录。
+    st.session_state["auto_login_checked"] = True
+    _logout_uid = st.session_state.get("user_id")
+    if _logout_uid is not None:
+        _clear_remember = _remember_db_func("clear_remember_token")
+        if _clear_remember is None:
+            print("[remember] db.clear_remember_token 不可用（请确认已执行 migrations/016）")
+        else:
+            try:
+                _clear_remember(_logout_uid)
+            except Exception as _clear_exc:
+                print(f"[remember] 清除 remember token 失败：{type(_clear_exc).__name__}: {_clear_exc}")
+    try:
+        _get_cookie_manager().delete(REMEMBER_COOKIE_NAME)
+    except Exception as _delete_exc:
+        # cookie 不存在时组件内部 del self.cookies[...] 会 KeyError：没有可删的，忽略即可
+        print(f"[remember] 删除 remember cookie 失败：{type(_delete_exc).__name__}: {_delete_exc}")
+    st.session_state.pop("remember_token_cache", None)
     st.session_state.user_id = None
     st.session_state.is_admin = False
     st.session_state.pop("last_upload_sig", None)        # 换人登录后不能沿用上一个人的文件签名
@@ -94,6 +235,8 @@ if st.session_state.user_id is None:
     username = st.text_input("用户名", max_chars=50, placeholder="3-50 个字符")
     # 密码：长度规则与 db 层 bcrypt 的硬限制保持一致（8 位起，UTF-8 72 字节封顶）
     password = st.text_input("密码", type="password", help="至少 8 位；最长 72 字节（约 24 个汉字）")
+    # 「记住我」只属于登录表单：注册分支不读这个值，也不会下发 remember token
+    remember_me = st.checkbox("记住我（7天免登录）", key="remember_me_checkbox")
     col1, col2 = st.columns(2)
     with col1:
         if st.button("登录"):
@@ -114,6 +257,9 @@ if st.session_state.user_id is None:
                 else:
                     if uid:
                         st.session_state.user_id = uid
+                        if remember_me:
+                            # 写库失败/组件异常只降级提示，登录继续（见 _issue_remember_token）
+                            _issue_remember_token(uid)
                         # 不在这里查管理员标记：紧接的 st.rerun() 会在下一次 run 开头的
                         # 统一鉴权里重算，此处赋值没人读，纯多一次查询
                         st.rerun()
