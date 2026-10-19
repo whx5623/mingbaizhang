@@ -4325,3 +4325,688 @@ def award_challenge_points(user_id, week: str, points: int) -> dict:
         awarded,
     )
     return {"awarded": awarded, "points": total, "week": normalized_week}
+
+
+# ===========================================================================
+# 平台账单导入（微信支付 / 支付宝 / 通用 CSV）
+# ===========================================================================
+# 背景：用户手里的原始账单不是本项目的 5 列 CSV，而是平台自己导出的文件：
+#   · 微信支付：「我 → 服务 → 钱包 → 账单 → 常见问题 → 下载账单」得到 CSV，
+#     前面十几行是账户 / 时间范围 / 导出时间等说明，中间才是 11 列表头；
+#   · 支付宝：「账单 → 开具交易流水证明 → 用于个人对账」得到 CSV，前 4~6 行说明；
+#   · 通用：本项目 app.py 一直在用的 date,merchant,amount,payment_method,type。
+# 这两类文件对用户来说"就是账单"，但结构并不统一：
+#   · 编码：微信/支付宝老版本导出是 GBK/GB18030，新版本是 UTF-8(BOM)；
+#   · 前导说明行、分隔行、末尾汇总行都不是数据；
+#   · 列名全角/半角括号、首尾空格、BOM 都可能不同。
+# 所以本段做三件事：① 猜编码并解码；② 定位表头、识别平台；③ 逐行清洗成
+# bills 需要的 6 个字段（date/merchant/amount/payment_method/type/category）。
+# 设计红线（与 import_csv_to_bills 一致）：
+#   · 脏行只跳过自己，带**文件原始行号**与中文原因，绝不让整份账单失败；
+#   · 金额/日期/类型全部复用既有归一化函数，口径与手工记账、CSV 导入完全一致；
+#   · 分类只走规则（auto_categorize 不传 api_key）：批量导入几百行逐行问 AI
+#     又慢又贵，规则未命中落 "其他"，仍可在页面上人工改。
+# ---------------------------------------------------------------------------
+
+PLATFORM_BILL_ENCODINGS = ("utf-8-sig", "gb18030", "gbk", "big5")
+
+PLATFORM_ENCODING_ERROR = (
+    "无法识别文件编码（已尝试 UTF-8 / GB18030 / GBK / Big5）："
+    "请上传微信/支付宝导出的 CSV 文件"
+)
+
+PLATFORM_FORMAT_ERROR = "无法识别的账单格式：请上传微信/支付宝导出的 CSV 文件"
+
+# 一个"像账单"的文本至少要命中其中一个标记。用途只有一个：当同一串字节能被
+# 多种编码解开时（Big5 的中文字节恰好也是合法的 GB18030 序列），挑出真正的那一种。
+# 这个判据**不参与**平台识别，只参与"选编码"，误命中不会改变平台判断。
+_PLATFORM_TEXT_MARKERS = (
+    "微信支付", "支付宝", "交易时间", "交易创建时间", "交易对方",
+    "金额(元)", "金额（元）", "收/支", "商品名称",
+)
+
+# 表头里可能出现的列名（已归一：去空白、全角括号转半角、casefold）。
+# 说明行即使带逗号，也很少同时出现 2 个以上这样的列名 → 用"≥2 个"当表头候选，
+# 而不是一上来就要求完整签名（有些平台的导出会少列，完整签名会认不出）。
+_PLATFORM_HEADER_KEY_COLUMNS = frozenset({
+    "交易时间", "交易创建时间", "付款时间", "交易对方", "金额(元)", "金额",
+    "收/支", "收支", "商品", "商品名称", "支付方式", "交易单号", "商户单号",
+    "交易号", "商家订单号", "交易类型", "当前状态", "交易状态", "资金状态",
+    "date", "merchant", "amount", "payment_method", "type",
+})
+
+# 表头之后仍可能出现的结构行/汇总行。这类行**静默跳过**，不写 skipped ——
+# 用户关心的是"哪笔账没导进来"，而不是"文件末尾那行总计也跳过了"。
+# 这也是 V3 里 skipped 恰好等于脏数据行数的原因。
+_PLATFORM_STRUCTURE_ROW_MARKERS = (
+    "起始时间", "终止时间", "导出时间", "账单明细", "交易记录明细",
+)
+_PLATFORM_TOTAL_ROW_PATTERN = re.compile(r"^共\s*\d+\s*笔", re.ASCII)
+
+# 金额：可选正负号 + 十进制；清洗掉 ¥/￥/千分位逗号/空格/尾缀"元"后再整串匹配。
+_PLATFORM_AMOUNT_PATTERN = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", re.ASCII)
+
+# 日期：三种平台常见写法，允许后面跟时间（空格或 T 分隔）。
+_PLATFORM_DATE_PATTERNS = (
+    re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T].*)?", re.ASCII),
+    re.compile(r"(\d{4})/(\d{1,2})/(\d{1,2})(?:[ T].*)?", re.ASCII),
+    re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日?(?:\s*.*)?", re.ASCII),
+)
+
+# 平台 → 日期列别名（按优先级）。微信的日期列叫"交易时间"，支付宝叫"交易创建
+# 时间"；通用 CSV 叫 date。后面的别名是宽容兜底（少数导出版本会改名）。
+_PLATFORM_DATE_ALIASES = {
+    "wechat": ("交易时间", "交易创建时间", "付款时间", "date"),
+    "alipay": ("交易创建时间", "交易时间", "付款时间", "date"),
+    "generic": ("date", "交易时间", "交易创建时间"),
+}
+
+# 其余列的平台无关别名（表头归一后的大小写/括号差异已在匹配时吃掉）。
+_PLATFORM_COLUMN_ALIASES = {
+    "merchant": ("交易对方", "merchant", "交易对方名称", "对方"),
+    "product": ("商品", "商品名称", "product"),
+    "amount": ("金额(元)", "金额", "amount"),
+    "direction": ("收/支", "收支", "type", "direction"),
+    "payment": ("支付方式", "payment_method", "付款方式"),
+}
+
+
+def _platform_format_error(filename=""):
+    """拼格式错误文案：带上文件名（有的话），核心句保持不变，便于页面直接展示。"""
+    if filename:
+        return f"{PLATFORM_FORMAT_ERROR}（文件：{filename}）"
+    return PLATFORM_FORMAT_ERROR
+
+
+def _normalize_platform_header_name(value):
+    """把表头/列名收敛成可比较的形式：去 BOM、去所有空白、全角括号转半角、casefold。
+
+    为什么去**所有**空白：微信导出的列名可能写成 "金额 (元)"、" 交易对方"；
+    支付宝写成 "金额（元）"。不归一，同一份文件换台机器/换次版本就认不出表头。
+    casefold 是给通用 CSV 的英文列名（DATE / Date / date）用的。
+    """
+    text = "" if value is None else str(value)
+    text = text.replace("\ufeff", "").strip()
+    text = text.replace("（", "(").replace("）", ")")
+    # 中文逗号只作列名分隔符出现，按半角统一（只用于表头，不影响数据值）
+    text = text.replace("，", ",")
+    text = re.sub(r"\s+", "", text)
+    return text.casefold()
+
+
+def _platform_header_signature(names):
+    """按平台导出文件的完整表头签名识别平台；认不出返回 None。
+
+    签名来自真实导出文件：
+      微信：交易时间, 交易类型, 交易对方, 商品, 收/支, 金额(元), 支付方式, ...
+      支付宝：交易号, ..., 交易创建时间, ..., 交易对方, 商品名称, 金额（元）, 收/支, ...
+      通用：date, merchant, amount, payment_method, type
+    金额列允许写成 "金额"（少数导出版本不带单位），全角括号已被归一成半角。
+    """
+    name_set = {name for name in names if name}
+    if {"date", "merchant", "amount", "payment_method", "type"} <= name_set:
+        return "generic"
+    has_amount = bool(name_set & {"金额(元)", "金额"})
+    if has_amount and {"交易时间", "交易对方", "收/支"} <= name_set:
+        return "wechat"
+    if has_amount and {"交易创建时间", "交易对方", "收/支"} <= name_set:
+        return "alipay"
+    return None
+
+
+def _platform_header_key_count(names):
+    """表头候选打分：一行里出现多少个"账单关键列名"。
+
+    说明行（"起始时间：[...] 终止时间：[...]"）通常一个都不命中；
+    真正表头至少命中 4 个。用 >= 2 当候选，是为了兜住"平台导出少了某几列"
+    的变体 —— 完整签名认不出时还能靠文本里的平台名 + 部分列名继续解析。
+    """
+    seen = set()
+    for name in names:
+        if name and name in _PLATFORM_HEADER_KEY_COLUMNS:
+            seen.add(name)
+    return len(seen)
+
+
+def _platform_from_header_or_text(text, names):
+    """完整签名认不出时，用文件里的平台名 / 部分列名推断平台。"""
+    name_set = {name for name in names if name}
+    has_wechat = "微信支付" in text
+    has_alipay = "支付宝" in text
+    if has_wechat and not has_alipay:
+        return "wechat"
+    if has_alipay and not has_wechat:
+        return "alipay"
+    # 两个平台名都出现（例如备注里提到对方平台）时，用列名区分：
+    # 支付宝独有"交易创建时间 / 交易号 / 商品名称"，微信独有"交易时间 / 商品"。
+    if name_set & {"交易创建时间", "交易号", "商家订单号", "商品名称", "付款时间"}:
+        return "alipay"
+    if name_set & {"交易时间", "交易类型", "支付方式", "商品", "交易单号", "商户单号"}:
+        return "wechat"
+    return None
+
+
+def _looks_like_platform_bill_text(text):
+    """粗判一段文本像不像账单（只用于多编码都能解码时挑哪一种）。"""
+    return any(marker in text for marker in _PLATFORM_TEXT_MARKERS)
+
+
+def _decode_platform_bill(file_bytes):
+    """把上传的字节解码成文本，返回 (encoding, text)。
+
+    顺序是 utf-8-sig → gb18030 → gbk → big5（gb18030 是 gbk 的超集，必须排在
+    gbk 前面，否则 GB18030 里的 4 字节汉字会被 gbk 判成非法）。但"能解码"不等于
+    "解对了"：Big5 的中文字节往往也是合法的 GB18030 序列。所以这里先收集所有能
+    解码成功的候选，优先选**文本看起来像账单**的那一个（含平台名/关键列名）。
+    全部解不出来 → ValueError（中文文案）。
+
+    返回的 encoding 是给用户核对导出编码用的：如果 GB18030 解出来的内容同样能被
+    GBK 无损解开（说明内容本来就落在 GBK 子集里），回报更具体的 "gbk"；两者文本
+    逐字相同，解析结果不受影响（V2 的 GBK 账单断言"encoding=gbk"正依赖这一点）。
+    """
+    if isinstance(file_bytes, bytearray):
+        file_bytes = bytes(file_bytes)
+    if not isinstance(file_bytes, bytes):
+        raise ValueError(f"账单文件必须是 bytes（二进制内容）：{type(file_bytes).__name__}")
+    if not file_bytes:
+        raise ValueError("账单文件为空：请重新从微信/支付宝导出后再上传")
+
+    decoded = []
+    for encoding in PLATFORM_BILL_ENCODINGS:
+        try:
+            decoded.append((encoding, file_bytes.decode(encoding)))
+        except (UnicodeDecodeError, LookupError):
+            continue
+    if not decoded:
+        raise ValueError(PLATFORM_ENCODING_ERROR)
+
+    encoding, text = next(
+        ((enc, content) for enc, content in decoded if _looks_like_platform_bill_text(content)),
+        decoded[0],
+    )
+    text = text.lstrip("\ufeff")
+    if encoding == "gb18030":
+        try:
+            if file_bytes.decode("gbk") == text:
+                encoding = "gbk"
+        except UnicodeDecodeError:
+            pass
+    return encoding, text
+
+
+def _iter_platform_csv_rows(text):
+    """逐行产出 (原始行号, 字段列表)，行号是**文件里的物理行号**（1-based）。
+
+    为什么不用 pandas.read_csv(skiprows=N)：说明行数并不固定（微信 14~18 行、
+    支付宝 4~6 行，不同年份/版本不一样），写死 skiprows 必定错位；而且平台文件
+    里字段可能带逗号/引号，必须先按 CSV 规则切分，再逐行找表头。
+    csv.reader.line_num 给的是物理行号，带引号的多行字段也能对得上。
+    """
+    import csv
+    import io
+    import re
+    # 就地 import：csv / io / re 只有平台账单解析才用得到，放在函数里可以保持本次改动
+    # 完全"只追加"，不动文件头的既有 import 区。
+
+    # 平台账单偶尔把金额写成 ￥1,018.50 且**不加引号**：csv.reader 会把这个逗号当成
+    # 字段分隔符，导致「金额=1.0、支付方式=018.50」这类错位（实测微信导出会遇到）。
+    # 解析前去掉「数字,三位数字」之间的千分位逗号：引号内普通逗号的左右不是数字，
+    # 不会被误伤；日期用 - /，也不会命中。
+    text = re.sub(r"(?<=\d),(?=\d{3}(?:\D|$))", "", text)
+
+    reader = csv.reader(io.StringIO(text, newline=""))
+    previous_line = 0
+    try:
+        for fields in reader:
+            start_line = previous_line + 1
+            previous_line = reader.line_num
+            yield start_line, fields
+    except csv.Error as exc:
+        # 解出来的文本不是合法 CSV（含 NUL、引号不闭合等）：按"格式不认识"处理
+        raise ValueError(f"{PLATFORM_FORMAT_ERROR}（文件不是合法的 CSV）") from exc
+
+
+def _platform_cell(cells, position):
+    """取一行里某一列的值；列不存在/越界一律当空串（不抛 IndexError）。"""
+    if position is None:
+        return ""
+    if 0 <= position < len(cells):
+        return cells[position]
+    return ""
+
+
+def _clip_platform_text(value, limit):
+    """去掉空白 / NaN / NUL 并按列宽截断（merchant VARCHAR(100)、payment_method VARCHAR(50)）。
+
+    截断而不是报错：平台账单的商品名/商户名可能超过 100 字符，整批因此回滚的代价
+    远大于丢掉尾部几个字；分类与金额都不受影响。
+    """
+    if _is_missing_value(value):
+        return ""
+    text = str(value).replace("\x00", "").strip()
+    return text[:limit]
+
+
+def _parse_platform_bill_date(raw):
+    """把平台日期收敛成严格 ISO 'YYYY-MM-DD'，并校验真实日历日。
+
+    支持：2026-10-01 12:30:00 / 2026/10/01 / 2026年10月1日（可带时间）。
+    非法（含 2026-02-30、2026-13-01 这种"格式对、日子不存在"）→ ValueError。
+    返回 ISO 串而不是 datetime：bills.date 是字符串列，读取侧靠 ISO 字典序排序。
+    """
+    if _is_missing_value(raw):
+        raise ValueError("账单日期不能为空")
+    text = str(raw).strip().replace("\u3000", " ")
+    for pattern in _PLATFORM_DATE_PATTERNS:
+        matched = pattern.fullmatch(text)
+        if not matched:
+            continue
+        year, month, day = (int(part) for part in matched.groups())
+        try:
+            return date(year, month, day).isoformat()
+        except ValueError as exc:
+            raise ValueError("日期不合法") from exc
+    raise ValueError("日期不合法")
+
+
+def _parse_platform_bill_amount(raw):
+    """把平台金额字符串转成带符号的 float（不做 >0 / 上界判断，交给调用方）。
+
+    清洗：¥ / ￥ / $ / 千分位逗号 / 全角空格 / 首尾空白 / 尾缀"元"。
+    保留符号：收/支列缺失时，负号是唯一能判断"支出"的信号。
+    """
+    if _is_missing_value(raw):
+        raise ValueError("账单金额不能为空")
+    text = str(raw).strip()
+    for token in ("¥", "￥", "$", "＄", ",", "，", "\u00a0", "\u3000", " "):
+        text = text.replace(token, "")
+    if text.endswith("元"):
+        text = text[:-1].strip()
+    if not _PLATFORM_AMOUNT_PATTERN.fullmatch(text):
+        raise ValueError(f"账单金额非法：{raw!r}")
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"账单金额非法：{raw!r}")
+    return value
+
+
+def _resolve_platform_columns(platform, names):
+    """把表头列名映射成 canonical 列 → 列下标；找不到的置 None。"""
+    index = {}
+    for position, name in enumerate(names):
+        if name and name not in index:
+            index[name] = position
+
+    def pick(aliases):
+        for alias in aliases:
+            key = _normalize_platform_header_name(alias)
+            if key in index:
+                return index[key]
+        return None
+
+    date_aliases = _PLATFORM_DATE_ALIASES.get(platform, _PLATFORM_DATE_ALIASES["generic"])
+    return {
+        "date": pick(date_aliases),
+        "merchant": pick(_PLATFORM_COLUMN_ALIASES["merchant"]),
+        "product": pick(_PLATFORM_COLUMN_ALIASES["product"]),
+        "amount": pick(_PLATFORM_COLUMN_ALIASES["amount"]),
+        "direction": pick(_PLATFORM_COLUMN_ALIASES["direction"]),
+        "payment": pick(_PLATFORM_COLUMN_ALIASES["payment"]),
+    }
+
+
+def _platform_missing_columns(columns):
+    """返回缺失的关键列中文名（日期/金额/交易对方或商品），空列表 = 能解析。"""
+    missing = []
+    if columns.get("date") is None:
+        missing.append("日期")
+    if columns.get("amount") is None:
+        missing.append("金额")
+    if columns.get("merchant") is None and columns.get("product") is None:
+        missing.append("交易对方/商品")
+    return missing
+
+
+def _parse_platform_row(cells, platform, columns):
+    """清洗一行数据，返回 6 字段 dict；任何脏数据抛 ValueError（中文原因）。
+
+    行号/平台/列映射都与"数据内容"无关，所以由 parse_platform_bill 负责；
+    本函数只面对"这一行的值对不对"，方便单测逐条构造。
+    """
+    try:
+        bill_date = _parse_platform_bill_date(_platform_cell(cells, columns.get("date")))
+    except ValueError as exc:
+        raise ValueError("日期不合法") from exc
+
+    # 商户：优先"交易对方"，空则退回"商品 / 商品名称"；两边都空就不能算一笔账。
+    merchant = _clip_platform_text(_platform_cell(cells, columns.get("merchant")), 100)
+    if not merchant:
+        merchant = _clip_platform_text(_platform_cell(cells, columns.get("product")), 100)
+    if not merchant:
+        raise ValueError("缺少商户")
+
+    payment = _clip_platform_text(_platform_cell(cells, columns.get("payment")), 50)
+    if not payment:
+        # 支付宝导出没有"支付方式"列：资金来源本来就是这个平台
+        payment = "支付宝" if platform == "alipay" else "未知"
+
+    raw_amount = _platform_cell(cells, columns.get("amount"))
+    try:
+        signed_amount = _parse_platform_bill_amount(raw_amount)
+    except ValueError as exc:
+        raise ValueError("金额不合法") from exc
+
+    direction_position = columns.get("direction")
+    if direction_position is not None:
+        # 收/支 列存在：只认 收入 / 支出（复用既有别名表），
+        # "不计收支 / 中性交易 / 空 / 其他"一律跳过 —— 它们不是真正的收支。
+        try:
+            bill_type = normalize_bill_type(
+                _platform_cell(cells, direction_position), strict=True
+            )
+        except ValueError as exc:
+            raise ValueError("不计收支") from exc
+        if signed_amount <= 0:
+            raise ValueError("金额必须大于 0")
+        amount_value = signed_amount
+    else:
+        # 收/支 列缺失（银行流水式文件）：负号 → 支出；显式正号 → 收入；
+        # 无符号正数无法判断方向 → 跳过。宁可少导，绝不把支出猜成收入（会虚增结余）。
+        if signed_amount < 0:
+            bill_type = EXPENSE_TYPE
+            amount_value = abs(signed_amount)
+        elif str(raw_amount).strip().startswith("+"):
+            bill_type = INCOME_TYPE
+            amount_value = signed_amount
+        else:
+            raise ValueError("无法判断收支（缺少收/支列）")
+
+    try:
+        # 与 add_bill / import_csv_to_bills 同一套口径：符号收敛 + 两位小数 + 上界校验
+        # （上界就是 MAX_ABS_AMOUNT = 9999999999.99，与 NUMERIC(12,2) 一致）。
+        amount_value = _normalize_amount(amount_value, bill_type)
+    except ValueError as exc:
+        raise ValueError("金额超出上限") from exc
+
+    # 分类只走规则：api_key=None → 不逐行调 AI。几百行的批量导入靠网络会极慢，
+    # 规则未命中落 "其他"，页面仍可人工改。
+    category = auto_categorize(merchant, "", api_key=None)
+
+    return {
+        "date": bill_date,
+        "merchant": merchant,
+        "amount": amount_value,
+        "payment_method": payment,
+        "type": bill_type,
+        "category": category,
+    }
+
+
+def parse_platform_bill(file_bytes: bytes, filename: str = "") -> dict:
+    """解析微信 / 支付宝 / 通用 CSV 账单，**只读不写库**，逐行容错。
+
+    参数：
+      · file_bytes：上传文件的原始字节（str 会直接 ValueError）
+      · filename：仅用于错误/日志文案，不参与解析
+
+    返回：
+        {"platform": "wechat" | "alipay" | "generic",
+         "encoding": "utf-8-sig" / "gb18030" / "gbk" / "big5",
+         "rows": [{"date": "YYYY-MM-DD", "merchant": str, "amount": float,
+                   "payment_method": str, "type": "支出" | "收入",
+                   "category": str, "_src_row": 文件原始行号}, ...],
+         "skipped": [{"row": 文件原始行号, "reason": "中文原因"}, ...],
+         "total": len(rows)}
+
+    解析流程：
+      ① 编码自适应：utf-8-sig → gb18030 → gbk → big5（gb18030 在 gbk 前，它是超集）；
+         全部失败 → ValueError（"无法识别文件编码…"）。
+      ② 平台识别：优先完整表头签名（微信 11 列 / 支付宝 16 列 / 通用 5 列），
+         其次用文件里的平台名 + 部分列名；都认不出 → ValueError（"无法识别的账单格式…"）。
+      ③ 定位表头：逐行找**包含关键列名**的那一行，之前的说明行全部跳过；
+         支付宝 4~6 行、微信 16 行左右都覆盖，不依赖固定 skiprows。
+      ④ 表头之后：空行 / `---` / `=` 分隔行 / "总计 / 共 N 笔 / 起始时间 / 终止时间 /
+         导出时间 / 账单明细"等说明汇总行**静默跳过**（不进 skipped，因为用户只关心
+         哪笔账没导进来）；只有"有日期、但字段不合法"的行才进 skipped。
+      ⑤ 逐行清洗：
+         · 日期：交易时间(微信) / 交易创建时间(支付宝)，支持 2026-10-01 12:30:00、
+           2026/10/01、2026年10月1日；严格校验真实日历日；
+         · 商户：交易对方，空则用商品/商品名称；仍为空 → skipped「缺少商户」；
+         · 金额：金额(元)/金额（元），去掉 ¥/￥/,/空格，必须 > 0，上界复用
+           MAX_ABS_AMOUNT（9999999999.99）；
+         · 收支：收/支 列 支出/收入；"不计收支/中性交易/空" → skipped「不计收支」；
+           收/支 列整列缺失时才用金额符号（- → 支出，+ → 收入，无符号 → 跳过）；
+         · 支付方式：微信取"支付方式"，支付宝无此列 → "支付宝"，空 → "未知"；
+         · 分类：auto_categorize(merchant, "", api_key=None)，**只走规则**。
+           这里刻意不逐行调 AI：几百行的批量导入逐行请求 DeepSeek 会慢到不可用，
+           且规则表已覆盖常见商户；未命中落 "其他"，不阻塞导入。
+      ⑥ 行号一律用**文件原始物理行号**（1-based），用户能直接对照 Excel/文本编辑器。
+
+    设计取舍：
+      · 每行独立 try：坏行只跳过自己，绝不整份失败；
+      · 所有金额/日期/类型都复用 add_bill / import_csv_to_bills 的归一化函数，
+        保证"手工记账 / 通用 CSV / 平台账单"三条入口口径完全一致；
+      · 不做去重、不碰库：同一份文件解析两次得到相同结果（可单测）。
+    """
+    encoding, text = _decode_platform_bill(file_bytes)
+    records = list(_iter_platform_csv_rows(text))
+
+    header_position = None
+    header_names = None
+    header_signature = None
+    partial_header = None
+
+    for position, (_line_no, fields) in enumerate(records):
+        names = [_normalize_platform_header_name(field) for field in fields]
+        signature = _platform_header_signature(names)
+        if signature is not None:
+            header_position = position
+            header_names, header_signature = names, signature
+            break
+        if partial_header is None and _platform_header_key_count(names) >= 2:
+            partial_header = (position, names)
+
+    platform = header_signature
+    if header_position is None and partial_header is not None:
+        position, names = partial_header
+        guessed = _platform_from_header_or_text(text, names)
+        if guessed is not None:
+            header_position = position
+            header_names, platform = names, guessed
+
+    if header_position is None or header_names is None or platform is None:
+        raise ValueError(_platform_format_error(filename))
+
+    columns = _resolve_platform_columns(platform, header_names)
+    missing = _platform_missing_columns(columns)
+    if missing:
+        raise ValueError(
+            f"{_platform_format_error(filename)}（缺少关键列：{'、'.join(missing)}）"
+        )
+
+    date_position = columns["date"]
+    rows = []
+    skipped = []
+    for line_no, fields in records[header_position + 1:]:
+        cells = ["" if field is None else str(field).strip() for field in fields]
+        non_empty = [cell for cell in cells if cell]
+        if not non_empty:
+            continue
+        first = non_empty[0]
+        joined = "".join(non_empty)
+        # 分隔行 / 汇总行 / 说明行：先按形状挡掉，避免它们被误算成"日期不合法"
+        if first.startswith("---") or first.startswith("=") or first.startswith("—"):
+            continue
+        if first.startswith("总计") or first.startswith("合计"):
+            continue
+        if _PLATFORM_TOTAL_ROW_PATTERN.match(first):
+            continue
+        if any(marker in joined for marker in _PLATFORM_STRUCTURE_ROW_MARKERS):
+            continue
+        # 重复表头（有些文件每页重复一次表头）
+        if sum(
+            1 for cell in cells
+            if _normalize_platform_header_name(cell) in _PLATFORM_HEADER_KEY_COLUMNS
+        ) >= 2:
+            continue
+        if _is_missing_value(_platform_cell(cells, date_position)):
+            # 没有日期：空行 / 单列汇总行 / 账户信息（非空单元格 < 3）静默跳过；
+            # 但一行明显有数据（>= 3 个非空单元格）却没日期时，仍按脏数据报告，
+            # 否则用户永远不知道这几笔账没导进来。
+            if len(non_empty) < 3:
+                continue
+            skipped.append({"row": line_no, "reason": "日期不合法"})
+            continue
+
+        try:
+            parsed_row = _parse_platform_row(cells, platform, columns)
+        except ValueError as exc:
+            skipped.append({"row": line_no, "reason": str(exc)})
+            continue
+        except Exception:
+            # 逐行容错兜底：任何意料之外的解析异常都不该让整份账单失败
+            logging.getLogger(__name__).warning(
+                "[parse_platform_bill] 第 %s 行解析失败（已跳过该行）", line_no, exc_info=True
+            )
+            skipped.append({"row": line_no, "reason": "行数据无法解析"})
+            continue
+
+        parsed_row["_src_row"] = line_no
+        rows.append(parsed_row)
+
+    return {
+        "platform": platform,
+        "encoding": encoding,
+        "rows": rows,
+        "skipped": skipped,
+        "total": len(rows),
+    }
+
+
+def import_platform_bill(user_id, file_bytes: bytes, filename: str = "") -> dict:
+    """把平台账单（微信/支付宝/通用 CSV）**追加**导入 bills，逐行容错。
+
+    返回：
+        {"platform": ..., "encoding": ...,
+         "imported": 实际写入行数,
+         "skipped": [{"row": 原始行号, "reason": 中文短句}, ...],
+         "total": parse 成功的行数（= parse_platform_bill 的 total）}
+
+    关键行为（与 import_csv_to_bills 的差异，务必先读完）：
+    - **追加，不替换**：本函数不会 DELETE 用户已有账单。import_csv_to_bills 的语义是
+      "整本账单替换"（内部先 DELETE FROM bills WHERE user_id=...），而平台账单是
+      **按自然月分段导出**的：用户这个月导微信、下个月导支付宝，替换语义会把上一份
+      账单直接清空。所以这里刻意复用它的**逐行归一化口径**（同一批 _normalize_* /
+      auto_categorize / _bills_category_supported），但写库改成纯 INSERT。
+    - **不去重**：同一份文件导入两次就真的写两遍；去重由前端负责（app.py 用
+      user_id + 文件名 + 大小 + 内容哈希做上传签名）。本函数保持纯粹，便于单测。
+    - **不逐行调 AI**：分类只走 auto_categorize 的规则（api_key=None），几百行也
+      不会因为网络变慢；规则未命中落 "其他"。
+    - **逐行容错**：parse 阶段已剔除的脏行原样合并进 skipped（行号是文件原始行号）；
+      写库前再过一遍既有归一化函数做防御校验，单行再有意外只跳过该行。
+    - **时区口径**：日期只取文件里的日历日，不做时区换算；平台导出的是用户本地
+      时间，跨零点前后的记录以平台文件为准（与 bills.date 是"日历日字符串"一致）。
+    - user_id 非法 → ValueError（_normalize_bill_query_user_id）；用户不存在 →
+      ValueError("用户不存在")（与 get_challenge_state 同口径）；写库失败 →
+      原样上抛（环境问题不能假装成功）。
+    """
+    uid = _normalize_bill_query_user_id(user_id)
+    parsed = parse_platform_bill(file_bytes, filename)
+    rows = parsed["rows"]
+    skipped = [dict(item) for item in parsed["skipped"]]
+    result = {
+        "platform": parsed["platform"],
+        "encoding": parsed["encoding"],
+        "imported": 0,
+        "skipped": skipped,
+        "total": parsed["total"],
+    }
+    if engine is None:
+        init_db()
+    with engine.connect() as conn:
+        exists = conn.execute(
+            text("SELECT 1 FROM users WHERE id = :uid"), {"uid": uid}
+        ).scalar()
+    if exists is None:
+        # 与 get_challenge_state / award_challenge_points 同一错误契约：
+        # 不能靠外键报错让页面看到 psycopg2 栈，也不能静默写成"0 行成功"。
+        raise ValueError("用户不存在")
+
+    if not rows:
+        return result
+
+    prepared = []
+    for position, row in enumerate(rows):
+        src_row = row.get("_src_row") or position + 1
+        try:
+            bill_date = _normalize_bill_date(row.get("date"))
+        except ValueError:
+            skipped.append({"row": src_row, "reason": "日期不合法"})
+            continue
+        try:
+            bill_type = normalize_bill_type(row.get("type"), strict=True)
+        except ValueError:
+            skipped.append({"row": src_row, "reason": "收支类型非法"})
+            continue
+        try:
+            amount = _normalize_amount(row.get("amount"), bill_type)
+        except ValueError:
+            skipped.append({"row": src_row, "reason": "金额不合法"})
+            continue
+        merchant = _clip_platform_text(row.get("merchant"), 100)
+        if not merchant:
+            skipped.append({"row": src_row, "reason": "缺少商户"})
+            continue
+        payment = _clip_platform_text(row.get("payment_method"), 50) or "未知"
+        category = row.get("category")
+        if not (isinstance(category, str) and category.strip() in BILL_CATEGORIES):
+            category = auto_categorize(merchant, "", api_key=None)
+        prepared.append({
+            "dt": bill_date,
+            "mer": merchant,
+            "amt": amount,
+            "pm": payment,
+            "tp": bill_type,
+            "cat": category.strip() if isinstance(category, str) else FALLBACK_CATEGORY,
+        })
+
+    if not prepared:
+        return result
+
+    write_category = _bills_category_supported()
+    try:
+        with engine.connect() as conn:
+            if write_category:
+                stmt = text("""
+                    INSERT INTO bills(user_id, date, merchant, amount, payment_method, type, category)
+                    VALUES (:uid, :dt, :mer, :amt, :pm, :tp, :cat)
+                """)
+                params = [{"uid": uid, **item} for item in prepared]
+            else:
+                # 012 未执行：去掉 category 再写（降级，导入优先）
+                stmt = text("""
+                    INSERT INTO bills(user_id, date, merchant, amount, payment_method, type)
+                    VALUES (:uid, :dt, :mer, :amt, :pm, :tp)
+                """)
+                params = [
+                    {
+                        "uid": uid,
+                        "dt": item["dt"],
+                        "mer": item["mer"],
+                        "amt": item["amt"],
+                        "pm": item["pm"],
+                        "tp": item["tp"],
+                    }
+                    for item in prepared
+                ]
+            # 追加语义：纯 INSERT，不 DELETE 既有账单
+            conn.execute(stmt, params)
+            conn.commit()
+    except Exception as exc:
+        print(
+            f"[import_platform_bill] 写库失败，本次导入已整体回滚（原有账单未被改动）：{exc}"
+        )
+        raise
+
+    result["imported"] = len(prepared)
+    return result

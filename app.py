@@ -11,6 +11,16 @@ except ImportError as _health_import_exc:
     print(f"[health] 健康分模块不可用：{type(_health_import_exc).__name__}: {_health_import_exc}")
 from finance_math import compute_irr, payment_from_fee, debt_ratio
 from db import init_db, get_all_bills, get_bills_paginated, get_total_bill_count, insert_demo_bills, import_csv_to_bills, register_user, verify_user, add_bill, get_user_auth_state, add_feedback, add_user_credits, get_admin_operate_data, get_admin_funnel_data, get_login_daily_stats, login_events_available, LoginThrottled, set_goal, get_goal, add_to_goal, get_budget_details, save_budget_details, generate_smart_budget, query_bills, delete_bills, detect_subscriptions
+# 微信/支付宝真实账单导入由并行方提供（db.import_platform_bill）：与其它并行模块同样先降级，
+# 尚未合入时侧边栏给出友好提示，而不是整页 ImportError 红屏。
+try:
+    from db import import_platform_bill
+except ImportError as _platform_import_exc:
+    import_platform_bill = None
+    print(
+        f"[platform] 微信/支付宝账单导入后端不可用："
+        f"{type(_platform_import_exc).__name__}: {_platform_import_exc}"
+    )
 # 每周省钱挑战后端由并行方提供（db.get_challenge_state / db.award_challenge_points + migrations/017）：
 # 与 get_daily_expense_totals 同样处理——db.py 可能晚于 app.py 合入，这里先降级成 None，
 # 卡片内按名字取模块属性（便于测试打桩），函数缺失时只显示「未启用」，绝不让整页 ImportError 红屏。
@@ -699,71 +709,106 @@ with st.sidebar:
         remaining = 20 - st.session_state.ai_daily_count
         st.info(f"今日剩余提问次数：{remaining}")
 
-    # ---- 数据导入（CSV 上传 + 演示数据）----
+    # ---- 数据导入（微信/支付宝真实账单 + 演示数据）----
     with st.container(border=True, key="card_data_import"):
         st.subheader("数据导入")
-        uploaded_file = st.file_uploader("上传账单文件", type=['csv'], key=f"uploader_{st.session_state.user_id}")
+        uploaded_file = st.file_uploader(
+            "上传微信/支付宝账单",
+            type=["csv", "txt"],
+            key=f"platform_bill_{st.session_state.user_id}",
+            help="在微信/支付宝 App 中申请导出账单，下载 CSV 后直接上传；支持 GBK/GB18030 编码与说明表头",
+        )
+        st.caption(
+            "微信：我 → 服务 → 钱包 → 账单 → 常见问题 → 下载账单；"
+            "支付宝：我的 → 账单 → 开具交易流水证明"
+        )
         if uploaded_file is not None:
-            # 文件级去重：st.file_uploader 的值跨 rerun 保留，imported>0 分支里的 st.rerun()
+            # 文件级去重：st.file_uploader 的值跨 rerun 保留，成功分支里的 st.rerun()
             # 会让脚本重跑并再次读到同一个文件 → 无限「导入→rerun→再导入」循环。
             # 签名 = 用户ID + 文件名 + 字节数 + 内容哈希：
             #   - 带 user_id：换人登录后不沿用上一个人的签名，同名同大小的另一份文件照常导入；
             #   - 带内容哈希：同名同大小但内容不同的文件不会被误判成「已处理过」而静默不导入。
-            # 签名只在真正写库成功后落位（见 imported > 0 分支），读取/校验/导入失败都不留签名，用户可立即重试。
+            # 签名只在真正写库成功后落位（见 imported > 0 分支），解析/校验/导入失败都不留签名，用户可立即重试。
             upload_sig = f"{st.session_state.user_id}:{uploaded_file.name}:{uploaded_file.size}:{hashlib.sha256(uploaded_file.getvalue()).hexdigest()[:16]}"
             if st.session_state.get("last_upload_sig") == upload_sig:
-                st.info(f"文件「{uploaded_file.name}」本次已处理过；如需重新导入同一文件，请修改内容或改名后重新上传。")
+                st.info(f"这份文件已处理过（「{uploaded_file.name}」已成功导入）；如需重新导入同一文件，请修改内容或改名后重新上传。")
             else:
-                df_upload = None
-                try:
-                    df_upload = pd.read_csv(uploaded_file, encoding="utf-8-sig")
-                    required_cols = ["date", "merchant", "amount", "payment_method", "type"]
-                    missing_cols = [col for col in required_cols if col not in df_upload.columns]
-                    if missing_cols:
-                        st.error(f"文件缺少必要列：{','.join(missing_cols)}")
-                        df_upload = None  # 缺列不进入导入分支，也不写签名
-                except Exception as e:
-                    st.error(f"读取文件失败：{str(e)}")
-                    df_upload = None
-
-                if df_upload is not None:
+                # 优先取 db 模块属性：并行开发期允许晚合入，测试里 patch db.import_platform_bill 也能生效；
+                # 再退回顶部 try import 的绑定，两种方式任一可用即可。
+                _import_platform_bill = getattr(db, "import_platform_bill", None) or import_platform_bill
+                if _import_platform_bill is None:
+                    st.error("账单导入功能暂不可用，请稍后再试")
+                else:
                     try:
-                        ret = import_csv_to_bills(st.session_state.user_id, df_upload)
-                        imported = ret.get("imported", 0)
-                        skipped = ret.get("skipped", []) or []
-                        total = ret.get("total", len(df_upload))
+                        # 真实账单可能是 GBK/GB18030 且带说明表头，统一交给数据层解密/识别编码/解析
+                        with st.spinner("正在解密并解析真实账单..."):
+                            result = _import_platform_bill(
+                                st.session_state.user_id,
+                                uploaded_file.getvalue(),
+                                uploaded_file.name,
+                            )
+                        imported = int(result.get("imported", 0) or 0)
+                        skipped = result.get("skipped", []) or []
+                        total = int(result.get("total", imported + len(skipped)) or 0)
+                        platform = result.get("platform", "generic") or "generic"
+                        encoding = str(result.get("encoding") or "utf-8")
+                        platform_cn = {
+                            "wechat": "微信",
+                            "alipay": "支付宝",
+                            "generic": "通用账单",
+                        }.get(platform, "通用账单")
 
-                        # 跳过明细最多展示 5 条，避免刷屏
-                        detail = "；".join(f"第{s['row']}行 {s['reason']}" for s in skipped[:5])
-                        if len(skipped) > 5:
-                            detail += f"；另有 {len(skipped) - 5} 行未列出"
+                        # 跳过明细跨 rerun 持久化：成功分支 rerun 后上传控件仍持有文件，
+                        # 但本次 run 的局部变量已丢失，只能在 session_state 里留一份报告。
+                        # 带上 uid，换人登录后不会看到上一个人的账单信息。
+                        st.session_state["platform_import_report"] = {
+                            "uid": st.session_state.user_id,
+                            "platform_cn": platform_cn,
+                            "encoding": encoding,
+                            "imported": imported,
+                            "total": total,
+                            "skipped_total": len(skipped),
+                            "skipped": skipped[:10],
+                        }
 
                         if imported == 0:
-                            # 一行都没写成功：数据层完全没动库，页面数据也没变 → 就地警告，不 rerun、不清缓存
-                            # 不写签名：用户可以改文件后用同一个文件名直接重传
-                            msg = f"未导入任何账单（共 {total} 行均无效），原有账单未改动。"
+                            # 一行都没写成功：数据层完全没动库，页面数据也没变 → 就地警告，不 rerun、不清缓存。
+                            # 不写签名：用户可以改文件后用同一个文件名直接重传。
+                            detail = "；".join(f"第 {s['row']} 行：{s['reason']}" for s in skipped[:5])
+                            msg = f"未导入任何账单（共 {total} 行），原有账单未改动，可检查文件后重试。"
                             if detail:
-                                msg += f"跳过明细：{detail}"
+                                msg += f" 跳过明细：{detail}"
                             st.warning(msg)
                         else:
-                            # 真正写库成功之后才记签名：此时库已被替换，再处理一次就会重复导入
+                            # 真正写库成功之后才记签名：此时库已更新，再处理一次就会重复导入
                             st.session_state["last_upload_sig"] = upload_sig
+                            st.session_state["flash"] = {
+                                "level": "success",
+                                "msg": f"已导入 {imported} 笔（{platform_cn} · {encoding.upper()} 编码），跳过 {len(skipped)} 笔",
+                            }
                             st.cache_data.clear()
                             st.session_state.page = 0
-                            if skipped:
-                                st.session_state["flash"] = {
-                                    "level": "warning",
-                                    "msg": f"已导入 {imported} 行，跳过 {len(skipped)} 行（原有账单已被替换）。跳过明细：{detail}",
-                                }
-                            else:
-                                st.session_state["flash"] = {
-                                    "level": "success",
-                                    "msg": f"成功导入 {imported} 行账单（原有账单已被替换）",
-                                }
                             st.rerun()
-                    except Exception as e:
-                        # 导入（写库）失败：不写签名，用户可以立刻重试同一个文件
-                        st.error(f"导入失败：{str(e)}")
+                    except ValueError as exc:
+                        # 编码/格式不认识：数据层给的是可直接展示的中文提示。不写签名，同一文件可立即重试。
+                        st.error(str(exc))
+                    except Exception as exc:
+                        # 其它异常细节只进服务端日志，页面给一句可操作的提示
+                        print(f"[platform] 账单解析失败：{type(exc).__name__}: {exc}")
+                        st.error("账单解析失败，请确认是微信/支付宝导出的 CSV")
+
+        # 上次导入报告（含跳过明细）：成功导入后会 rerun，这里从 session_state 取出来展示
+        _last_report = st.session_state.get("platform_import_report")
+        if _last_report and _last_report.get("uid") == st.session_state.user_id:
+            st.caption(
+                f"上次导入：{_last_report['imported']}/{_last_report['total']} 笔成功"
+                f"（{_last_report['platform_cn']} · {_last_report['encoding'].upper()}）"
+            )
+            _last_skipped = _last_report.get("skipped") or []
+            if _last_skipped:
+                with st.expander(f"查看跳过的 {_last_report.get('skipped_total', len(_last_skipped))} 笔"):
+                    for item in _last_skipped[:10]:
+                        st.caption(f"第 {item.get('row')} 行：{item.get('reason')}")
 
         if st.button("一键加载演示数据（答辩专用）"):
             # 用户有效性已在本次 run 开头的统一鉴权里校验过（不存在会被踢出、根本到不了这里），
