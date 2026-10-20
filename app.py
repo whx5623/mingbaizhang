@@ -346,6 +346,7 @@ def logout():
     st.session_state.pop("last_screenshot_sig", None)     # 截图签名同理：换人后同一张图应能重新识别
     st.session_state.pop("flash", None)             # 上一个人的提示（可能含商户名）不能带给下一个人
     st.session_state.pop("month_review", None)      # AI 复盘含本月消费明细，绝不能带给下一个登录的人
+    st.session_state.pop("advisor", None)           # 1v1 顾问访谈含个人财务信息（收入/支出/目标），换人绝不能带走
     st.session_state.pop("health_comment", None)    # AI 锐评同样基于本月财务数据，换人后必须失效
     st.session_state.pop("_title_level_seen", None) # 换人后不能沿用上一人的头衔等级（否则首屏可能误撒花/漏撒花）
     st.session_state["page"] = 0
@@ -874,6 +875,203 @@ def _peer_fallback_roast(mine, peer):
     if len(text) > 60:
         text = text[:59].rstrip("；，、") + "。"
     return text
+
+
+# ===== 1v1 财务顾问访谈：后端取用 + 状态归一 + 本地兜底 =====
+# advisor_turn 由并行方实现：与其它 AI 功能一致，刻意不用 `from ai_agent import ...`，
+# 而是在调用时按模块属性取 —— import 期不存在会把整页打红，属性取用既能感知「稍后合入」，
+# 也方便 AppTest 打桩。后端缺失 / 抛异常 / 返回坏值时，全部由下面的本地兜底接住。
+_ADVISOR_QUESTION_LIMIT = 3      # 已回答 >= 3 条就出建议书（与需求里的话题数对齐）
+_ADVISOR_DEFAULT_TARGET = 500.0  # 兜底建议书的目标金额（context 里 save_target <= 0 时用）
+# 兜底问题序列：按「已回答条数」取，问完第 4 句前基本已到 3 条，不会再往下问
+_ADVISOR_LOCAL_QUESTIONS = (
+    "你每个月的生活费大概是多少？",
+    "最近有没有让你压力比较大的支出？",
+    "你存钱主要是为了什么？",
+    "奶茶、外卖这类小额消费，一周大概几次？",
+)
+
+
+def _get_advisor_turn_fn():
+    """按模块属性取 ai_agent.advisor_turn：并行开发期缺失 / 打桩都能感知。"""
+    try:
+        import ai_agent as _ai_agent_mod
+    except Exception as _ai_import_exc:  # pragma: no cover - 依赖缺失时只降级
+        print(
+            f"[advisor] ai_agent 不可用："
+            f"{type(_ai_import_exc).__name__}: {_ai_import_exc}"
+        )
+        return None
+    turn_fn = getattr(_ai_agent_mod, "advisor_turn", None)
+    return turn_fn if callable(turn_fn) else None
+
+
+def _advisor_amount(value, default=0.0):
+    """把后端 / context 里的金额归一成有限 float：非法 / NaN / inf 一律退回 default。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _advisor_text(value, limit=200):
+    """把任意值安全转成去空白的短文本（超长截断，异常值退回空串）。"""
+    try:
+        text = str(value if value is not None else "").strip()
+    except Exception:
+        return ""
+    return text[:limit]
+
+
+def _advisor_deadline(value):
+    """goal.deadline → (date 对象, 页面展示文案, 入库字符串)。
+
+    - "YYYY-MM-DD" → date.fromisoformat（真实日历日）；
+    - "YYYY-MM" → 该月 1 日（db 只接受 ISO 日期串，绝不能把 "2027-03" 原样塞给 set_goal）；
+    - 其它 / 空 / 非法 → (None, "", None)，即「不设截止日」。
+    """
+    text = _advisor_text(value, 20)
+    if not text:
+        return None, "", None
+    parsed = None
+    try:
+        parsed = date.fromisoformat(text)
+    except ValueError:
+        parsed = None
+    if parsed is not None:
+        return parsed, parsed.isoformat(), parsed.isoformat()
+    try:
+        parsed = datetime.strptime(text[:7], "%Y-%m").date()
+    except (ValueError, TypeError):
+        return None, "", None
+    # 展示仍用 "YYYY-MM"（更符合用户口头表达），入库统一成该月 1 日的 ISO 串
+    return parsed, text[:7], parsed.isoformat()
+
+
+def _advisor_normalize_proposal(proposal):
+    """把后端 proposal 归一成页面可直接渲染的结构；不可用 → None。
+
+    后端正在并行开发，字段缺失 / 类型不对都可能发生：这里逐字段兜底，
+    免得 st.success(f"📄 {proposal['title']}") 之类因为 KeyError 红屏。
+    """
+    if not isinstance(proposal, dict):
+        return None
+    title = _advisor_text(proposal.get("title"), 60) or "个人财务改善建议书"
+    summary = _advisor_text(proposal.get("summary"), 2000)
+    diagnosis = []
+    raw_diagnosis = proposal.get("diagnosis")
+    if isinstance(raw_diagnosis, (list, tuple)):
+        for item in raw_diagnosis:
+            line = _advisor_text(item, 300)
+            if line:
+                diagnosis.append(line)
+    actions = []
+    raw_actions = proposal.get("actions")
+    if isinstance(raw_actions, (list, tuple)):
+        for item in raw_actions:
+            if isinstance(item, dict):
+                action_title = _advisor_text(item.get("title"), 60)
+                action_detail = _advisor_text(item.get("detail"), 500)
+            else:
+                action_title = _advisor_text(item, 60)
+                action_detail = ""
+            if not (action_title or action_detail):
+                continue
+            actions.append({"title": action_title or "小建议", "detail": action_detail})
+    goal = {}
+    raw_goal = proposal.get("goal")
+    if isinstance(raw_goal, dict):
+        goal = {
+            "name": _advisor_text(raw_goal.get("name"), 50) or "我的存钱目标",
+            # 金额保留原值（_advisor_amount 在渲染 / 保存时再归一），不在这里提前断言类型
+            "target_amount": raw_goal.get("target_amount"),
+            "deadline": _advisor_text(raw_goal.get("deadline"), 20),
+        }
+    if not (summary or diagnosis or actions):
+        # 只有标题、没有任何可用内容 → 当作无效建议书，让调用方走本地兜底
+        return None
+    return {
+        "title": title,
+        "summary": summary,
+        "diagnosis": diagnosis,
+        "actions": actions,
+        "goal": goal,
+    }
+
+
+def _advisor_parse_reply(reply):
+    """把 advisor_turn 的返回值归一成 {done, message, proposal}；不可用 → None。
+
+    规则：
+    - 不是 dict / message 为空 → None（调用方走本地兜底）；
+    - done=True 但 proposal 不可用 → 降级成「继续提问」，绝不渲染一张空建议书；
+    """
+    if not isinstance(reply, dict):
+        return None
+    message = _advisor_text(reply.get("message"), 1000)
+    if not message:
+        return None
+    proposal = _advisor_normalize_proposal(reply.get("proposal"))
+    done = bool(reply.get("done")) and proposal is not None
+    return {"done": done, "message": message, "proposal": proposal if done else None}
+
+
+def _advisor_local_proposal(context):
+    """本地建议书：后端缺失 / 调用异常 / 额度用完时收尾用，不联网、不消耗额度。"""
+    context = context if isinstance(context, dict) else {}
+    month_label = _advisor_text(context.get("month_label"), 20) or datetime.now().strftime("%Y-%m")
+    month_expense = _advisor_amount(context.get("month_expense"))
+    balance = _advisor_amount(context.get("balance"))
+    save_target = _advisor_amount(context.get("save_target"))
+    target = save_target if save_target > 0 else _ADVISOR_DEFAULT_TARGET
+    if balance >= 0:
+        summary = (
+            f"{month_label} 你花了 ¥{month_expense:.2f}，还结余 ¥{balance:.2f}，"
+            "说明你已经能把日子过在收入以内；把这笔结余固定下来，存钱就会慢慢变成习惯。"
+        )
+    else:
+        summary = (
+            f"{month_label} 你花了 ¥{month_expense:.2f}，结余 ¥{balance:.2f}，"
+            "先别急着怪自己，把每一笔看清楚，下个月就能少一点慌张。"
+        )
+    diagnosis = [
+        f"本月支出 ¥{month_expense:.2f}，结余 ¥{balance:.2f}",
+        f"目标存款 ¥{target:.2f}，先把小额高频消费记清楚",
+    ]
+    actions = [
+        {"title": "自动转存", "detail": "每周固定转出 10% 生活费到存钱罐，工资到账先存后花"},
+        {"title": "小额上限", "detail": "奶茶、外卖设一个每周上限，超了就记一笔提醒自己"},
+    ]
+    # 截止日给半年后（"YYYY-MM"，保存时由 _advisor_deadline 折算成该月 1 日）
+    deadline = (datetime.now() + timedelta(days=180)).strftime("%Y-%m")
+    return {
+        "title": "个人财务改善建议书",
+        "summary": summary,
+        "diagnosis": diagnosis,
+        "actions": actions,
+        "goal": {
+            "name": "我的存钱目标",
+            "target_amount": target,
+            "deadline": deadline,
+        },
+    }
+
+
+def _advisor_fallback_turn(answered, context):
+    """App 侧本地兜底：按「已回答条数」给下一问；>= 3 条就给本地建议书。
+
+    返回 (assistant 文案, proposal 或 None)，与 advisor_turn 的语义对齐。
+    """
+    try:
+        answered = int(answered)
+    except (TypeError, ValueError):
+        answered = 0
+    if answered >= _ADVISOR_QUESTION_LIMIT:
+        proposal = _advisor_local_proposal(context)
+        return "聊到这儿差不多了，我把你说的这些整理成了下面这份建议书。", proposal
+    index = answered if 0 <= answered < len(_ADVISOR_LOCAL_QUESTIONS) else len(_ADVISOR_LOCAL_QUESTIONS) - 1
+    return _ADVISOR_LOCAL_QUESTIONS[index], None
 
 
 # ===== 财务沙盘推演：AI 沙盘点评的进程级缓存 =====
@@ -5091,6 +5289,257 @@ with tab_ai:
                 mime="image/png",
                 key="poster_download_btn",
             )
+
+    # ========== 1v1 财务顾问访谈 ==========
+    # 状态机只活在 session_state["advisor"] 里（不写库）：
+    #   None            → 未开始，展示「开启」按钮
+    #   status=asking   → 多轮问答，form 提交后继续问
+    #   status=done     → 展示建议书卡片 + 保存目标 / 重新开始
+    # 只有用户点「保存为我的目标」时才真正 set_goal 落库；访谈内容本身绝不入库。
+    with st.container(border=True, key="card_advisor"):
+        st.subheader("🎧 1v1 财务顾问访谈")
+        st.caption("和顾问聊三四句，最后生成一份属于你的《个人财务改善建议书》")
+
+        # context 每轮都用页面最新数据现装：本月支出 / 总收支结余 / 目标存款都可能刚被侧边栏改过
+        _advisor_context = {
+            "month_label": current_month_str,
+            "month_expense": float(month_expense),
+            "balance": float(balance),
+            "save_target": float(st.session_state.get("save_target") or 0),
+        }
+
+        _advisor = st.session_state.get("advisor")
+        if not isinstance(_advisor, dict) or _advisor.get("status") not in ("asking", "done"):
+            # 没有会话 / 结构被写坏：一律当作「未开始」，不带着坏数据往下渲染
+            _advisor = None
+
+        if _advisor is None:
+            # ---- A. 未开始 ----
+            if st.button("开启 1v1 财务诊断", key="advisor_start_btn"):
+                if st.session_state.get("ai_daily_count", 0) >= 20:
+                    st.warning("今日免费额度已用完，请明天再来")
+                else:
+                    _advisor_fn = _get_advisor_turn_fn()
+                    _advisor_reply = None
+                    if _advisor_fn is not None:
+                        try:
+                            _advisor_reply = _advisor_parse_reply(
+                                _advisor_fn([], _advisor_context, get_deepseek_api_key())
+                            )
+                        except Exception as _advisor_exc:
+                            # 细节只进服务端日志：异常文本可能带 url / 请求参数
+                            print(
+                                f"[advisor] 开启访谈失败："
+                                f"{type(_advisor_exc).__name__}: {_advisor_exc}"
+                            )
+                            _advisor_reply = None
+                    if _advisor_reply is not None:
+                        _advisor_proposal = _advisor_reply.get("proposal")
+                        st.session_state["advisor"] = {
+                            "status": "done" if _advisor_proposal else "asking",
+                            "messages": [
+                                {"role": "assistant", "content": _advisor_reply["message"]}
+                            ],
+                            "proposal": _advisor_proposal,
+                            "saved": False,
+                        }
+                        # 只有真的发出了请求才计一次额度
+                        st.session_state.ai_daily_count = (
+                            st.session_state.get("ai_daily_count", 0) + 1
+                        )
+                    else:
+                        # 后端缺失 / 调用异常 / 返回坏值：本地第一问兜底，不发请求、不扣额度
+                        st.session_state["advisor"] = {
+                            "status": "asking",
+                            "messages": [
+                                {
+                                    "role": "assistant",
+                                    "content": _ADVISOR_LOCAL_QUESTIONS[0],
+                                }
+                            ],
+                            "proposal": None,
+                            "saved": False,
+                        }
+                    st.rerun()
+
+        elif _advisor["status"] == "asking":
+            # ---- B. 进行中 ----
+            _advisor_messages = [
+                {
+                    "role": ("user" if item.get("role") == "user" else "assistant"),
+                    "content": str(item.get("content") or ""),
+                }
+                for item in (_advisor.get("messages") or [])
+                if isinstance(item, dict) and str(item.get("content") or "").strip()
+            ]
+            for _advisor_msg in _advisor_messages:
+                with st.chat_message(_advisor_msg["role"]):
+                    st.write(_advisor_msg["content"])
+
+            with st.form("advisor_form", clear_on_submit=True):
+                _advisor_answer = st.text_input(
+                    "说说你的情况…", key="advisor_answer", max_chars=200
+                )
+                _advisor_sent = st.form_submit_button("发送")
+
+            if _advisor_sent:
+                _advisor_answer_text = str(_advisor_answer or "").strip()
+                if not _advisor_answer_text:
+                    st.warning("先说说你的情况吧")
+                elif st.session_state.get("ai_daily_count", 0) >= 20:
+                    # 额度用完：不追加、不调用，下面是「本地建议书收尾」的出口
+                    st.warning("今日免费额度已用完，请明天再来")
+                else:
+                    _advisor_messages.append(
+                        {"role": "user", "content": _advisor_answer_text}
+                    )
+                    _advisor_fn = _get_advisor_turn_fn()
+                    _advisor_reply = None
+                    if _advisor_fn is not None:
+                        try:
+                            _advisor_reply = _advisor_parse_reply(
+                                _advisor_fn(
+                                    _advisor_messages,
+                                    _advisor_context,
+                                    get_deepseek_api_key(),
+                                )
+                            )
+                        except Exception as _advisor_exc:
+                            print(
+                                f"[advisor] 对话失败："
+                                f"{type(_advisor_exc).__name__}: {_advisor_exc}"
+                            )
+                            _advisor_reply = None
+                    if _advisor_reply is not None:
+                        _advisor_messages.append(
+                            {"role": "assistant", "content": _advisor_reply["message"]}
+                        )
+                        _advisor_proposal = _advisor_reply.get("proposal")
+                        st.session_state["advisor"] = {
+                            "status": "done" if _advisor_proposal else "asking",
+                            "messages": _advisor_messages,
+                            "proposal": _advisor_proposal,
+                            "saved": False,
+                        }
+                        st.session_state.ai_daily_count = (
+                            st.session_state.get("ai_daily_count", 0) + 1
+                        )
+                    else:
+                        # App 侧本地兜底：按「已回答条数」给下一问，>= 3 条就出本地建议书。
+                        # 这一次没拿到有效回复（没发请求 / 请求失败），按需求不扣额度。
+                        _advisor_answered = sum(
+                            1 for item in _advisor_messages if item["role"] == "user"
+                        )
+                        _advisor_fallback_text, _advisor_fallback_proposal = (
+                            _advisor_fallback_turn(_advisor_answered, _advisor_context)
+                        )
+                        _advisor_messages.append(
+                            {"role": "assistant", "content": _advisor_fallback_text}
+                        )
+                        st.session_state["advisor"] = {
+                            "status": "done" if _advisor_fallback_proposal else "asking",
+                            "messages": _advisor_messages,
+                            "proposal": _advisor_fallback_proposal,
+                            "saved": False,
+                        }
+                    st.rerun()
+
+            if st.session_state.get("ai_daily_count", 0) >= 20:
+                # 额度用完也要能收尾：本地建议书不联网、不扣额度、也不追加新的问答
+                st.caption("今日 AI 额度已用完；这里可以不用额度，直接用本地建议书收尾。")
+                if st.button("用本地建议书直接收尾", key="advisor_local_finish_btn"):
+                    _advisor_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": "额度用完了也没关系，我先按你已记的账出一份本地建议书。",
+                        }
+                    )
+                    st.session_state["advisor"] = {
+                        "status": "done",
+                        "messages": _advisor_messages,
+                        "proposal": _advisor_local_proposal(_advisor_context),
+                        "saved": False,
+                    }
+                    st.rerun()
+
+        else:
+            # ---- C. 已结束：建议书卡片 ----
+            _advisor_proposal = _advisor_normalize_proposal(_advisor.get("proposal"))
+            if _advisor_proposal is None:
+                # 会话里的 proposal 丢了 / 结构不对：就地用本地建议书补齐，页面不空
+                _advisor_proposal = _advisor_local_proposal(_advisor_context)
+
+            _advisor_goal = (
+                _advisor_proposal.get("goal")
+                if isinstance(_advisor_proposal.get("goal"), dict)
+                else {}
+            )
+            _advisor_name = str(_advisor_goal.get("name") or "").strip() or "我的存钱目标"
+            _advisor_target = _advisor_amount(_advisor_goal.get("target_amount"))
+            if _advisor_target <= 0:
+                _advisor_target = _ADVISOR_DEFAULT_TARGET
+            (
+                _advisor_deadline_date,
+                _advisor_deadline_text,
+                _advisor_deadline_db,
+            ) = _advisor_deadline(_advisor_goal.get("deadline"))
+
+            st.success(f"📄 {_advisor_proposal['title']}")
+            if _advisor_proposal.get("summary"):
+                st.markdown(_advisor_proposal["summary"])
+            if _advisor_proposal.get("diagnosis"):
+                st.markdown("**我的诊断**")
+                for _advisor_line in _advisor_proposal["diagnosis"]:
+                    st.markdown(f"- {_advisor_line}")
+            if _advisor_proposal.get("actions"):
+                st.markdown("**可以马上做的几件事**")
+                for _advisor_action in _advisor_proposal["actions"]:
+                    st.markdown(
+                        f"**{_advisor_action['title']}**：{_advisor_action['detail']}"
+                    )
+            st.caption(
+                f"建议目标：{_advisor_name} · ¥{_advisor_target:.2f}"
+                + (f" · {_advisor_deadline_text}" if _advisor_deadline_text else "")
+            )
+
+            if st.button("💾 将建议书保存为我的目标", key="advisor_save_btn"):
+                # 先同步侧边栏「目标存款」：即便随后写库失败，用户这轮也能看到金额已更新
+                st.session_state.save_target = _advisor_target
+                try:
+                    # set_goal 是 upsert：只改名称 / 目标金额 / 截止日，不会清空已存金额
+                    set_goal(
+                        st.session_state.user_id,
+                        _advisor_name,
+                        _advisor_target,
+                        _advisor_deadline_db,
+                    )
+                except Exception as _advisor_save_exc:
+                    print(
+                        f"[advisor] 保存心愿目标失败："
+                        f"{type(_advisor_save_exc).__name__}: {_advisor_save_exc}"
+                    )
+                    # flash 支持 success / warning 两态（见页面顶部 flash 渲染）：
+                    # 紧跟 rerun 的 st.warning 会被吞掉，走 flash 才看得见
+                    st.session_state["flash"] = {
+                        "level": "warning",
+                        "msg": "建议书已生成，但保存到心愿单失败，请稍后再试",
+                    }
+                else:
+                    st.session_state["flash"] = {
+                        "level": "success",
+                        "msg": "建议书已保存到心愿单，侧边栏目标存款已同步",
+                    }
+                    _advisor["proposal"] = _advisor_proposal
+                    _advisor["saved"] = True
+                    st.session_state["advisor"] = _advisor
+                st.rerun()
+
+            if _advisor.get("saved"):
+                st.caption("✅ 已保存到心愿单，侧边栏目标存款也已更新")
+
+            if st.button("🔁 重新开始访谈", key="advisor_reset_btn"):
+                st.session_state.pop("advisor", None)
+                st.rerun()
 
     if len(st.session_state.chat_history) == 0:
         st.session_state.chat_history.append({"role": "assistant", "content": "你好！我是明白账AI财务管家，可以帮你分析账单，也可以直接帮你记账，有什么想问我的吗？"})

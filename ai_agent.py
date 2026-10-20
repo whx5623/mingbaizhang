@@ -4100,3 +4100,621 @@ def generate_peer_roast(comparison: dict, api_key: str) -> str:
         content = content[:PEER_ROAST_MAX_CHARS] + "…"
     logger.info("同龄人点评生成成功（月份=%s，字数=%d）", month_label, len(content))
     return content
+
+
+# ============================================================================
+# AI 财务顾问 · 多轮访谈（DeepSeek Chat，一次调用推进一轮：提问或收尾）
+# ----------------------------------------------------------------------------
+# 与「沙盘顾问 / 月度回忆录 / 同龄人点评」同构：先校验（没 key、没对话也没
+# 本月数据都不发请求）→ 组 payload → 发请求 → 异常分层 → 解析/归一模型输出
+# → 脱敏日志。差异在于本函数是**有状态的访谈**：
+#   · history 是已完成的问答（按时间顺序），每次只推进一轮：问下一个问题，
+#     或在回答够多时收尾出一份「个人财务改善建议书」；
+#   · 收尾有两条硬保护：回答不足 3 条时模型想收尾也一律改回提问；回答满 4 条时
+#     模型还想问也一律强制收尾（用内置兜底方案，不浪费这一轮回答）；
+#   · 轮次规则、输出格式、JSON schema 全部写在 user message 里，system prompt
+#     逐字固定（产品口径，单测用独立字面量断言）；
+#   · 日志只记轮次 / done / 字数 / 状态码 / 异常类型，**绝不**记 api_key，
+#     也**绝不**记对话正文或响应体。
+# ============================================================================
+
+ADVISOR_SYSTEM_PROMPT = (
+    "你是一个温柔、专业、有耐心的大学生财务顾问。你需要通过向我提问，了解我的消费习惯、近期压力、未来目标。"
+    "每次只问一个问题，引导我说出真实的财务状况。不要一次问太多。"
+)
+ADVISOR_MODEL = "deepseek-chat"
+ADVISOR_TEMPERATURE = 0.7
+ADVISOR_MAX_TOKENS = 800
+ADVISOR_TIMEOUT = 30
+ADVISOR_MAX_MESSAGE_CHARS = 220      # 单条 message 硬上限
+ADVISOR_MIN_ANSWERS = 3              # 少于 3 条回答一律不许收尾
+ADVISOR_MAX_QUESTIONS = 4            # 满 4 条回答必须收尾
+
+_ADVISOR_DEFAULT_TITLE = "个人财务改善建议书"
+_ADVISOR_DEFAULT_GOAL_NAME = "我的存钱目标"
+_ADVISOR_DEFAULT_GOAL_AMOUNT = 500.0
+_ADVISOR_TITLE_MAX_CHARS = 40
+_ADVISOR_SUMMARY_MAX_CHARS = 200
+_ADVISOR_DIAGNOSIS_MAX_ITEMS = 5
+_ADVISOR_DIAGNOSIS_MAX_CHARS = 80
+_ADVISOR_ACTION_MAX_ITEMS = 4
+_ADVISOR_ACTION_TITLE_MAX_CHARS = 30
+_ADVISOR_ACTION_DETAIL_MAX_CHARS = 120
+_ADVISOR_GOAL_NAME_MAX_CHARS = 30
+
+# 硬性收尾保护用的兜底问题：按已获得的回答条数取（顺序固定，单测依赖下标）。
+_ADVISOR_FALLBACK_QUESTIONS = (
+    "你每个月的生活费大概是多少？",
+    "最近有没有哪笔支出让你压力比较大？",
+    "你存钱主要是为了什么呢？",
+    "奶茶和外卖一周大概几次？",
+)
+
+# 强制收尾时固定给出的收尾语（不随模型输出变化）。
+_ADVISOR_FORCED_FINISH_MESSAGE = "我们聊得差不多了，我把建议整理成一页纸给你。"
+
+# JSON schema 原样贴进 user message（不进 system prompt），两种返回形态各给一个例子。
+_ADVISOR_JSON_SCHEMA = """问问题时只输出：
+{"done": false, "message": "你每个月的生活费大概是多少？"}
+
+收尾时输出：
+{
+  "done": true,
+  "message": "谢谢你说的这些，我大致看清楚了……",
+  "proposal": {
+    "title": "个人财务改善建议书",
+    "summary": "50~80 字的总结",
+    "diagnosis": ["诊断 1", "诊断 2"],
+    "actions": [{"title": "行动标题", "detail": "具体怎么做"}],
+    "goal": {"name": "存钱目标的名字", "target_amount": 500.0, "deadline": "2027-03"}
+  }
+}"""
+
+
+class AdvisorError(Exception):
+    """AI 财务顾问访谈失败。
+
+    code 取值：
+      no_api_key     未配置 DeepSeek API Key（**未发请求**）
+      empty_history  history 不是 list / history 为空且 context 也为空（**未发请求**）
+      network        网络异常（超时 / 连接失败 / 其它请求层异常）
+      http           接口返回非 200（message 只带状态码，不带响应体）
+      parse          响应不是合法 JSON / message 缺失或空白 / 模型输出无法解析
+
+    message 为面向用户的中文提示，可直接展示。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"AdvisorError(code={self.code!r}, message={self.message!r})"
+
+
+def _advisor_text(value, default: str = "", limit: int = 0) -> str:
+    """顾问相关文本宽松归一：None / bool → default；strip 后为空 → default。
+
+    limit > 0 且超长时截断到 limit 字并补「…」（与 message 的 220+「…」口径一致）。
+    """
+    if isinstance(value, str):
+        text = value.strip()
+    elif value is None or isinstance(value, bool):
+        text = ""
+    else:
+        try:
+            text = str(value).strip()
+        except (TypeError, ValueError):
+            text = ""
+    if not text:
+        text = default
+    if limit and len(text) > limit:
+        text = text[:limit] + "…"
+    return text
+
+
+def _advisor_amount(value, default: float = 0.0) -> float:
+    """顾问相关金额宽松转 float：None / bool / 非数字 / nan / inf → default。"""
+    if isinstance(value, bool):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(number):
+        return default
+    return number
+
+
+def _advisor_list(value) -> list:
+    """宽松取列表：不是 list / tuple → []（元素原样返回，由调用方逐条归一）。"""
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return []
+
+
+def _advisor_history(history):
+    """把 history 过滤成 [{"role": "assistant"|"user", "content": str}, ...]。
+
+    · 不是 list → None（由调用方翻译成 empty_history，**不发请求**）；
+    · 非 dict 条目 / 其它 role / content 不是非空字符串 → 直接忽略。
+    注意：**合法的空列表**（访谈第一轮）返回 []，不是 None。
+    """
+    if not isinstance(history, list):
+        return None
+    entries = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        if role not in ("assistant", "user"):
+            continue
+        content = item.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        entries.append({"role": role, "content": content.strip()})
+    return entries
+
+
+def _advisor_context_parts(context: dict) -> dict:
+    """把 context 收敛成 {"month_label", "month_expense", "balance", "save_target"}。
+
+    字段可能缺、类型可能脏：文本统一 strip，金额非数字一律按 0（绝不 KeyError）。
+    """
+    data = context if isinstance(context, dict) else {}
+    return {
+        "month_label": _advisor_text(data.get("month_label")),
+        "month_expense": _advisor_amount(data.get("month_expense")),
+        "balance": _advisor_amount(data.get("balance")),
+        "save_target": _advisor_amount(data.get("save_target")),
+    }
+
+
+def _advisor_context_has_data(parts: dict) -> bool:
+    """context 是否提供了任何可用信息（月份 / 支出 / 结余 / 目标任一非空）。"""
+    return bool(
+        parts.get("month_label")
+        or parts.get("month_expense")
+        or parts.get("balance")
+        or parts.get("save_target")
+    )
+
+
+def _advisor_fallback_question(answers: int) -> str:
+    """按已回答条数取内置兜底问题；越界时取最后一个（绝不 IndexError）。"""
+    index = answers if 0 <= answers < len(_ADVISOR_FALLBACK_QUESTIONS) else len(_ADVISOR_FALLBACK_QUESTIONS) - 1
+    return _ADVISOR_FALLBACK_QUESTIONS[index]
+
+
+def _advisor_deadline(value) -> str:
+    """归一 goal.deadline：接受 YYYY-MM 或 YYYY-MM-DD，其它一律空串（绝不编日期）。"""
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if re.fullmatch(r"\d{4}-\d{2}", text):
+        try:
+            datetime.strptime(text, "%Y-%m")
+        except ValueError:
+            return ""
+        return text
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        try:
+            datetime.strptime(text, "%Y-%m-%d")
+        except ValueError:
+            return ""
+        return text
+    return ""
+
+
+def _advisor_parse_json(content: str) -> dict:
+    """解析模型输出：去 ```json 围栏 → 取第一个 { 到最后一个 } → json.loads。
+
+    任何一步失败 / 结果不是非空 dict → AdvisorError("parse", ...)。
+    """
+    text = content.strip() if isinstance(content, str) else ""
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    if fenced and fenced.group(1).strip():
+        text = fenced.group(1).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        text = text[start:end + 1]
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        raise AdvisorError("parse", "AI 没有返回有效的顾问回复，请重试") from None
+    if not isinstance(data, dict) or not data:
+        raise AdvisorError("parse", "AI 没有返回有效的顾问回复，请重试")
+    return data
+
+
+def _advisor_normalize_proposal(raw, message: str) -> dict:
+    """把模型给的 proposal 宽容归一成约定结构（字段缺失一律给默认值）。
+
+    · title：默认「个人财务改善建议书」，≤40 字；
+    · summary：默认取本轮 message，≤200 字；
+    · diagnosis：list[str]，过滤空串，最多 5 条，每条 ≤80 字；
+    · actions：list[dict]，title ≤30 字 / detail ≤120 字，最多 4 条，非法条目丢弃；
+    · goal：name ≤30 字（默认「我的存钱目标」）、target_amount > 0（默认 500.0）、
+      deadline 只接受 YYYY-MM / YYYY-MM-DD，其它为空串。
+    """
+    data = raw if isinstance(raw, dict) else {}
+
+    title = _advisor_text(
+        data.get("title"), _ADVISOR_DEFAULT_TITLE, _ADVISOR_TITLE_MAX_CHARS
+    )
+    summary = _advisor_text(
+        data.get("summary"), message, _ADVISOR_SUMMARY_MAX_CHARS
+    )
+
+    diagnosis = []
+    for item in _advisor_list(data.get("diagnosis")):
+        text = _advisor_text(item, "", _ADVISOR_DIAGNOSIS_MAX_CHARS)
+        if not text:
+            continue
+        diagnosis.append(text)
+        if len(diagnosis) >= _ADVISOR_DIAGNOSIS_MAX_ITEMS:
+            break
+
+    actions = []
+    for item in _advisor_list(data.get("actions")):
+        if not isinstance(item, dict):
+            continue
+        action_title = _advisor_text(
+            item.get("title"), "", _ADVISOR_ACTION_TITLE_MAX_CHARS
+        )
+        action_detail = _advisor_text(
+            item.get("detail"), "", _ADVISOR_ACTION_DETAIL_MAX_CHARS
+        )
+        if not action_title and not action_detail:
+            continue
+        actions.append({"title": action_title, "detail": action_detail})
+        if len(actions) >= _ADVISOR_ACTION_MAX_ITEMS:
+            break
+
+    goal_raw = data.get("goal")
+    goal = goal_raw if isinstance(goal_raw, dict) else {}
+    goal_name = _advisor_text(
+        goal.get("name"), _ADVISOR_DEFAULT_GOAL_NAME, _ADVISOR_GOAL_NAME_MAX_CHARS
+    )
+    target_amount = _advisor_amount(goal.get("target_amount"), 0.0)
+    if target_amount <= 0:
+        target_amount = _ADVISOR_DEFAULT_GOAL_AMOUNT
+
+    return {
+        "title": title,
+        "summary": summary,
+        "diagnosis": diagnosis,
+        "actions": actions,
+        "goal": {
+            "name": goal_name,
+            "target_amount": float(target_amount),
+            "deadline": _advisor_deadline(goal.get("deadline")),
+        },
+    }
+
+
+def _advisor_fallback_proposal(parts: dict, entries: list[dict]) -> dict:
+    """强制收尾用的内置方案：按 context / history 拼一份 2 诊断 + 2 行动的建议书。
+
+    绝不调用模型（模型这一轮已经跑偏），所以每个字段都必须自己补齐，
+    保证 app.py 拿到的结构与正常收尾完全一致。
+    """
+    month_label = parts.get("month_label") or "这段时间"
+    month_expense = _advisor_amount(parts.get("month_expense"))
+    balance = _advisor_amount(parts.get("balance"))
+    save_target = _advisor_amount(parts.get("save_target"))
+    target_amount = save_target if save_target > 0 else _ADVISOR_DEFAULT_GOAL_AMOUNT
+
+    # 已完成的回答条数用于收尾文案（history 里没有 user 回答时退回通用开场）。
+    answers = sum(1 for item in entries if item["role"] == "user")
+    opening = (
+        f"我们聊了 {answers} 轮，谢谢你愿意把这些讲给我听。"
+        if answers
+        else "谢谢你愿意把这些讲给我听。"
+    )
+
+    if month_expense > 0:
+        summary = (
+            f"{opening}{month_label}你一共花了 {month_expense:.2f} 元，"
+            f"现在还剩 {balance:.2f} 元。别急着怪自己，先把节奏放慢，"
+            "把花得最多的地方收一收，再给存钱留一个固定的位置。"
+        )
+        diagnosis = [
+            f"这个月已经花掉 {month_expense:.2f} 元，钱多半是在日常小笔消费里悄悄流走的。"
+        ]
+        action_one = {
+            "title": "给日常开销定个上限",
+            "detail": (
+                f"把每月支出控制在 {round(month_expense * 0.9, 2):.2f} 元左右"
+                "（比现在少一成），每天睡前花一分钟对一下账。"
+            ),
+        }
+    else:
+        summary = (
+            f"{opening}这阵子记账还不多，"
+            "但先把方向聊清楚，比记多少笔都重要。我们先把目标定下来，"
+            "再从小处开始调整，你会慢慢看到变化的。"
+        )
+        diagnosis = ["目前账单还不多，先把每一笔记下来，才看得清钱到底去了哪里。"]
+        action_one = {
+            "title": "先把每一笔记下来",
+            "detail": "每天睡前花一分钟记下当天花销，一周回看一次，找出最容易被忽略的那一类。",
+        }
+
+    if save_target > 0:
+        diagnosis.append(
+            f"你给自己定的存钱目标是 {save_target:.2f} 元，按现在的花法还要再收紧一点才够。"
+        )
+        action_two = {
+            "title": f"每月先存下 {save_target:.2f} 元",
+            "detail": "生活费到账当天就把这笔钱转到单独的储蓄账户，剩下的再拿来花。",
+        }
+    else:
+        diagnosis.append("你还没有写下明确的存钱目标，先定一个数字，花钱时会更容易停一下。")
+        action_two = {
+            "title": "先设一个看得见的存钱目标",
+            "detail": "在 App 里定一个具体金额和日期（比如 3 个月存 500 元），想乱花时先看一眼它。",
+        }
+
+    return {
+        "title": _ADVISOR_DEFAULT_TITLE,
+        "summary": summary,
+        "diagnosis": diagnosis,
+        "actions": [action_one, action_two],
+        "goal": {
+            "name": _ADVISOR_DEFAULT_GOAL_NAME,
+            "target_amount": float(target_amount),
+            "deadline": "",
+        },
+    }
+
+
+def _build_advisor_user_content(entries: list[dict], parts: dict, answers: int) -> str:
+    """把本轮上下文 + 已完成问答 + 轮次规则 + JSON schema 拼成 user message。
+
+    所有“怎么做”的指令都放这里，system prompt 保持逐字不变。
+    """
+    month_label = parts.get("month_label") or ""
+    month_expense = _advisor_amount(parts.get("month_expense"))
+    balance = _advisor_amount(parts.get("balance"))
+    save_target = _advisor_amount(parts.get("save_target"))
+
+    lines = ["这是我的本月财务情况和我们已经聊过的内容，请按系统要求继续访谈："]
+
+    context_lines = []
+    if month_label:
+        context_lines.append(f"月份：{month_label}")
+    if month_expense:
+        context_lines.append(f"本月支出：{month_expense:.2f} 元")
+    if balance:
+        context_lines.append(f"当前结余：{balance:.2f} 元")
+    if save_target:
+        context_lines.append(f"目标存款：{save_target:.2f} 元")
+    if context_lines:
+        lines.extend(context_lines)
+    else:
+        lines.append("本月数据：暂无")
+
+    lines.append("已完成的问答：")
+    if entries:
+        turn = 0
+        for item in entries:
+            if item["role"] == "assistant":
+                turn += 1
+                lines.append(f"{turn}. 顾问：{item['content']}")
+            elif turn:
+                lines.append(f"   我：{item['content']}")
+            else:
+                turn = 1
+                lines.append(f"{turn}. 我：{item['content']}")
+    else:
+        lines.append("（还没有开始问答，请你先提出第一个问题。）")
+
+    lines.append("轮次规则：")
+    lines.append(
+        f"已获得 {answers} 条回答；n < 3 时必须继续提问，不得收尾；"
+        "n >= 3 且信息足够时输出方案；n >= 4 时必须输出方案。"
+    )
+    if answers < ADVISOR_MIN_ANSWERS:
+        lines.append(
+            f"当前判断：已获得 {answers} 条回答，还不到 {ADVISOR_MIN_ANSWERS} 条，"
+            "必须继续提问，不得收尾。"
+        )
+    elif answers < ADVISOR_MAX_QUESTIONS:
+        lines.append(
+            f"当前判断：已获得 {answers} 条回答，信息足够就用方案收尾；"
+            "还差一点可以再问一个问题。"
+        )
+    else:
+        lines.append(
+            f"当前判断：已获得 {answers} 条回答，已达到 {ADVISOR_MAX_QUESTIONS} 条，"
+            "必须输出方案，不要再提问。"
+        )
+    lines.append(
+        "其它要求：如果我的回答胡言乱语 / 答非所问，请用一句温柔的话把我拉回主题，"
+        "并把问题换个问法再问一次。"
+    )
+    lines.append(
+        "只输出一个 JSON 对象，不要 markdown 代码块、不要多余解释。"
+        "问问题时 done=false；收尾时 done=true 且必须带 proposal。"
+    )
+    lines.append("JSON 格式（字段名不可改）：")
+    lines.append(_ADVISOR_JSON_SCHEMA)
+    return "\n".join(lines)
+
+
+def advisor_turn(history: list[dict], context: dict, api_key: str) -> dict:
+    """AI 财务顾问访谈的一轮：要么问下一个问题，要么收尾出建议书。
+
+    参数：
+        history: [{"role": "assistant"|"user", "content": str}, ...]（按时间顺序；
+                 其它 role / 非 dict 条目忽略；**空列表合法** —— 第一轮由顾问开场）
+        context: {"month_label": "2026年10月", "month_expense": 452.0,
+                  "balance": 1048.0, "save_target": 200.0}（字段可缺，金额非数字按 0）
+        api_key: DeepSeek API Key（空/空白 → no_api_key，**不发请求**）
+
+    返回（严格二选一）：
+        {"done": False, "message": str}
+        {"done": True, "message": str, "proposal": {...}}
+
+    失败一律抛 AdvisorError（中文 message，可直接上页面）：
+      · api_key 为空                                  → no_api_key（且**不发请求**）；
+      · history 不是 list / history 为空且 context 为空  → empty_history（且**不发请求**）；
+      · 超时 / 连接失败 / 其它请求层异常                    → network；
+      · 非 200                                         → http（只带状态码，不拼响应体）；
+      · 响应不是 JSON / message 缺失或空白                → parse。
+    硬保护：
+      · 模型 done=true 但回答不足 3 条 → 忽略 done，改为内置兜底提问（不报错）；
+      · 模型 done=false 但回答已满 4 条 → 强制收尾，用内置兜底方案。
+    message 超过 220 字截断补「…」；proposal 各字段宽容归一。
+    日志只记轮次 / done / 字数 / 状态码与异常类型，**绝不**记 api_key 或对话正文。
+    """
+    # ① api_key：先查它，没有 key 时不该先花一次网络往返。
+    if not isinstance(api_key, str) or not api_key.strip():
+        logger.warning("顾问访谈未配置 DEEPSEEK_API_KEY（未发请求）")
+        raise AdvisorError(
+            "no_api_key",
+            "未配置 DEEPSEEK_API_KEY，AI 财务顾问暂不可用",
+        )
+    api_key = api_key.strip()
+
+    # ② 对话前置校验：history 必须是 list；空 history 只在 context 也空时才算非法
+    #    （访谈第一轮 history=[] 是合法的，顾问要主动问第一个问题）。
+    entries = _advisor_history(history)
+    if entries is None:
+        logger.warning("顾问访谈的对话记录不是列表（未发请求）")
+        raise AdvisorError(
+            "empty_history",
+            "顾问访谈的对话记录格式不正确，请刷新页面后重试",
+        )
+    parts = _advisor_context_parts(context)
+    if not entries and not _advisor_context_has_data(parts):
+        logger.warning("顾问访谈缺少对话与本月数据（未发请求）")
+        raise AdvisorError(
+            "empty_history",
+            "还没有对话内容，也没有本月数据，暂时无法开始财务访谈",
+        )
+
+    answers = sum(1 for item in entries if item["role"] == "user")
+
+    user_content = _build_advisor_user_content(entries, parts, answers)
+    payload = {
+        "model": ADVISOR_MODEL,
+        "messages": [
+            {"role": "system", "content": ADVISOR_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": ADVISOR_TEMPERATURE,
+        "max_tokens": ADVISOR_MAX_TOKENS,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ③ 发请求：超时/连接失败翻译成用户能看懂的句子（不把异常对象漏到页面）。
+    try:
+        resp = requests.post(
+            DEEPSEEK_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=ADVISOR_TIMEOUT,
+        )
+    except requests.Timeout:
+        logger.warning("顾问访谈请求超时（轮次=%s）", answers)
+        raise AdvisorError("network", "生成顾问回复超时，请稍后再试") from None
+    except requests.ConnectionError:
+        logger.warning("顾问访谈请求连接失败（轮次=%s）", answers)
+        raise AdvisorError("network", "网络连接失败，请检查网络") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：日志只记异常类型（确保不把 headers / key 带出去）。
+        logger.warning(
+            "顾问访谈请求失败（轮次=%s，异常=%s）", answers, type(exc).__name__
+        )
+        raise AdvisorError("network", "网络连接失败，请检查网络") from None
+
+    # ④ 非 200：只带状态码，不把响应体拼进 message（响应体可能含请求回显）。
+    if resp.status_code != 200:
+        logger.warning("顾问访谈接口返回 HTTP %s（轮次=%s）", resp.status_code, answers)
+        raise AdvisorError(
+            "http",
+            f"AI 服务返回异常（HTTP {resp.status_code}），请稍后重试",
+        )
+
+    # ⑤ 解析：非 JSON / 结构不符 / content 为空 → parse。
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("顾问访谈响应不是合法 JSON（轮次=%s）", answers)
+        raise AdvisorError("parse", "AI 没有返回有效的顾问回复，请重试") from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("顾问访谈响应结构不符合预期（轮次=%s）", answers)
+        raise AdvisorError("parse", "AI 没有返回有效的顾问回复，请重试") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("顾问访谈响应 content 为空（轮次=%s）", answers)
+        raise AdvisorError("parse", "AI 没有返回有效的顾问回复，请重试")
+
+    # ⑥ 解析模型输出（去围栏 / 取 {…}），message 严格要求非空字符串。
+    parsed = _advisor_parse_json(content.strip())
+    raw_message = parsed.get("message")
+    if not isinstance(raw_message, str) or not raw_message.strip():
+        logger.warning("顾问访谈响应缺少有效 message（轮次=%s）", answers)
+        raise AdvisorError("parse", "AI 没有返回有效的顾问回复，请重试")
+    message = raw_message.strip()
+    if len(message) > ADVISOR_MAX_MESSAGE_CHARS:
+        message = message[:ADVISOR_MAX_MESSAGE_CHARS] + "…"
+    done = _coerce_bool(parsed.get("done"), default=False)
+
+    # ⑦ 硬性收尾保护一：回答不足 3 条时，模型的 done=true 一律忽略，改回提问。
+    #    用内置问题按 answers 取，不报错、不浪费这一轮回答。
+    if done and answers < ADVISOR_MIN_ANSWERS:
+        question = _advisor_fallback_question(answers)
+        logger.info(
+            "顾问访谈生成成功（轮次=%d，done=%s，字数=%d）",
+            answers,
+            "否",
+            len(question),
+        )
+        return {"done": False, "message": question}
+
+    # ⑧ 硬性收尾保护二：回答已满 4 条时，模型还想提问也强制收尾（内置兜底方案）。
+    if not done and answers >= ADVISOR_MAX_QUESTIONS:
+        proposal = _advisor_fallback_proposal(parts, entries)
+        logger.info(
+            "顾问访谈生成成功（轮次=%d，done=%s，字数=%d）",
+            answers,
+            "是",
+            len(_ADVISOR_FORCED_FINISH_MESSAGE),
+        )
+        return {
+            "done": True,
+            "message": _ADVISOR_FORCED_FINISH_MESSAGE,
+            "proposal": proposal,
+        }
+
+    # ⑨ 正常提问。
+    if not done:
+        logger.info(
+            "顾问访谈生成成功（轮次=%d，done=%s，字数=%d）",
+            answers,
+            "否",
+            len(message),
+        )
+        return {"done": False, "message": message}
+
+    # ⑩ 正常收尾：proposal 全部字段宽容归一。
+    proposal = _advisor_normalize_proposal(parsed.get("proposal"), message)
+    logger.info(
+        "顾问访谈生成成功（轮次=%d，done=%s，字数=%d）",
+        answers,
+        "是",
+        len(message),
+    )
+    return {"done": True, "message": message, "proposal": proposal}
