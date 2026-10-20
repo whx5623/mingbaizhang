@@ -62,6 +62,7 @@ import json
 import math
 import calendar
 import hashlib
+import inspect
 import os
 import tomllib
 
@@ -118,6 +119,17 @@ try:
 except ImportError as _report_import_exc:
     report_pdf = None
     print(f"[report] PDF 报告模块不可用：{type(_report_import_exc).__name__}: {_report_import_exc}")
+
+# 情绪消费气象站气泡图（mood_chart.py 由并行方实现）：缺失只让气泡图降级成一行提示，
+# 高危提示与 AI 教练仍然可用，绝不红屏。调用处一律 getattr，便于测试打桩。
+try:
+    import mood_chart
+except ImportError as _mood_chart_import_exc:
+    mood_chart = None
+    print(
+        f"[mood] 情绪气泡图模块不可用："
+        f"{type(_mood_chart_import_exc).__name__}: {_mood_chart_import_exc}"
+    )
 
 
 class _ChartInsightFallbackError(Exception):
@@ -360,6 +372,7 @@ def logout():
     st.session_state.pop("advisor", None)           # 1v1 顾问访谈含个人财务信息（收入/支出/目标），换人绝不能带走
     st.session_state.pop("health_comment", None)    # AI 锐评同样基于本月财务数据，换人后必须失效
     st.session_state.pop("_title_level_seen", None) # 换人后不能沿用上一人的头衔等级（否则首屏可能误撒花/漏撒花）
+    st.session_state.pop("mood_insight_cache", None) # AI 教练文案基于上一个人的情绪消费数据，换人必须失效
     st.session_state["page"] = 0
     st.session_state["chat_history"] = []           # 换人登录不应看到上一个人的 AI 聊天记录
     st.cache_data.clear()
@@ -1257,6 +1270,145 @@ def _memoir_fallback(anchors: dict) -> dict:
         "memoir": "".join(pieces),
         "blessing": "下个月继续记账，花钱前多问自己一句：这笔钱，值不值得？",
     }
+
+
+# ===== 情绪消费气象站：表单标签映射 / 带 mood 记账 / AI 教练 =====
+# 表单用带 emoji 的中文标签展示，入库值取 db.MOOD_OPTIONS 的原值（与 db.normalize_mood 对齐）；
+# db 尚未合入时按 mood_chart.MOOD_ORDER 兜底，保证下拉框与记账路径在并行开发期也能跑。
+_MOOD_FORM_LABELS = (
+    "（不标注）",
+    "😊 开心",
+    "😢 Emo",
+    "😠 焦虑",
+    "😴 疲惫",
+    "🤩 激动",
+)
+
+
+def _mood_value_from_label(label):
+    """把带 emoji 的表单标签映射成 db.MOOD_OPTIONS 原值；（不标注）→ 空串。"""
+    text = str(label or "").strip()
+    if not text or text == "（不标注）":
+        return ""
+    # 标签形如「😊 开心」：只保留 emoji 之后的中文原值
+    core = text.split(" ", 1)[1].strip() if " " in text else text
+    options = getattr(db, "MOOD_OPTIONS", None)
+    if isinstance(options, dict):
+        # 兼容 {展示标签: 入库值} 的映射写法
+        if text in options:
+            return str(options[text])
+        if core in options:
+            return str(options[core])
+    return core
+
+
+def _add_bill_with_mood(
+    user_id, bill_date, merchant, amount, payment_method, bill_type, mood=""
+):
+    """调用 db.add_bill 并透传 mood；并行期后端还不支持该参数时退回旧签名。
+
+    mood 为空按旧签名调用（默认写 NULL）；后端最终会接受 mood 关键字，
+    这里用 inspect 判断而不是 try/except TypeError，避免把「真 TypeError」误当成参数不支持。
+    """
+    if mood:
+        try:
+            params = inspect.signature(add_bill).parameters
+        except (TypeError, ValueError):
+            params = {}
+        supports_mood = "mood" in params or any(
+            getattr(param, "kind", None) is inspect.Parameter.VAR_KEYWORD
+            for param in params.values()
+        )
+        if supports_mood:
+            return add_bill(
+                user_id, bill_date, merchant, amount, payment_method, bill_type, mood=mood
+            )
+    return add_bill(user_id, bill_date, merchant, amount, payment_method, bill_type)
+
+
+def _get_mood_insight_fn():
+    """按模块属性取 ai_agent.generate_mood_insight；缺失时返回 None 由调用方降级。"""
+    try:
+        import ai_agent as _ai_agent_mod
+    except Exception as _mood_ai_exc:
+        print(f"[mood] ai_agent 不可用：{type(_mood_ai_exc).__name__}: {_mood_ai_exc}")
+        return None
+    return getattr(_ai_agent_mod, "generate_mood_insight", None)
+
+
+def _mood_bubble_option(stats):
+    """用 mood_chart 拼气泡图 option；模块缺失 / 结构异常返回 None（调用方降级）。"""
+    build = getattr(mood_chart, "build_mood_bubble_option", None) if mood_chart else None
+    if not callable(build):
+        return None
+    moods = stats.get("moods") if isinstance(stats, dict) else None
+    if not isinstance(moods, list):
+        moods = []
+    try:
+        months = int(stats.get("months") or 3)
+    except (TypeError, ValueError):
+        months = 3
+    try:
+        baseline_avg = float(stats.get("baseline_avg") or 0.0)
+    except (TypeError, ValueError):
+        baseline_avg = 0.0
+    try:
+        total_expense = float(stats.get("total_expense") or 0.0)
+    except (TypeError, ValueError):
+        total_expense = 0.0
+    return build(
+        moods,
+        baseline_avg=baseline_avg,
+        total_expense=total_expense,
+        months=months,
+    )
+
+
+def _mood_high_risk_item(stats):
+    """取高危情绪条目（含 emoji / avg / avg_ratio / count）；无则返回 None。"""
+    if not isinstance(stats, dict):
+        return None
+    moods = stats.get("moods") if isinstance(stats.get("moods"), list) else []
+    raw = stats.get("high_risk")
+    candidates = []
+    if isinstance(raw, dict):
+        candidates.append(raw)
+    elif isinstance(raw, list):
+        candidates.extend(item for item in raw if isinstance(item, dict))
+    elif isinstance(raw, str) and raw.strip():
+        candidates.append({"mood": raw.strip()})
+    else:
+        candidates.extend(
+            item for item in moods if isinstance(item, dict) and item.get("high_risk")
+        )
+    for candidate in candidates:
+        name = str(candidate.get("mood") or "").strip()
+        if not name:
+            continue
+        base = next(
+            (
+                item
+                for item in moods
+                if isinstance(item, dict) and str(item.get("mood") or "").strip() == name
+            ),
+            {},
+        )
+        merged = dict(base)
+        merged.update({k: v for k, v in candidate.items() if v is not None})
+        merged["mood"] = name
+        return merged
+    return None
+
+
+def _mood_number(value, default=0.0):
+    """高危提示 / 气泡图里的脏值收敛：None / 字符串数字 / NaN 都转成可格式化 float。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number or number in (float("inf"), float("-inf")):
+        return default
+    return number
 
 
 # Sidebar
@@ -3421,6 +3573,136 @@ with tab_dash:
             )
             st.caption("机会成本分析暂不可用")
 
+    # ===== 情绪消费气象站：情绪 × 金额气泡图 + 高危提示 + AI 教练 =====
+    # 数据由并行方 db.get_mood_spending 提供，图表由 mood_chart 拼 option；
+    # 取数 / 图表 / AI 任一环节缺失或异常都只降级成一行 caption，
+    # 绝不红屏、也绝不截断后面的 AI 洞察区块。
+    with st.expander("🌤️ 你的专属消费气象站", expanded=False):
+        st.caption("把情绪和金额放在一张图上：气泡越大花得越多，越靠右单笔越贵。")
+        _mood_lookup = getattr(db, "get_mood_spending", None)
+        _mood_stats = None
+        if not callable(_mood_lookup):
+            st.caption("气象站暂不可用，先记几笔带心情的账吧")
+        else:
+            try:
+                _mood_stats = _mood_lookup(st.session_state.user_id)
+            except Exception as _mood_stats_exc:
+                print(
+                    f"[mood] 读取情绪消费统计失败："
+                    f"{type(_mood_stats_exc).__name__}: {_mood_stats_exc}"
+                )
+                _mood_stats = None
+            if not isinstance(_mood_stats, dict):
+                st.caption("气象站暂不可用，先记几笔带心情的账吧")
+            else:
+                _mood_list = _mood_stats.get("moods")
+                if not isinstance(_mood_list, list):
+                    _mood_list = []
+                # 空态也照常画：option 自带 graphic 引导文案
+                _mood_option = None
+                try:
+                    _mood_option = _mood_bubble_option(_mood_stats)
+                except Exception as _mood_chart_exc:
+                    print(
+                        f"[mood] 气泡图构造失败："
+                        f"{type(_mood_chart_exc).__name__}: {_mood_chart_exc}"
+                    )
+                if _mood_option is None:
+                    st.caption("图表组件暂不可用")
+                else:
+                    try:
+                        st_echarts(_mood_option, height="420px", key="mood_bubble")
+                    except Exception as _mood_render_exc:
+                        print(
+                            f"[mood] 气泡图渲染失败："
+                            f"{type(_mood_render_exc).__name__}: {_mood_render_exc}"
+                        )
+                        st.caption("图表组件暂不可用")
+                if not _mood_list or _mood_stats.get("has_data") is False:
+                    st.caption("本月还没有带情绪的账单，记账时选一下心情即可点亮")
+
+                _mood_high_risk = _mood_high_risk_item(_mood_stats)
+                if _mood_high_risk:
+                    _mood_hr_name = str(_mood_high_risk.get("mood") or "").strip()
+                    _mood_emoji_map = (
+                        getattr(mood_chart, "MOOD_EMOJI", {}) if mood_chart else {}
+                    )
+                    _mood_hr_emoji = str(_mood_high_risk.get("emoji") or "").strip()
+                    if not _mood_hr_emoji and isinstance(_mood_emoji_map, dict):
+                        _mood_hr_emoji = str(_mood_emoji_map.get(_mood_hr_name) or "")
+                    st.warning(
+                        f"⚠️ 高危情绪：{_mood_hr_emoji} {_mood_hr_name} —— "
+                        f"平均单笔 ¥{_mood_number(_mood_high_risk.get('avg')):.2f}，"
+                        f"是平时的 {_mood_number(_mood_high_risk.get('avg_ratio'), 1.0):.1f} 倍，"
+                        f"共 {int(_mood_number(_mood_high_risk.get('count')))} 笔"
+                    )
+
+                # AI 教练：同一份 stats 命中 session 缓存，不重复调用、不重复扣额度
+                try:
+                    _mood_stats_json = json.dumps(
+                        _mood_stats, sort_keys=True, ensure_ascii=False, default=str
+                    )
+                except Exception:
+                    _mood_stats_json = str(_mood_stats)
+                _mood_digest = hashlib.sha256(
+                    _mood_stats_json.encode("utf-8", "ignore")
+                ).hexdigest()
+                _mood_saved = st.session_state.get("mood_insight_cache")
+                _mood_cached_text = ""
+                if (
+                    isinstance(_mood_saved, dict)
+                    and _mood_saved.get("key") == _mood_digest
+                    and str(_mood_saved.get("text") or "").strip()
+                ):
+                    _mood_cached_text = str(_mood_saved["text"]).strip()
+
+                if st.button("🧠 听听教练怎么说", key="mood_coach_btn"):
+                    if _mood_cached_text:
+                        # 同一份数据已生成过：下面直接展示缓存，不重复调 API、不扣额度
+                        pass
+                    elif st.session_state.get("ai_daily_count", 0) >= 20:
+                        st.caption("今日免费额度已用完，明天再来听教练怎么说吧")
+                    else:
+                        _mood_insight_fn = _get_mood_insight_fn()
+                        if not callable(_mood_insight_fn):
+                            st.caption("教练暂时没空：AI 教练模块还没准备好")
+                        else:
+                            try:
+                                with st.spinner("教练正在读你的情绪账单…"):
+                                    _mood_text = _mood_insight_fn(_mood_stats)
+                            except Exception as _mood_insight_exc:
+                                # MoodInsightError 与其它异常同一口径：只 caption，不红屏、不扣额度
+                                print(
+                                    f"[mood] AI 教练调用失败："
+                                    f"{type(_mood_insight_exc).__name__}: {_mood_insight_exc}"
+                                )
+                                st.caption(f"教练暂时没空：{_mood_insight_exc}")
+                            else:
+                                _mood_text = (
+                                    str(_mood_text).strip()
+                                    if isinstance(_mood_text, str)
+                                    else ""
+                                )
+                                if _mood_text:
+                                    st.session_state["mood_insight_cache"] = {
+                                        "key": _mood_digest,
+                                        "text": _mood_text,
+                                    }
+                                    st.session_state.ai_daily_count = (
+                                        st.session_state.get("ai_daily_count", 0) + 1
+                                    )
+                                    st.session_state.ai_last_count_date = date.today()
+                                else:
+                                    st.caption("教练暂时没空：这次没有给出内容")
+
+                _mood_show = st.session_state.get("mood_insight_cache")
+                if (
+                    isinstance(_mood_show, dict)
+                    and _mood_show.get("key") == _mood_digest
+                    and str(_mood_show.get("text") or "").strip()
+                ):
+                    st.info(f"🧠 教练说：{str(_mood_show['text']).strip()}")
+
     # ===== AI 洞察：本月消费图表解读（玫瑰图下方、数据导出之前）=====
     # 统计口径与上方玫瑰图一致：本月 + 支出。无支出时只给引导，不显示按钮。
     _insight_exp_df = df_current_month[df_current_month["type"] == "支出"]
@@ -4338,6 +4620,12 @@ with tab_tools:
                 amount = st.number_input("金额（元）", min_value=0.0, step=1.0, format="%.2f")
             with row2_col2:
                 bill_type = st.selectbox("类型", ["支出", "收入"])
+            # 情绪标签只做展示：提交时映射成 db.MOOD_OPTIONS 原值，空选写 NULL
+            mood_label = st.selectbox(
+                "消费时的心情（可选）",
+                list(_MOOD_FORM_LABELS),
+                help="记录下来，气象站会分析情绪和花钱的关系",
+            )
             submitted = st.form_submit_button("保存这笔")
         # 提交逻辑放在 expander 外，避免校验/错误提示被折叠面板收起；
         # 成功提示用 session_state flash 传递，跨 rerun 在页面顶部展示一次
@@ -4353,8 +4641,23 @@ with tab_tools:
                 st.warning("记账日期不能晚于今天")
             else:
                 try:
-                    add_bill(st.session_state.user_id, bill_date.strftime("%Y-%m-%d"), merchant, float(amount), "手动录入", bill_type)
-                    st.session_state["flash"] = {"level": "success", "msg": f"已记录：{bill_date.strftime('%Y-%m-%d')} {merchant} ¥{amount:.2f}（{bill_type}）"}
+                    _mood_value = _mood_value_from_label(mood_label)
+                    _add_bill_with_mood(
+                        st.session_state.user_id,
+                        bill_date.strftime("%Y-%m-%d"),
+                        merchant,
+                        float(amount),
+                        "手动录入",
+                        bill_type,
+                        mood=_mood_value,
+                    )
+                    _flash_msg = (
+                        f"已记录：{bill_date.strftime('%Y-%m-%d')} {merchant} "
+                        f"¥{amount:.2f}（{bill_type}）"
+                    )
+                    if _mood_value:
+                        _flash_msg += f" · 心情：{_mood_value}"
+                    st.session_state["flash"] = {"level": "success", "msg": _flash_msg}
                     st.cache_data.clear()          # 清缓存，保证下面的指标/图表/提示条立刻更新
                     st.session_state.page = 0      # 回到第一页，新账单按日期倒序通常在最前
                     st.rerun()                     # 刷新页面，成功提示由顶部 flash 显示
@@ -4869,13 +5172,14 @@ with tab_tools:
                             _voice_bill = extract_bill_from_text(
                                 _voice_text, get_deepseek_api_key()
                             )
-                            add_bill(
+                            _add_bill_with_mood(
                                 st.session_state.user_id,
                                 _voice_bill["occurred_at"],
                                 _voice_bill["merchant"],
                                 _voice_bill["amount"],
                                 "语音记账",
                                 _voice_bill["bill_type"],
+                                mood=_voice_bill.get("mood") if isinstance(_voice_bill, dict) else "",
                             )
                         except TextBillError as _bill_err:
                             _bill_code = getattr(_bill_err, "code", "")
@@ -6173,13 +6477,14 @@ with tab_ai:
                         screenshot_file.type or "image/png",
                         ZHIPU_API_KEY,
                     )
-                    add_bill(
+                    _add_bill_with_mood(
                         st.session_state.user_id,
                         result["occurred_at"],
                         result["merchant"],
                         result["amount"],
                         "截图识别",
                         result["bill_type"],
+                        mood=result.get("mood") if isinstance(result, dict) else "",
                     )
                 except BillImageError as exc:
                     code = getattr(exc, "code", "")
@@ -6447,7 +6752,15 @@ with tab_ai:
                                     amount = float(func_args["amount"])
                                     payment_method = func_args.get("payment_method","未知")
                                     bill_type = func_args["type"]
-                                    add_bill(st.session_state.user_id, bill_date, merchant, amount, payment_method, bill_type)
+                                    _add_bill_with_mood(
+                                        st.session_state.user_id,
+                                        bill_date,
+                                        merchant,
+                                        amount,
+                                        payment_method,
+                                        bill_type,
+                                        mood=func_args.get("mood") or "",
+                                    )
                                     tool_result = f"已成功添加账单：日期{bill_date}，商户{merchant}，金额{amount}，类型{bill_type}"
                                     st.cache_data.clear()
                                 elif func_name == "get_summary":

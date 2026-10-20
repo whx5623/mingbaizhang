@@ -87,6 +87,7 @@ def build_system_prompt(total_income, total_expense, balance, recent_bills_text,
 2. 删除类请求 → 直接调用 delete_bills（只调用工具，不要自己编造删除结果）。调用后系统会向用户展示「确认卡片」，用户回复「确认」才会真正执行删除；因此你**不要**在文字里再问一遍确认，也不要在没有用户删除意图时调用它。
 3. 如果用户没说清日期区间，先追问清楚再调用工具，不要自行猜测。
 4. 不要在一次回复里同时调用 add_bill 和 delete_bills。
+5. 用户明确提到消费时的心情（emo/焦虑/开心/累/激动/压力大…）时，把对应情绪填进 add_bill 的 mood 字段（可选值：开心/Emo/焦虑/疲惫/激动）；没提就不要猜、不要编造。
 """
     return prompt
 
@@ -114,7 +115,8 @@ def get_ai_response(messages, api_key, zhipu_api_key, total_income, total_expens
                         "merchant": {"type": "string", "description": "商户名称"},
                         "amount": {"type": "number", "description": "金额"},
                         "payment_method": {"type": "string", "description": "支付方式"},
-                        "type": {"type": "string", "description": "收入/支出"}
+                        "type": {"type": "string", "description": "收入/支出"},
+                        "mood": {"type": "string", "description": "消费时的情绪，可选值：开心/Emo/焦虑/疲惫/激动；只有用户明确提到心情时才填，没提就不填"}
                     },
                     "required": ["date", "merchant", "amount", "payment_method", "type"]
                 }
@@ -4718,3 +4720,285 @@ def advisor_turn(history: list[dict], context: dict, api_key: str) -> dict:
         len(message),
     )
     return {"done": True, "message": message, "proposal": proposal}
+
+
+# ===========================================================================
+# 情绪消费教练（DeepSeek Chat：把「情绪标签统计」写成一句有心理学洞察的短句）
+# ---------------------------------------------------------------------------
+# 与「拿铁因子 / 同龄人」同构：先校验（没 key、没数据都不发请求）→ 组 payload
+# → 发请求 → 异常分层 → strip + 截断 → 脱敏日志。
+# 差异只在入参与返回：入参是调用方按约定拼好的情绪统计 stats，返回一段纯字符串，
+# 可直接贴到页面上。
+#   · 系统提示词逐字固定（产品口径，改一个字文案风格就跑偏）；
+#   · 日志只记模型名、字数、状态码与异常类型，**绝不**记 api_key 或金额明细。
+# ===========================================================================
+
+# 系统提示词逐字固定（产品口径）。
+MOOD_INSIGHT_SYSTEM_PROMPT = (
+    "你是一个既懂心理学又懂理财的教练。请根据我的情绪消费分析，给我一句 50 字左右的洞察。"
+    "比如：‘我发现你每到考试周（焦虑/疲惫），外卖和奶茶支出就会飙升。"
+    "下次压力大时，试试去操场跑两圈代替一杯奶茶？’"
+)
+
+MOOD_INSIGHT_MODEL = "deepseek-chat"
+MOOD_INSIGHT_TEMPERATURE = 0.7   # 0.7：要洞察、要温度，但不能飘成鸡汤
+MOOD_INSIGHT_MAX_TOKENS = 200    # 50 字 + 余量
+MOOD_INSIGHT_TIMEOUT = 20
+MOOD_INSIGHT_MAX_CHARS = 140     # 返回文本硬上限：超过截断到 140 字并补「…」
+
+
+class MoodInsightError(Exception):
+    """情绪消费教练洞察生成失败。
+
+    code 取值：
+      no_api_key   未配置 DeepSeek API Key（**未发请求**）
+      empty_stats  stats 不是 dict / moods 为空或无有效条目（**未发请求**）
+      network      网络异常（超时 / 连接失败 / 其它请求层异常）
+      http         接口返回非 200（message 只带状态码，不带响应体）
+      parse        响应不是合法 JSON / choices/content 缺失或为空
+
+    message 为面向用户的中文提示，可直接展示。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"MoodInsightError(code={self.code!r}, message={self.message!r})"
+
+
+def _mood_insight_amount(value) -> float:
+    """stats 里的金额宽松转 float：None / bool / 非数字 / nan / inf → 0.0。"""
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(number):
+        return 0.0
+    return number
+
+
+def _mood_insight_int(value, default: int = 0) -> int:
+    """笔数 / 月数转 int：非法 / 负数 → default。"""
+    if isinstance(value, bool):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(number) or number < 0:
+        return default
+    return int(number)
+
+
+def _mood_insight_text(value) -> str:
+    """mood / emoji 宽松转 str：None / bool → ""，其余 str() 后 strip。"""
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    try:
+        return str(value).strip()
+    except (TypeError, ValueError):
+        return ""
+
+
+def _mood_insight_entries(stats: dict) -> list[dict]:
+    """把 stats["moods"] 收敛成有效条目；不是 list 或条目结构不对的项直接跳过。"""
+    moods = stats.get("moods")
+    if not isinstance(moods, (list, tuple)):
+        return []
+    entries = []
+    for item in moods:
+        if not isinstance(item, dict):
+            continue
+        if not _mood_insight_text(item.get("mood")):
+            continue
+        entries.append(item)
+    return entries
+
+
+def _mood_insight_ratio_text(value) -> str:
+    """倍数展示口径：2.0 → "2.0 倍"。"""
+    ratio = _mood_insight_amount(value)
+    if ratio <= 0:
+        return "0.0 倍"
+    return f"{ratio:.1f} 倍"
+
+
+def _mood_insight_share_text(value) -> str:
+    """占比展示口径：0.6 → "60.0%"（入参是 0~1 的比例）。"""
+    share = _mood_insight_amount(value)
+    if share <= 0:
+        return "0.0%"
+    return f"{share * 100:.1f}%"
+
+
+def _build_mood_insight_user_content(stats: dict, entries: list[dict]) -> str:
+    """把情绪消费统计排成中文条目（金额两位小数、倍数一位小数）。"""
+    months = _mood_insight_int(stats.get("months"))
+    total_expense = _mood_insight_amount(stats.get("total_expense"))
+    tagged_expense = _mood_insight_amount(stats.get("tagged_expense"))
+    baseline_avg = _mood_insight_amount(stats.get("baseline_avg"))
+
+    lines = [
+        "这是我的情绪消费分析，请按系统要求写一句洞察：",
+        f"统计月数：{months} 个月",
+        f"支出总额：{total_expense:.2f} 元",
+        f"带情绪标签的支出：{tagged_expense:.2f} 元",
+        f"基线平均单笔：{baseline_avg:.2f} 元",
+        "各情绪消费明细：",
+    ]
+    for item in entries:
+        mood = _mood_insight_text(item.get("mood"))
+        emoji = _mood_insight_text(item.get("emoji"))
+        label = f"{mood} {emoji}".strip() if emoji else mood
+        total = _mood_insight_amount(item.get("total"))
+        count = _mood_insight_int(item.get("count"))
+        avg = _mood_insight_amount(item.get("avg"))
+        risk = "高危" if item.get("high_risk") else "正常"
+        lines.append(
+            f"  {label}：总额 {total:.2f} 元，笔数 {count} 笔，"
+            f"平均单笔 {avg:.2f} 元，是基线的 {_mood_insight_ratio_text(item.get('avg_ratio'))}，"
+            f"占比 {_mood_insight_share_text(item.get('share'))}，{risk}"
+        )
+
+    untagged = stats.get("untagged")
+    if isinstance(untagged, dict):
+        untagged_total = _mood_insight_amount(untagged.get("total"))
+        untagged_count = _mood_insight_int(untagged.get("count"))
+        untagged_avg = _mood_insight_amount(untagged.get("avg"))
+        lines.append(
+            f"未标注情绪支出：总额 {untagged_total:.2f} 元，笔数 {untagged_count} 笔，"
+            f"平均单笔 {untagged_avg:.2f} 元"
+        )
+    else:
+        lines.append("未标注情绪支出：无")
+
+    lines.append(
+        "请用一句 50 字左右的话总结我的情绪消费模式：要有一点心理学洞察，"
+        "并给我一个可执行的替代动作（例如用散步、运动、找朋友聊聊代替情绪化消费）。"
+    )
+    return "\n".join(lines)
+
+
+def generate_mood_insight(stats: dict, api_key: str = "") -> str:
+    """根据情绪标签统计生成一句约 50 字的「心理 + 理财」洞察，返回 strip 后文本。
+
+    stats 约定（缺失键按 0 / 空处理，绝不 KeyError）：
+        {"months": 3, "total_expense": 1520.0, "tagged_expense": 900.0,
+         "baseline_avg": 45.0, "has_data": True,
+         "high_risk": {"mood": "Emo", "avg": 90.0, "avg_ratio": 2.0,
+                       "count": 6, "total": 540.0},
+         "moods": [{"mood": "Emo", "emoji": "😢", "total": 540.0, "count": 6,
+                    "avg": 90.0, "avg_ratio": 2.0, "share": 0.6,
+                    "high_risk": True}, ...],
+         "untagged": {"total": 620.0, "count": 12, "avg": 51.67}}
+
+    失败一律抛 MoodInsightError（中文 message，可直接上页面）：
+      · api_key 为空                                → no_api_key（且**不发请求**）；
+      · stats 不是 dict / moods 为空或无有效条目     → empty_stats（且**不发请求**）；
+      · 超时 / 连接失败 / 其它请求层异常              → network；
+      · 非 200                                      → http（只带状态码，不拼响应体）；
+      · 响应不是 JSON / content 缺失或为空            → parse。
+    返回文本超过 140 字时截断到 140 字并补「…」。
+    日志只记模型名、字数、状态码与异常类型，**绝不**记 api_key 或金额明细。
+    """
+    # ① api_key：先查它，没有 key 时不该先花一次网络往返。
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise MoodInsightError(
+            "no_api_key",
+            "未配置 DEEPSEEK_API_KEY，情绪消费洞察暂不可用",
+        )
+    api_key = api_key.strip()
+
+    # ② 数据前置校验：没有情绪标签时让模型硬编只会产出空话。
+    if not isinstance(stats, dict):
+        raise MoodInsightError(
+            "empty_stats",
+            "情绪消费数据不完整，暂时无法生成洞察，请刷新后重试",
+        )
+    entries = _mood_insight_entries(stats)
+    if not entries:
+        raise MoodInsightError(
+            "empty_stats",
+            "还没有带情绪标签的消费记录，先记几笔带心情的账单吧",
+        )
+
+    user_content = _build_mood_insight_user_content(stats, entries)
+    payload = {
+        "model": MOOD_INSIGHT_MODEL,
+        "messages": [
+            {"role": "system", "content": MOOD_INSIGHT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": MOOD_INSIGHT_TEMPERATURE,
+        "max_tokens": MOOD_INSIGHT_MAX_TOKENS,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ③ 发请求：超时/连接失败翻译成用户能看懂的句子（不把异常对象漏到页面）。
+    try:
+        resp = requests.post(
+            DEEPSEEK_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=MOOD_INSIGHT_TIMEOUT,
+        )
+    except requests.Timeout:
+        logger.warning("情绪消费洞察请求超时（模型=%s）", MOOD_INSIGHT_MODEL)
+        raise MoodInsightError("network", "生成情绪消费洞察超时，请稍后再试") from None
+    except requests.ConnectionError:
+        logger.warning("情绪消费洞察请求连接失败（模型=%s）", MOOD_INSIGHT_MODEL)
+        raise MoodInsightError("network", "网络连接失败，请检查网络") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：日志只记异常类型（确保不把 headers / key 带出去）。
+        logger.warning(
+            "情绪消费洞察请求失败（模型=%s，异常=%s）",
+            MOOD_INSIGHT_MODEL,
+            type(exc).__name__,
+        )
+        raise MoodInsightError("network", "网络连接失败，请检查网络") from None
+
+    # ④ 非 200：只带状态码，不把响应体拼进 message（响应体可能含请求回显）。
+    if resp.status_code != 200:
+        logger.warning(
+            "情绪消费洞察接口返回 HTTP %s（模型=%s）",
+            resp.status_code,
+            MOOD_INSIGHT_MODEL,
+        )
+        raise MoodInsightError(
+            "http",
+            f"AI 服务返回异常（HTTP {resp.status_code}），请稍后重试",
+        )
+
+    # ⑤ 解析：非 JSON / 结构不符 / content 为空 → 同一条"没有有效洞察"。
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("情绪消费洞察响应不是合法 JSON（模型=%s）", MOOD_INSIGHT_MODEL)
+        raise MoodInsightError("parse", "AI 没有返回有效洞察，请重试") from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("情绪消费洞察响应结构不符合预期（模型=%s）", MOOD_INSIGHT_MODEL)
+        raise MoodInsightError("parse", "AI 没有返回有效洞察，请重试") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("情绪消费洞察响应 content 为空（模型=%s）", MOOD_INSIGHT_MODEL)
+        raise MoodInsightError("parse", "AI 没有返回有效洞察，请重试")
+
+    content = content.strip()
+    if len(content) > MOOD_INSIGHT_MAX_CHARS:
+        content = content[:MOOD_INSIGHT_MAX_CHARS] + "…"
+    logger.info("情绪消费洞察生成成功（模型=%s，字数=%d）", MOOD_INSIGHT_MODEL, len(content))
+    return content

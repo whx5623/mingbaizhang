@@ -733,7 +733,36 @@ def verify_user(username, password):
     _touch_last_login(user_id)
     return user_id
 
-def add_bill(user_id, date, merchant, amount, payment_method, type, category=None):
+def _bill_insert_statement(write_category, write_mood):
+    """按「012 / 019 是否已执行」选出四种 INSERT 之一（列名全是字面量）。
+
+    为什么要写死四种组合：category 与 mood 分属两个迁移，线上完全可能出现
+    「012 已执行、019 未执行」（或反过来）的中间态。只要把**不存在的列**写进
+    INSERT，整笔账单就会失败 —— 而分类和情绪都只是附加信息，绝不能拖垮记账。
+    调用方只有在 write_* 为 True 时才绑对应的参数，用户数据一律走绑定参数。
+    """
+    if write_category and write_mood:
+        return text("""
+            INSERT INTO bills(user_id, date, merchant, amount, payment_method, type, category, mood)
+            VALUES (:uid, :dt, :mer, :amt, :pm, :tp, :cat, :mood)
+        """)
+    if write_category:
+        return text("""
+            INSERT INTO bills(user_id, date, merchant, amount, payment_method, type, category)
+            VALUES (:uid, :dt, :mer, :amt, :pm, :tp, :cat)
+        """)
+    if write_mood:
+        return text("""
+            INSERT INTO bills(user_id, date, merchant, amount, payment_method, type, mood)
+            VALUES (:uid, :dt, :mer, :amt, :pm, :tp, :mood)
+        """)
+    return text("""
+        INSERT INTO bills(user_id, date, merchant, amount, payment_method, type)
+        VALUES (:uid, :dt, :mer, :amt, :pm, :tp)
+    """)
+
+
+def add_bill(user_id, date, merchant, amount, payment_method, type, category=None, mood=None):
     global engine
     # 参数名 date 是历史遗留（遮蔽了 datetime.date），本函数里不再用 date 类型，只当值用。
     #
@@ -751,38 +780,31 @@ def add_bill(user_id, date, merchant, amount, payment_method, type, category=Non
     # 所以分类失败绝不会让这笔账记不上（这是本功能的硬约束）。
     # category 显式传了就尊重调用方（app.py 目前不传，保持位置参数兼容）。
     category_value = category or auto_categorize(merchant, "", api_key=_deepseek_key())
+    # 情绪同样在开连接之前收敛：normalize_mood 永不抛异常，AI 把整段描述塞进 mood
+    # 也只会变成 ""（= 未标注），不会让这笔账记不上（与分类同一个硬约束）。
+    # 注意 mood 是**只能追加**的 keyword 参数：老调用方仍可按位置传 category。
+    mood_value = normalize_mood(mood)
     # 列存在性探测放在开写连接之前：避免在一条已检出的连接上再借第二条连接做元数据查询。
     write_category = _bills_category_supported()
+    write_mood = _bills_mood_supported()
     with engine.connect() as conn:
+        # 012 / 019 的四种组合由 _bill_insert_statement 统一挑选：缺哪列就少写哪列。
+        # 降级只发生在这里，告警由两个 _bills_*_supported() 负责（每个进程一次）。
+        stmt = _bill_insert_statement(write_category, write_mood)
+        params = {
+            "uid": user_id,
+            "dt": bill_date,
+            "mer": merchant,
+            "amt": amt,
+            "pm": payment_method,
+            "tp": bill_type,
+        }
         if write_category:
-            stmt = text("""
-                INSERT INTO bills(user_id, date, merchant, amount, payment_method, type, category)
-                VALUES (:uid, :dt, :mer, :amt, :pm, :tp, :cat)
-            """)
-            params = {
-                "uid": user_id,
-                "dt": bill_date,
-                "mer": merchant,
-                "amt": amt,
-                "pm": payment_method,
-                "tp": bill_type,
-                "cat": category_value,
-            }
-        else:
-            # 迁移 012 未执行：列不存在，INSERT 不能带 category，否则整笔账单都会失败。
-            # 降级只发生在这里，告警由 _bills_category_supported() 负责（每个进程一次）。
-            stmt = text("""
-                INSERT INTO bills(user_id, date, merchant, amount, payment_method, type)
-                VALUES (:uid, :dt, :mer, :amt, :pm, :tp)
-            """)
-            params = {
-                "uid": user_id,
-                "dt": bill_date,
-                "mer": merchant,
-                "amt": amt,
-                "pm": payment_method,
-                "tp": bill_type,
-            }
+            params["cat"] = category_value
+        if write_mood:
+            # 空串在读取侧与 NULL 等价，但库里保持 NULL 更干净：
+            # 「没标注」和「标注了一个空情绪」在数据上不该是两种东西。
+            params["mood"] = mood_value or None
         conn.execute(stmt, params)
         conn.commit()
 
@@ -790,15 +812,19 @@ def get_all_bills(user_id):
     global engine
     sql = text("SELECT * FROM bills WHERE user_id = :uid")
     df = pd.read_sql(sql, engine, params={"uid": user_id})
-    # 顺序无所谓，但三列都必须收口：type 归一化（字符串口径）+ amount 转 float（数值口径）
-    # + category 空值收敛（列不存在时原样返回，绝不凭空造列）。
-    return _normalize_category_column(_normalize_type_column(_normalize_amount_column(df)))
+    # 顺序无所谓，但四列都必须收口：type 归一化（字符串口径）+ amount 转 float（数值口径）
+    # + category 空值收敛 + mood 收敛（后两者列不存在时原样返回，绝不凭空造列）。
+    return _normalize_category_column(
+        _normalize_mood_column(_normalize_type_column(_normalize_amount_column(df)))
+    )
 
 def get_bills_paginated(user_id, limit, offset):
     global engine
     sql = text("SELECT * FROM bills WHERE user_id = :uid ORDER BY date DESC LIMIT :lim OFFSET :off")
     df = pd.read_sql(sql, engine, params={"uid": user_id, "lim": limit, "off": offset})
-    return _normalize_category_column(_normalize_type_column(_normalize_amount_column(df)))
+    return _normalize_category_column(
+        _normalize_mood_column(_normalize_type_column(_normalize_amount_column(df)))
+    )
 
 def get_total_bill_count(user_id):
     global engine
@@ -809,31 +835,26 @@ def get_total_bill_count(user_id):
 def insert_demo_bills(user_id):
     global engine
     demo_data = [
-        {"date":"2026-10-01","merchant":"食堂","amount":12.5,"payment_method":"校园卡","type":"支出"},
-        {"date":"2026-10-02","merchant":"蜜雪冰城","amount":8.0,"payment_method":"微信","type":"支出"},
-        {"date":"2026-10-03","merchant":"淘宝网购","amount":129.0,"payment_method":"支付宝","type":"支出"},
-        {"date":"2026-10-04","merchant":"兼职","amount":400.0,"payment_method":"银行卡","type":"收入"},
-        {"date":"2026-10-05","merchant":"白条分期","amount":99.0,"payment_method":"白条","type":"支出"},
-        {"date":"2026-10-06","merchant":"食堂","amount":15.0,"payment_method":"校园卡","type":"支出"},
-        {"date":"2026-10-07","merchant":"瑞幸咖啡","amount":14.0,"payment_method":"微信","type":"支出"},
-        {"date":"2026-10-08","merchant":"拼多多","amount":45.5,"payment_method":"支付宝","type":"支出"},
-        {"date":"2026-10-09","merchant":"家教兼职","amount":300.0,"payment_method":"微信","type":"收入"},
-        {"date":"2026-10-10","merchant":"超市","amount":56.2,"payment_method":"支付宝","type":"支出"},
+        # mood 是**确定性**写死的（不按商户猜、不调 AI）：演示数据的意义是"点一下就能看到
+        # 效果"，同一份数据每次加载出的气象站必须完全一样。收入行标 None —— 情绪分析只
+        # 看支出，给收入编一个情绪只会污染口径。
+        {"date":"2026-10-01","merchant":"食堂","amount":12.5,"payment_method":"校园卡","type":"支出","mood":"开心"},
+        {"date":"2026-10-02","merchant":"蜜雪冰城","amount":8.0,"payment_method":"微信","type":"支出","mood":"疲惫"},
+        {"date":"2026-10-03","merchant":"淘宝网购","amount":129.0,"payment_method":"支付宝","type":"支出","mood":"激动"},
+        {"date":"2026-10-04","merchant":"兼职","amount":400.0,"payment_method":"银行卡","type":"收入","mood":None},
+        {"date":"2026-10-05","merchant":"白条分期","amount":99.0,"payment_method":"白条","type":"支出","mood":"焦虑"},
+        {"date":"2026-10-06","merchant":"食堂","amount":15.0,"payment_method":"校园卡","type":"支出","mood":"开心"},
+        {"date":"2026-10-07","merchant":"瑞幸咖啡","amount":14.0,"payment_method":"微信","type":"支出","mood":"疲惫"},
+        {"date":"2026-10-08","merchant":"拼多多","amount":45.5,"payment_method":"支付宝","type":"支出","mood":"激动"},
+        {"date":"2026-10-09","merchant":"家教兼职","amount":300.0,"payment_method":"微信","type":"收入","mood":None},
+        {"date":"2026-10-10","merchant":"超市","amount":56.2,"payment_method":"支付宝","type":"支出","mood":"开心"},
     ]
     write_category = _bills_category_supported()
+    write_mood = _bills_mood_supported()
     with engine.connect() as conn:
         conn.execute(text("DELETE FROM bills WHERE user_id = :uid"), {"uid": user_id})
-        if write_category:
-            stmt = text("""
-                INSERT INTO bills(user_id, date, merchant, amount, payment_method, type, category)
-                VALUES (:uid, :dt, :mer, :amt, :pm, :tp, :cat)
-            """)
-        else:
-            # 012 未执行：不带 category 写入（降级，记账优先）
-            stmt = text("""
-                INSERT INTO bills(user_id, date, merchant, amount, payment_method, type)
-                VALUES (:uid, :dt, :mer, :amt, :pm, :tp)
-            """)
+        # 012 / 019 的四种组合由同一个函数挑选：缺哪列就少写哪列（降级，记账优先）。
+        stmt = _bill_insert_statement(write_category, write_mood)
         for row in demo_data:
             # 演示数据里本来就是中文字面量，归一化是幂等的（防止以后有人改数据源）
             bill_type = normalize_bill_type(row["type"], strict=True)
@@ -855,6 +876,9 @@ def insert_demo_bills(user_id):
             }
             if write_category:
                 params["cat"] = category_value
+            if write_mood:
+                # 与 add_bill 同一口径：认不出/收入行都写 NULL（= 未标注）
+                params["mood"] = normalize_mood(row.get("mood")) or None
             conn.execute(stmt, params)
         conn.commit()
     return True
@@ -2095,6 +2119,362 @@ def auto_categorize(merchant, description="", api_key=None) -> str:
         category, FALLBACK_CATEGORY, merchant_text[:50],
     )
     return FALLBACK_CATEGORY
+
+
+# ---------------------------------------------------------------------------
+# 消费情绪（bills.mood，迁移 019）
+# ---------------------------------------------------------------------------
+# 设计口径（与分类同构，但「可选」的意味更强）：
+#   · 情绪是用户/AI 顺手给的附加信息，不是记账的前置条件。019 未执行、值非法、
+#     列不存在 —— 一律降级成「未标注」，绝不因此让一笔账记不上。
+#   · 「未标注」不是一种情绪：NULL / 空串 / 非法值都收敛成 ""，不进 moods 分组，
+#     只进 total_expense 与 baseline_avg。否则它会被当成第六种情绪参与排名，
+#     均值参照线也会被它污染。
+#   · 写入侧兼容「019 未执行」：_bills_mood_supported() 探测列是否存在，不存在时
+#     INSERT 自动去掉 mood（见 add_bill / _bill_insert_statement）。
+#   · 读取侧不凭空造列：只有列存在时才把列值收敛成合法情绪或空串。
+MOOD_OPTIONS = ("开心", "Emo", "焦虑", "疲惫", "激动")
+
+MOOD_EMOJI = {"开心": "😊", "Emo": "😢", "焦虑": "😠", "疲惫": "😴", "激动": "🤩"}
+
+# 未标注的**展示文案**：只给页面用，绝不写进库（库里如实是真 NULL）。
+MOOD_UNKNOWN = "未标注"
+
+# 统计窗口的默认值与上限：24 个月足够覆盖"年度回顾"，也避免一个误传的月份数
+# 把整张 bills 扫成一次全表聚合。
+MOOD_MONTHS_DEFAULT = 3
+MOOD_MONTHS_MAX = 24
+
+# high_risk 的判定阈值：同一情绪的平均单笔 >= 全窗口均值的 1.5 倍，且至少 2 笔。
+# 为什么要 count>=2：一笔大额不构成"情绪模式"，否则每次都会随机标红一个情绪。
+MOOD_HIGH_RISK_RATIO = 1.5
+MOOD_HIGH_RISK_MIN_COUNT = 2
+
+# bills.mood 是否存在的进程级缓存：None = 还没探测过；True/False = 探测结果。
+# 与 _BILLS_CATEGORY_SUPPORT 同一套取舍：只缓存**探测成功**的结果，探测失败
+# （库暂时不可用）不缓存，否则一次抖动就会让整个进程永久降级。
+_BILLS_MOOD_SUPPORT = None
+
+# get_mood_spending 的告警只打一次：页面每轮 rerun 都会调用它，逐次 print 会刷屏。
+_MOOD_WARNED = False
+
+
+def normalize_mood(value) -> str:
+    """把任意传入值收敛成 MOOD_OPTIONS 里的原值；认不出就返回 ""（= 未标注）。
+
+    为什么这样"外宽内严"：
+      · 外宽：AI / 前端可能给 "😊开心"、"开心 "、"emo"、"EMO"、甚至把 emoji 夹在
+        中间。先 strip，再去掉 emoji / 标点 / 空白等非字母数字字符，最后做**整串**
+        比较，于是 "😊 开心" 与 "开心" 等价，大小写只对 Emo 不敏感。
+      · 内严：中文情绪必须整串精确匹配，"不开心" / "穷开心" 不会被误判成 "开心"；
+        非法值一律 ""，由调用方按「未标注」处理。
+      · **绝不抛异常**：它跑在记账主路径上（mood 可能来自 AI 幻觉），任何脏值
+        最多变成"没有标注"，不能让一笔账记不上。
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        # NaN / NaT / pd.NA 都按"没给值"处理；容器等不可判定值退回 str() 再比对。
+        try:
+            if pd.isna(value):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        try:
+            value = str(value)
+        except Exception:
+            return ""
+    cleaned = "".join(ch for ch in value.strip() if ch.isalnum())
+    if not cleaned:
+        return ""
+    # Emo 是唯一大小写不敏感的值（用户/AI 常写成 emo/EMO）；中文 casefold 无副作用。
+    if cleaned.casefold() == "emo":
+        return "Emo"
+    if cleaned in MOOD_OPTIONS:
+        return cleaned
+    return ""
+
+
+def _bills_mood_supported():
+    """探测 bills.mood 是否存在（迁移 019 是否已执行），结果进程内缓存。
+
+    False 时调用方必须走"不带 mood 的 INSERT"：019 未执行时硬塞 mood 会让
+    整笔账单写入失败 —— 情绪是可选信息，绝不能拖垮记账主路径。
+    这里只告警一次（缓存 False 之后的调用直接返回，不再刷日志）。
+    """
+    global _BILLS_MOOD_SUPPORT
+    if _BILLS_MOOD_SUPPORT is not None:
+        return _BILLS_MOOD_SUPPORT
+    if engine is None:
+        # 正常入口 app.py 会先 init_db()；这里兜底，避免脚本里直接调 add_bill 时
+        # 把"引擎没建"误判成"列不存在"并永久缓存。
+        try:
+            init_db()
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "[db] 探测 bills.mood 前初始化数据库失败，本次按「无 mood 列」处理", exc_info=True
+            )
+            return False
+    try:
+        with engine.connect() as conn:
+            exists = bool(conn.execute(text("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'bills'
+                      AND column_name = 'mood'
+                )
+            """)).scalar())
+    except Exception:
+        # 探测失败不等于列不存在：不写缓存，下次再探（写库本身也会失败并照常抛出）。
+        logging.getLogger(__name__).warning(
+            "[db] 探测 bills.mood 失败，本次按「无 mood 列」写入（不带情绪）", exc_info=True
+        )
+        return False
+    _BILLS_MOOD_SUPPORT = exists
+    if not exists:
+        logging.getLogger(__name__).warning(
+            "[db] bills.mood 不存在（migrations/019_bills_mood.sql 未执行）："
+            "账单将不带情绪写入，请执行 019 迁移后重启应用"
+        )
+    return exists
+
+
+def _normalize_mood_column(df):
+    """读取兜底：mood 列收敛成 MOOD_OPTIONS 原值或 ""；**没有该列时不造列**。
+
+    与 _normalize_category_column 同样"绝不抛异常"：归一化失败就返回原始数据，
+    页面最多把某个情绪显示成未标注，不会因为兜底逻辑崩掉。
+    NaN → ""、首尾空白去掉、非法值 → "" 都由 normalize_mood 统一负责。
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty or "mood" not in df.columns:
+        return df
+    try:
+        df = df.copy()
+        df["mood"] = df["mood"].map(normalize_mood)
+    except Exception as exc:  # 兜底逻辑本身不能把页面搞崩，异常时退回原始数据
+        print(f"[db] mood 列归一化失败，返回原始数据：{exc}")
+    return df
+
+
+def _normalize_mood_months(months) -> int:
+    """统计月数收敛到 1~24：非数字 / <=0 → 默认 3，>24 → 24。
+
+    与其它模块"非法即 ValueError"不同：情绪气象站是只读展示，月份来自页面控件，
+    传错/传空只该退回默认窗口，不该把整块页面打成异常（页面不能红屏）。
+    """
+    try:
+        value = int(months)
+    except (TypeError, ValueError, OverflowError):
+        return MOOD_MONTHS_DEFAULT
+    if value <= 0:
+        return MOOD_MONTHS_DEFAULT
+    return min(value, MOOD_MONTHS_MAX)
+
+
+def _warn_mood_once(message: str) -> None:
+    """[mood] 告警只打一次（进程内）：页面每轮 rerun 都会调统计函数，不能刷屏。"""
+    global _MOOD_WARNED
+    if _MOOD_WARNED:
+        return
+    _MOOD_WARNED = True
+    print(f"[mood] {message}")
+
+
+def _empty_mood_spending(window_months: int, start: str, end: str) -> dict:
+    """降级时返回的完整空结构：键/类型与正常返回一致，调用方无需写分支。"""
+    return {
+        "months": window_months,
+        "start": start,
+        "end": end,
+        "has_data": False,
+        "total_expense": 0.0,
+        "tagged_expense": 0.0,
+        "tagged_count": 0,
+        "baseline_avg": 0.0,
+        "moods": [],
+        "high_risk": None,
+        "untagged": {"total": 0.0, "count": 0, "avg": 0.0},
+    }
+
+
+def get_mood_spending(user_id, months=3, today=None) -> dict:
+    """统计某用户近 months 个月的「情绪 × 支出」，供情绪消费气象站使用。
+
+    统计窗口（左闭右闭）
+    --------------------
+    · 终点 = today（默认 date.today()）；起点 = 终点所在月往前推 months-1 个月的
+      1 号。例：today=2026-10-20、months=3 → 2026-08-01 ~ 2026-10-20。
+    · months<=0 / 非数字 → 3；months>24 → 24（只读展示，不为控件值把页面打成异常）。
+    · bills.date 是 VARCHAR 且 007 的 CHECK 保证 ISO，所以**按字符串比较**：
+      ISO 字典序与日历序一致，也避免 ``::date`` 在脏数据上抛异常。
+    · 只统计 ``type = '支出'``，收入不进任何数字。
+
+    口径
+    ----
+    · total_expense  = 窗口内全部支出（含未标注）；
+    · tagged_expense = 带合法情绪标签的支出合计；tagged_count = 对应笔数；
+    · baseline_avg   = **全部**支出的单笔均值（含未标注）= total / 全部笔数；
+      不是"已标注部分的均值" —— 参照线要回答"我平时一笔花多少"，未标注账单
+      同样是平时的消费，剔掉会让参照线虚高；
+    · 每种情绪：avg = total/count、share = total/tagged_expense、
+      avg_ratio = avg/baseline_avg；任何除零一律 0.0；
+    · high_risk = count>=2 且 avg >= baseline_avg*1.5 的情绪里 avg_ratio 最大的
+      一个，没有则 None；同分按 MOOD_OPTIONS 顺序取靠前者，保证同一份数据
+      每次输出完全一致。
+
+    降级（本函数**绝不向上抛**）
+    ----------------------------
+    · 019 未执行（bills.mood 不存在）→ 空结构 + 一句告警（print 一次）；
+    · 查询本身异常（连接断了、权限变了……）→ 同样空结构 + 告警。
+      情绪气象站是可选功能，页面渲染不该为它红屏；返回值仍是完整结构。
+    · user_id 非法仍抛 ValueError（与其它查询函数一致）：那是调用方的程序性
+      错误，不是环境降级，静默返回空数据会把 bug 藏起来。
+    """
+    uid = _normalize_budget_user_id(user_id)
+    window_months = _normalize_mood_months(months)
+    end_day = _normalize_forecast_today(today)
+
+    # 与 get_daily_expense_totals / get_latte_factor 同一套「月份序号」算法：
+    # 跨年由 floor 除 / 模自然处理，不写 year == 1 分支。
+    month_index = (end_day.year * 12 + end_day.month - 1) - (window_months - 1)
+    start_day = date(month_index // 12, month_index % 12 + 1, 1)
+    start_text = start_day.isoformat()
+    end_text = end_day.isoformat()
+    empty = _empty_mood_spending(window_months, start_text, end_text)
+
+    if not _bills_mood_supported():
+        _warn_mood_once(
+            "bills.mood 不可用（migrations/019_bills_mood.sql 未执行或数据库不可用），"
+            "情绪消费气象站按「暂无数据」展示"
+        )
+        return empty
+
+    try:
+        if engine is None:
+            init_db()
+        with engine.connect() as conn:
+            # 一条 SQL 按 mood 分组：NULL / 空串 / 非法值都落进同一个"未标注"桶，
+            # 由 Python 侧 normalize_mood 统一判定，SQL 里不写 IN (...) 枚举。
+            rows = conn.execute(
+                text("""
+                    SELECT b.mood AS mood,
+                           SUM(b.amount) AS total,
+                           COUNT(*) AS cnt
+                    FROM public.bills AS b
+                    WHERE b.user_id = :uid
+                      AND b.type = :expense
+                      AND b.date >= :start
+                      AND b.date <= :end
+                    GROUP BY b.mood
+                """),
+                {
+                    "uid": uid,
+                    "expense": EXPENSE_TYPE,
+                    "start": start_text,
+                    "end": end_text,
+                },
+            ).fetchall()
+    except Exception as exc:
+        # 只记异常类型：SQL 文本/参数值不进日志（与 hide_parameters 的口径一致）。
+        _warn_mood_once(f"查询情绪消费失败，按「暂无数据」展示：{type(exc).__name__}")
+        return empty
+
+    total_decimal = Decimal("0")
+    tagged_decimal = Decimal("0")
+    untagged_decimal = Decimal("0")
+    total_count = 0
+    tagged_count = 0
+    untagged_count = 0
+    per_mood: dict[str, dict] = {}
+    for row in rows:
+        count = int(row.cnt or 0)
+        if count <= 0:
+            continue
+        amount = _as_decimal(row.total)
+        total_decimal += amount
+        total_count += count
+        mood = normalize_mood(row.mood)
+        if not mood:
+            # NULL / 空串 / 库里的历史脏值都算未标注：只进总额与参照线，不参与排名。
+            untagged_decimal += amount
+            untagged_count += count
+            continue
+        bucket = per_mood.setdefault(mood, {"total": Decimal("0"), "count": 0})
+        bucket["total"] += amount
+        bucket["count"] += count
+        tagged_decimal += amount
+        tagged_count += count
+
+    total_expense = _money_to_float(total_decimal)
+    tagged_expense = _money_to_float(tagged_decimal)
+    # 全部支出为 0 时不能做除法：参照线给 0.0，下游据此把 avg_ratio 也置 0。
+    baseline_avg = (
+        _money_to_float(total_decimal / Decimal(total_count)) if total_count else 0.0
+    )
+    untagged = {
+        "total": _money_to_float(untagged_decimal),
+        "count": untagged_count,
+        "avg": (
+            _money_to_float(untagged_decimal / Decimal(untagged_count))
+            if untagged_count
+            else 0.0
+        ),
+    }
+
+    # 先按 MOOD_OPTIONS 顺序生成（同额时顺序稳定），再按总额降序排序。
+    moods = []
+    by_mood: dict[str, dict] = {}
+    for mood in MOOD_OPTIONS:
+        bucket = per_mood.get(mood)
+        if not bucket or bucket["count"] <= 0:
+            continue
+        count = int(bucket["count"])
+        total = _money_to_float(bucket["total"])
+        avg = _money_to_float(bucket["total"] / Decimal(count))
+        item = {
+            "mood": mood,
+            "emoji": MOOD_EMOJI.get(mood, ""),
+            "total": total,
+            "count": count,
+            "avg": avg,
+            "share": round(total / tagged_expense, 4) if tagged_expense > 0 else 0.0,
+            "avg_ratio": round(avg / baseline_avg, 2) if baseline_avg > 0 else 0.0,
+            "high_risk": False,
+        }
+        moods.append(item)
+        by_mood[mood] = item
+    moods.sort(key=lambda item: (-item["total"], MOOD_OPTIONS.index(item["mood"])))
+
+    # 高危情绪：笔数够、且客单价明显高于全体均值。同分时按 MOOD_OPTIONS 顺序取靠前者。
+    high_risk = None
+    if baseline_avg > 0:
+        threshold = baseline_avg * MOOD_HIGH_RISK_RATIO
+        for mood in MOOD_OPTIONS:
+            item = by_mood.get(mood)
+            if item is None or item["count"] < MOOD_HIGH_RISK_MIN_COUNT:
+                continue
+            if item["avg"] < threshold:
+                continue
+            if high_risk is None or item["avg_ratio"] > high_risk["avg_ratio"]:
+                high_risk = item
+    if high_risk is not None:
+        # 同一个 dict 对象也在 moods 里，标记一次两处都生效（页面按列表渲染）。
+        high_risk["high_risk"] = True
+
+    return {
+        "months": window_months,
+        "start": start_text,
+        "end": end_text,
+        "has_data": tagged_count > 0,
+        "total_expense": total_expense,
+        "tagged_expense": tagged_expense,
+        "tagged_count": tagged_count,
+        "baseline_avg": baseline_avg,
+        "moods": moods,
+        "high_risk": high_risk,
+        "untagged": untagged,
+    }
 
 
 # ---------------------------------------------------------------------------
