@@ -60,6 +60,7 @@ import requests
 import uuid
 import json
 import math
+import calendar
 import hashlib
 import os
 import tomllib
@@ -107,6 +108,16 @@ except ImportError as _peer_chart_exc:
         f"[peer] 雷达图模块不可用："
         f"{type(_peer_chart_exc).__name__}: {_peer_chart_exc}"
     )
+
+# 完整财务体检 PDF 报告（report_pdf.py 由并行方实现，3 页 A4，纯本地排版）：
+# 与上面几个并行模块同样先降级——缺失时只在「数据导出」区给一行提示，绝不红屏。
+# 调用处一律 getattr / hasattr 取属性（不用 from report_pdf import ...），
+# 这样并行方稍后合入、以及测试里往 sys.modules 注入假模块都能生效。
+try:
+    import report_pdf
+except ImportError as _report_import_exc:
+    report_pdf = None
+    print(f"[report] PDF 报告模块不可用：{type(_report_import_exc).__name__}: {_report_import_exc}")
 
 
 class _ChartInsightFallbackError(Exception):
@@ -3606,6 +3617,568 @@ with tab_dash:
         file_name=f"bills_filtered_{current_month_str}.csv",
         mime="text/csv",
     )
+
+    # ---- 📥 完整财务体检报告（3 页 A4 PDF，本地排版，不消耗 AI 额度）----
+    # 位置：先导数据（CSV/TXT）→ 再出体检报告 → 最后看消费回忆录，符合阅读顺序。
+    # 数据全部来自本页已算好的变量与 db 的只读查询：绝不调 AI、绝不动 ai_daily_count；
+    # 任何一块取数失败都只让对应章节降级成空值，绝不让整页红屏。
+    st.markdown("### 📥 完整财务体检报告")
+    st.caption("3 页 PDF：核心概览 / 消费透视 / AI 深度诊断 · 同一天同一份数据只生成一次")
+
+    # 模块可用性：report_pdf 缺失、或没有可调用的 build_financial_report，都只给一行提示。
+    _pdf_build_fn = (
+        getattr(report_pdf, "build_financial_report", None)
+        if report_pdf is not None
+        else None
+    )
+    # 页数由报告模块声明；缺失 / 脏值回退到契约默认的 3 页，别把异常值拼进文案。
+    try:
+        _pdf_page_count = int(getattr(report_pdf, "PAGE_COUNT", 3) or 3)
+    except (TypeError, ValueError):
+        _pdf_page_count = 3
+
+    if not callable(_pdf_build_fn):
+        st.caption("报告生成模块暂不可用")
+    elif st.button(
+        "📥 生成完整财务体检 PDF 报告",
+        key="pdf_report_btn",
+        type="primary",
+    ):
+        with st.spinner("正在排版 3 页报告，请稍候…"):
+            # ---------- ① user：昵称 / 中文月份 / 生成时间 ----------
+            _pdf_user = {
+                "nickname": "同学",
+                "month_label": current_month_str,
+                "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            }
+            # 昵称读库失败（get_username 缺失 / 用户不存在 / 连接异常）只降级成「同学」
+            try:
+                _pdf_nickname = (
+                    get_username(st.session_state.user_id) or ""
+                ).strip()
+                if _pdf_nickname:
+                    _pdf_user["nickname"] = _pdf_nickname
+            except Exception as _pdf_nick_exc:
+                print(
+                    f"[report] 读取昵称失败："
+                    f"{type(_pdf_nick_exc).__name__}: {_pdf_nick_exc}"
+                )
+            # "2026-10" → "2026年10月"；转换失败保留原串，报告不至于缺月份
+            try:
+                _pdf_year_text, _pdf_month_text = current_month_str.split("-")[:2]
+                _pdf_user["month_label"] = (
+                    f"{int(_pdf_year_text)}年{int(_pdf_month_text)}月"
+                )
+            except Exception as _pdf_label_exc:
+                print(
+                    f"[report] 月份标签转换失败："
+                    f"{type(_pdf_label_exc).__name__}: {_pdf_label_exc}"
+                )
+
+            # ---------- ② health：优先复用 Tab1 已算好的结果，拿不到就同口径现算 ----------
+            try:
+                _pdf_health_raw = health
+            except NameError:
+                _pdf_health_raw = None
+            if not (isinstance(_pdf_health_raw, dict) and "score" in _pdf_health_raw):
+                try:
+                    if compute_health_score is None:
+                        raise RuntimeError("health_score 模块未就绪")
+                    # 心愿进度：没有目标 / 011 未执行 / 读库异常 → None（健康分照常算）
+                    try:
+                        _pdf_goal_progress = (
+                            get_goal(st.session_state.user_id) or {}
+                        ).get("progress")
+                        if _pdf_goal_progress is not None:
+                            _pdf_goal_progress = float(_pdf_goal_progress)
+                    except Exception as _pdf_goal_exc:
+                        print(
+                            f"[report] 读取心愿进度失败："
+                            f"{type(_pdf_goal_exc).__name__}: {_pdf_goal_exc}"
+                        )
+                        _pdf_goal_progress = None
+                    # 分类汇总：迁移 012 未执行（无 category 列）时传空 dict
+                    _pdf_category_totals = {}
+                    try:
+                        if "category" in df_current_month.columns:
+                            _pdf_cat_exp_df = df_current_month[
+                                df_current_month["type"] == "支出"
+                            ]
+                            _pdf_cat_series = (
+                                _pdf_cat_exp_df["category"]
+                                .fillna("其他")
+                                .astype(str)
+                                .str.strip()
+                            )
+                            _pdf_cat_exp_df = _pdf_cat_exp_df.assign(
+                                _category=_pdf_cat_series.where(
+                                    _pdf_cat_series != "", "其他"
+                                )
+                            )
+                            _pdf_category_totals = {
+                                str(_cat): float(_amt)
+                                for _cat, _amt in _pdf_cat_exp_df.groupby(
+                                    "_category"
+                                )["amount"]
+                                .sum()
+                                .items()
+                            }
+                    except Exception as _pdf_cat_exc:
+                        print(
+                            f"[report] 分类汇总失败："
+                            f"{type(_pdf_cat_exc).__name__}: {_pdf_cat_exc}"
+                        )
+                        _pdf_category_totals = {}
+                    _pdf_health_raw = compute_health_score(
+                        month_expense=float(month_expense),
+                        budget=float(budget),
+                        month_balance=float(month_balance),
+                        save_target=float(st.session_state.save_target),
+                        goal_progress=_pdf_goal_progress,
+                        category_totals=_pdf_category_totals,
+                    )
+                except Exception as _pdf_health_exc:
+                    print(
+                        f"[report] 健康分现算失败："
+                        f"{type(_pdf_health_exc).__name__}: {_pdf_health_exc}"
+                    )
+                    _pdf_health_raw = {}
+            if not isinstance(_pdf_health_raw, dict):
+                _pdf_health_raw = {}
+            # 只挑报告要的四个字段，并统一类型：脏值（None / 非数字 / 非列表）就地兜底
+            _pdf_health = {}
+            try:
+                _pdf_health = {
+                    "score": int(_pdf_health_raw.get("score") or 0),
+                    "grade": str(_pdf_health_raw.get("grade") or "-"),
+                    "title": str(_pdf_health_raw.get("title") or ""),
+                    "deductions": [
+                        str(_item)
+                        for _item in (_pdf_health_raw.get("deductions") or [])
+                    ][:6],
+                }
+            except Exception as _pdf_health_norm_exc:
+                print(
+                    f"[report] 健康分字段归一失败："
+                    f"{type(_pdf_health_norm_exc).__name__}: {_pdf_health_norm_exc}"
+                )
+                _pdf_health = {}
+
+            # ---------- ③ balance：全量收支 + 预算 + 本月已过 / 总天数 ----------
+            _pdf_balance = {
+                "income": 0.0,
+                "expense": 0.0,
+                "net": 0.0,
+                "budget": 0.0,
+                "days_elapsed": 1,
+                "days_total": 1,
+            }
+            try:
+                _pdf_today = date.today()
+                _pdf_balance = {
+                    "income": float(total_income),
+                    "expense": float(total_expense),
+                    "net": float(balance),
+                    "budget": float(budget or 0.0),
+                    "days_elapsed": int(_pdf_today.day),
+                    "days_total": int(
+                        calendar.monthrange(_pdf_today.year, _pdf_today.month)[1]
+                    ),
+                }
+            except Exception as _pdf_balance_exc:
+                print(
+                    f"[report] 收支数据组装失败："
+                    f"{type(_pdf_balance_exc).__name__}: {_pdf_balance_exc}"
+                )
+
+            # ---------- ④ metrics：雷达图原始指标（纯函数，不读库不改 df）----------
+            _pdf_metrics = {}
+            try:
+                _pdf_radar_fn = getattr(db, "compute_radar_metrics", None)
+                if not callable(_pdf_radar_fn):
+                    raise RuntimeError("db.compute_radar_metrics 尚未提供")
+                _pdf_radar = _pdf_radar_fn(df, current_month_str)
+                if not isinstance(_pdf_radar, dict):
+                    raise ValueError("compute_radar_metrics 返回结构不合规")
+                _pdf_metrics = {
+                    "fun_share": float(_pdf_radar.get("fun_share") or 0.0),
+                    "milk_tea_share": float(
+                        _pdf_radar.get("milk_tea_share") or 0.0
+                    ),
+                    "food_share": float(_pdf_radar.get("food_share") or 0.0),
+                    "saving_rate": float(_pdf_radar.get("saving_rate") or 0.0),
+                    "record_ratio": float(_pdf_radar.get("record_ratio") or 0.0),
+                    "bill_count": int(_pdf_radar.get("bill_count") or 0),
+                }
+            except Exception as _pdf_metrics_exc:
+                print(
+                    f"[report] 雷达指标组装失败："
+                    f"{type(_pdf_metrics_exc).__name__}: {_pdf_metrics_exc}"
+                )
+                _pdf_metrics = {}
+
+            # ---------- ⑤ categories / ⑥ merchants：本月支出 Top 8 分类 / Top 5 商户 ----------
+            # 先切出「本月支出」子表：失败就给空表，后面两个统计都按空处理（不抛 NameError）
+            _pdf_month_expense_df = df_current_month.iloc[0:0]
+            try:
+                _pdf_month_expense_df = df_current_month[
+                    df_current_month["type"] == "支出"
+                ]
+            except Exception as _pdf_exp_df_exc:
+                print(
+                    f"[report] 本月支出筛选失败："
+                    f"{type(_pdf_exp_df_exc).__name__}: {_pdf_exp_df_exc}"
+                )
+                _pdf_month_expense_df = df_current_month.iloc[0:0]
+
+            _pdf_categories = []
+            try:
+                if not _pdf_month_expense_df.empty:
+                    # 迁移 012 后才有 category 列；没有就退回 merchant，口径同海报的 Top1
+                    _pdf_cat_col = (
+                        "category"
+                        if "category" in _pdf_month_expense_df.columns
+                        else "merchant"
+                    )
+                    _pdf_cat_groups = (
+                        _pdf_month_expense_df.groupby(_pdf_cat_col)["amount"]
+                        .sum()
+                        .sort_values(ascending=False)
+                    )
+                    _pdf_categories = [
+                        {"name": str(_name).strip() or "其他", "amount": float(_amt)}
+                        for _name, _amt in _pdf_cat_groups.head(8).items()
+                    ]
+            except Exception as _pdf_categories_exc:
+                print(
+                    f"[report] 分类 Top8 统计失败："
+                    f"{type(_pdf_categories_exc).__name__}: {_pdf_categories_exc}"
+                )
+                _pdf_categories = []
+
+            _pdf_merchants = []
+            try:
+                if (
+                    not _pdf_month_expense_df.empty
+                    and "merchant" in _pdf_month_expense_df.columns
+                ):
+                    _pdf_merchant_groups = (
+                        _pdf_month_expense_df.groupby("merchant")["amount"]
+                        .sum()
+                        .sort_values(ascending=False)
+                    )
+                    _pdf_merchants = [
+                        {
+                            "name": str(_name).strip() or "未知商户",
+                            "amount": float(_amt),
+                        }
+                        for _name, _amt in _pdf_merchant_groups.head(5).items()
+                    ]
+            except Exception as _pdf_merchants_exc:
+                print(
+                    f"[report] 商户 Top5 统计失败："
+                    f"{type(_pdf_merchants_exc).__name__}: {_pdf_merchants_exc}"
+                )
+                _pdf_merchants = []
+
+            # ---------- ⑦ calendar：本月按天汇总的支出（报告里的日历热力图）----------
+            # 年月优先从 current_month_str 解析；解析失败退回今天所在月，报告仍可用
+            try:
+                _pdf_cal_year = int(current_month_str.split("-")[0])
+                _pdf_cal_month = int(current_month_str.split("-")[1])
+            except Exception:
+                _pdf_cal_year = date.today().year
+                _pdf_cal_month = date.today().month
+            _pdf_calendar = {
+                "year": _pdf_cal_year,
+                "month": _pdf_cal_month,
+                "days": {},
+                "max_amount": 0.0,
+            }
+            try:
+                _pdf_day_totals = {}
+                if (
+                    not _pdf_month_expense_df.empty
+                    and "date_parsed" in _pdf_month_expense_df.columns
+                ):
+                    _pdf_by_day = (
+                        _pdf_month_expense_df.groupby(
+                            _pdf_month_expense_df["date_parsed"].dt.day
+                        )["amount"].sum()
+                    )
+                    _pdf_day_totals = {
+                        str(int(_day)): float(_amt)
+                        for _day, _amt in _pdf_by_day.items()
+                        if not pd.isna(_day)
+                    }
+                _pdf_calendar = {
+                    "year": int(_pdf_cal_year),
+                    "month": int(_pdf_cal_month),
+                    "days": _pdf_day_totals,
+                    "max_amount": (
+                        max(_pdf_day_totals.values()) if _pdf_day_totals else 0.0
+                    ),
+                }
+            except Exception as _pdf_calendar_exc:
+                print(
+                    f"[report] 日历数据组装失败："
+                    f"{type(_pdf_calendar_exc).__name__}: {_pdf_calendar_exc}"
+                )
+                _pdf_calendar = {
+                    "year": _pdf_cal_year,
+                    "month": _pdf_cal_month,
+                    "days": {},
+                    "max_amount": 0.0,
+                }
+
+            # ---------- ⑧ latte：拿铁因子（近 3 个月日均非必要消费，只读库 + 纯计算）----------
+            # 键名以 db 实际返回为准：get_latte_factor → daily_avg / breakdown[].category；
+            # project_latte_compound → years / future_value。任何一步失败就整块传 {}。
+            _pdf_latte = {}
+            try:
+                _pdf_latte_fn = getattr(db, "get_latte_factor", None)
+                if not callable(_pdf_latte_fn):
+                    raise RuntimeError("db.get_latte_factor 尚未提供")
+                _pdf_latte_stats = _pdf_latte_fn(st.session_state.user_id)
+                if not isinstance(_pdf_latte_stats, dict):
+                    raise ValueError("get_latte_factor 返回结构不合规")
+                _pdf_daily = float(_pdf_latte_stats.get("daily_avg") or 0.0)
+                _pdf_top_item = ""
+                _pdf_breakdown = _pdf_latte_stats.get("breakdown")
+                if (
+                    isinstance(_pdf_breakdown, list)
+                    and _pdf_breakdown
+                    and isinstance(_pdf_breakdown[0], dict)
+                ):
+                    _pdf_top_item = (
+                        str(_pdf_breakdown[0].get("category") or "").strip()
+                    )
+                _pdf_project_fn = getattr(db, "project_latte_compound", None)
+                if not callable(_pdf_project_fn):
+                    raise RuntimeError("db.project_latte_compound 尚未提供")
+                _pdf_ten_year = 0.0
+                for _pdf_row in _pdf_project_fn(_pdf_daily) or []:
+                    if not isinstance(_pdf_row, dict):
+                        continue
+                    try:
+                        _pdf_row_years = int(_pdf_row.get("years") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if _pdf_row_years == 10:
+                        _pdf_ten_year = float(_pdf_row.get("future_value") or 0.0)
+                        break
+                _pdf_latte = {
+                    "daily": round(_pdf_daily, 2),
+                    "monthly": round(_pdf_daily * 30.0, 2),
+                    "yearly": round(_pdf_daily * 365.0, 2),
+                    "ten_year": round(_pdf_ten_year, 2),
+                    "top_item": _pdf_top_item,
+                }
+            except Exception as _pdf_latte_exc:
+                print(
+                    f"[report] 拿铁因子组装失败："
+                    f"{type(_pdf_latte_exc).__name__}: {_pdf_latte_exc}"
+                )
+                _pdf_latte = {}
+
+            # ---------- ⑨ sandbox：三档消费习惯下未来 6 个月的余额 ----------
+            # 键名以 db 实际返回为准：months → ["YYYY-MM"]；scenarios[].key 为
+            # conservative / current / aggressive；余额在 scenarios[].months[].balance。
+            _pdf_sandbox = {}
+            try:
+                _pdf_sandbox_fn = getattr(db, "simulate_sandbox_scenarios", None)
+                if not callable(_pdf_sandbox_fn):
+                    raise RuntimeError("db.simulate_sandbox_scenarios 尚未提供")
+                _pdf_sandbox_today = date.today()
+                # 基线月支出：优先预算；没设预算就用本月日均 × 30（与沙盘面板同口径）
+                _pdf_month_daily_avg = float(month_expense) / max(
+                    int(_pdf_sandbox_today.day or 1), 1
+                )
+                _pdf_monthly_base = float(budget or 0.0) or (
+                    _pdf_month_daily_avg * 30.0
+                )
+                _pdf_scenarios = _pdf_sandbox_fn(
+                    initial_balance=float(balance),
+                    monthly_base_expense=float(_pdf_monthly_base),
+                    months=6,
+                )
+                if not isinstance(_pdf_scenarios, dict):
+                    raise ValueError("simulate_sandbox_scenarios 返回结构不合规")
+                _pdf_labels = []
+                for _pdf_month_key in _pdf_scenarios.get("months") or []:
+                    try:
+                        _pdf_labels.append(
+                            f"{int(str(_pdf_month_key).split('-')[-1])}月"
+                        )
+                    except (TypeError, ValueError):
+                        _pdf_labels.append(str(_pdf_month_key))
+                _pdf_series = {}
+                for _pdf_scenario in _pdf_scenarios.get("scenarios") or []:
+                    if not isinstance(_pdf_scenario, dict):
+                        continue
+                    _pdf_rows = _pdf_scenario.get("months")
+                    if not isinstance(_pdf_rows, list):
+                        continue
+                    _pdf_series[str(_pdf_scenario.get("key"))] = [
+                        float(_row.get("balance") or 0.0)
+                        for _row in _pdf_rows
+                        if isinstance(_row, dict)
+                    ]
+                if not (
+                    _pdf_labels
+                    and all(
+                        _key in _pdf_series
+                        for _key in ("conservative", "current", "aggressive")
+                    )
+                ):
+                    raise ValueError("simulate_sandbox_scenarios 缺少情景曲线")
+                _pdf_sandbox = {
+                    "labels": _pdf_labels,
+                    "current": _pdf_series["current"],
+                    "cut": _pdf_series["conservative"],
+                    "extra": _pdf_series["aggressive"],
+                }
+            except Exception as _pdf_sandbox_exc:
+                print(
+                    f"[report] 沙盘推演组装失败："
+                    f"{type(_pdf_sandbox_exc).__name__}: {_pdf_sandbox_exc}"
+                )
+                _pdf_sandbox = {}
+
+            # ---------- ⑩ ai：只读本页已有成品，绝不为了报告再调 AI / 扣额度 ----------
+            _pdf_ai = {"soul": "", "diagnosis": "", "actions": []}
+            try:
+                # 现有实现里「AI 灵魂拷问」的成品放在 _latte_roast_store 进程缓存
+                # （没有 session_state 键）；这里只读会话内可能存在的文本，
+                # 取不到就留空，交给报告模块用本地规则生成。
+                _pdf_soul = st.session_state.get("latte_soul")
+                if isinstance(_pdf_soul, dict):
+                    _pdf_soul = _pdf_soul.get("text")
+                if isinstance(_pdf_soul, str):
+                    _pdf_ai["soul"] = _pdf_soul.strip()
+            except Exception as _pdf_soul_exc:
+                print(
+                    f"[report] 读取灵魂拷问失败："
+                    f"{type(_pdf_soul_exc).__name__}: {_pdf_soul_exc}"
+                )
+                _pdf_ai["soul"] = ""
+            try:
+                # AI 锐评的真实结构是 {"key": "YYYY-MM:分数", "text": "..."}
+                _pdf_comment = st.session_state.get("health_comment")
+                if isinstance(_pdf_comment, dict):
+                    _pdf_ai["diagnosis"] = str(
+                        _pdf_comment.get("text") or ""
+                    ).strip()
+                elif isinstance(_pdf_comment, str):
+                    _pdf_ai["diagnosis"] = _pdf_comment.strip()
+            except Exception as _pdf_comment_exc:
+                print(
+                    f"[report] 读取 AI 锐评失败："
+                    f"{type(_pdf_comment_exc).__name__}: {_pdf_comment_exc}"
+                )
+                _pdf_ai["diagnosis"] = ""
+            # actions 交给报告模块用本地规则生成，前端不额外调 AI
+            _pdf_ai["actions"] = []
+
+            _pdf_payload = {
+                "user": _pdf_user,
+                "health": _pdf_health,
+                "balance": _pdf_balance,
+                "metrics": _pdf_metrics,
+                "categories": _pdf_categories,
+                "merchants": _pdf_merchants,
+                "calendar": _pdf_calendar,
+                "latte": _pdf_latte,
+                "sandbox": _pdf_sandbox,
+                "ai": _pdf_ai,
+            }
+
+            # 缓存 key = sha256(归一化 payload + 今天的日期)：
+            # 同一份数据同一天只生成一次；换数据 / 隔天都会得到新 key 重新生成。
+            # 归一化时把 user.generated_at 抹成空串：它只是展示用的时间戳，
+            # 若参与哈希，同一份数据隔一分钟点两次也会被判成「数据变了」而重复排版。
+            try:
+                _pdf_key_payload = json.loads(
+                    json.dumps(_pdf_payload, ensure_ascii=False, default=str)
+                )
+                if isinstance(_pdf_key_payload.get("user"), dict):
+                    _pdf_key_payload["user"]["generated_at"] = ""
+                _pdf_payload_json = json.dumps(
+                    _pdf_key_payload,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    default=str,
+                )
+                _pdf_digest = hashlib.sha256(
+                    (
+                        _pdf_payload_json + date.today().isoformat()
+                    ).encode("utf-8")
+                ).hexdigest()
+            except Exception as _pdf_key_exc:
+                print(
+                    f"[report] 缓存 key 计算失败："
+                    f"{type(_pdf_key_exc).__name__}: {_pdf_key_exc}"
+                )
+                _pdf_digest = ""
+
+            # 命中缓存就不再排版：直接复用上一次的字节流（key 相同 + 真有内容）
+            _pdf_cached = st.session_state.get("pdf_report_cache")
+            _pdf_bytes = None
+            if (
+                _pdf_digest
+                and isinstance(_pdf_cached, dict)
+                and _pdf_cached.get("key") == _pdf_digest
+                and isinstance(_pdf_cached.get("bytes"), (bytes, bytearray))
+                and _pdf_cached.get("bytes")
+            ):
+                _pdf_bytes = bytes(_pdf_cached["bytes"])
+            else:
+                try:
+                    _pdf_bytes = _pdf_build_fn(_pdf_payload)
+                except Exception as _pdf_build_exc:
+                    print(
+                        f"[report] 生成失败："
+                        f"{type(_pdf_build_exc).__name__}: {_pdf_build_exc}"
+                    )
+                    st.error("报告生成失败，请稍后再试")
+                    _pdf_bytes = None
+                else:
+                    if not isinstance(_pdf_bytes, (bytes, bytearray)) or not _pdf_bytes:
+                        # 后端违约返回空内容：同样按失败处理，绝不写缓存骗用户
+                        print("[report] 生成失败：build_financial_report 返回空内容")
+                        st.error("报告生成失败，请稍后再试")
+                        _pdf_bytes = None
+                    else:
+                        _pdf_bytes = bytes(_pdf_bytes)
+                        st.session_state["pdf_report_cache"] = {
+                            "key": _pdf_digest,
+                            "bytes": _pdf_bytes,
+                            "month": current_month_str,
+                        }
+            if _pdf_bytes:
+                st.success("报告已生成，可在下方下载")
+
+    # 下载区独立于按钮：rerun 后只要缓存还在（且仍是本月）就继续展示，不用重新点
+    _pdf_saved = st.session_state.get("pdf_report_cache")
+    if (
+        isinstance(_pdf_saved, dict)
+        and _pdf_saved.get("month") == current_month_str
+        and isinstance(_pdf_saved.get("bytes"), (bytes, bytearray))
+        and _pdf_saved.get("bytes")
+    ):
+        _pdf_saved_bytes = bytes(_pdf_saved["bytes"])
+        st.download_button(
+            "⬇️ 下载财务体检报告（PDF）",
+            data=_pdf_saved_bytes,
+            file_name=f"明白账_财务体检报告_{current_month_str}.pdf",
+            mime="application/pdf",
+            key="pdf_report_download_btn",
+        )
+        st.caption(
+            f"共 {_pdf_page_count} 页 · 约 "
+            f"{len(_pdf_saved_bytes) / 1024 / 1024:.1f} MB"
+            f" · 生成于 {datetime.now():%H:%M}"
+        )
 
     # ---- 📖 本月消费回忆录（AI 灵魂写手：不点按钮绝不调 API）----
     # 放在财务看板最底部（导出之后）：先看数据，再看故事，符合阅读顺序。
