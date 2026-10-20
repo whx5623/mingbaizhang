@@ -5010,3 +5010,229 @@ def import_platform_bill(user_id, file_bytes: bytes, filename: str = "") -> dict
 
     result["imported"] = len(prepared)
     return result
+
+
+# ===========================================================================
+# 负债识别与还款预测（只读；口径是「历史月均外推」的**估算**）
+# ---------------------------------------------------------------------------
+# 输入只有「关键词 + 月份窗口」，输出一份还款压力预测。设计边界：
+#   · **只读**：一条 SELECT，不写库、不建表、不改任何既有函数口径；
+#   · **关键词可配**：LIABILITY_KEYWORDS 是模块级常量，命中 merchant 或
+#     payment_method 任一列即算负债（花呗/白条可能写在商户名，也可能只写在
+#     支付方式里）；关键词只作为**绑定参数**（"%花呗%"）传入，SQL 片段里不含
+#     任何用户可控字符串，注入面为零；
+#   · **估算不是账单**：monthly_avg 是"过去 N 个自然月里，有匹配的月份的
+#     平均还款额"，forecast 按这个均值外推。它不代表真实账单金额 ——
+#     一次性大额、分期手续费、提前还款、这个月还没出账都算不进去，页面必须
+#     标"估算"；
+#   · **无匹配不抛错**：命中 0 行 → 全 0 / 空列表（has_liability=False），
+#     调用方不需要写分支；参数非法才 ValueError（且都在开连接之前）；
+#   · SQLAlchemy text() + 全部参数绑定，单条 SQL 取数，分组交给 Python（避免
+#     N+1，也避免把"自然月"口径绑死到某个数据库方言的 date_trunc 上）。
+# ===========================================================================
+
+LIABILITY_KEYWORDS = ("花呗", "白条", "信用卡", "分期", "借呗", "月付")
+
+LIABILITY_MONTHS_MIN = 1
+LIABILITY_MONTHS_MAX = 12
+LIABILITY_MATCHED_MERCHANTS_MAX = 10
+LIABILITY_UNKNOWN_MERCHANT = "未知商户"
+
+
+def _normalize_liability_months(value, label: str) -> int:
+    """months_ahead / lookback_months：必须是 1~12 的 int。
+
+    bool 是 int 子类（True 会被当成 1、False 当成 0）；float / 字符串一律拒绝，
+    不做 `int(2.9)` 这种静默截断 —— 把"写错窗口"伪装成"写对窗口"比直接报错更危险。
+    """
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not LIABILITY_MONTHS_MIN <= value <= LIABILITY_MONTHS_MAX
+    ):
+        raise ValueError(f"{label}必须是 1~{LIABILITY_MONTHS_MAX} 的整数：{value!r}")
+    return value
+
+
+def _liability_match_clause() -> str:
+    """生成「商户或支付方式命中任一关键词」的 SQL 片段。
+
+    列名（merchant / payment_method）与占位符名（:liability_kw_0 …）都是本函数的
+    常量，关键词只以绑定参数（"%花呗%"）下传，不存在 f-string 注入面；同一关键词
+    在 merchant / payment_method 两处**复用同一个占位符**，参数个数恒为
+    len(LIABILITY_KEYWORDS)，不随用户数据变化。COALESCE 把 NULL 归一成空串，
+    让 NULL 列参与 ILIKE 时得到确定的 False 而不是 SQL 三值逻辑的 NULL。
+    """
+    patterns = [
+        f"(COALESCE(b.merchant, '') ILIKE :liability_kw_{i}"
+        f" OR COALESCE(b.payment_method, '') ILIKE :liability_kw_{i})"
+        for i in range(len(LIABILITY_KEYWORDS))
+    ]
+    return "(" + " OR ".join(patterns) + ")"
+
+
+def _liability_month_key(day: date) -> str:
+    """自然月键 "YYYY-MM"（零填充 → 字典序 == 时间序）。"""
+    return f"{day.year:04d}-{day.month:02d}"
+
+
+def _liability_month_shift(day: date, months: int) -> date:
+    """把 day 所在月平移 months 个月，返回那一个月 1 号。
+
+    与 get_daily_expense_totals / detect_subscriptions 同一套「月份序号」算法：
+    序号 = year * 12 + month - 1，负数由 Python 的 floor 除 / 模自然处理，跨年
+    （2026-01 往后 1 个月 → 2026-02，往前 1 个月 → 2025-12）不必写分支。
+    """
+    index = day.year * 12 + day.month - 1 + months
+    return date(index // 12, index % 12 + 1, 1)
+
+
+def forecast_repayments(user_id, months_ahead: int = 3, lookback_months: int = 6,
+                        today=None) -> dict:
+    """按历史还款记录估算未来 N 个月的还款额（**估算**，不是真实账单金额）。
+
+    口径（与产品确认过的「还款压力预警」一致）
+    ----------------------------------------
+    1. 窗口 = 今天所在月往前推 lookback_months-1 个月的 1 号 ~ 今天（闭区间）。
+       例：today=2026-10-20、lookback_months=6 → 2026-05-01 ~ 2026-10-20；
+    2. 只统计 ``type = '支出'``，且 ``merchant`` 或 ``payment_method`` 命中
+       LIABILITY_KEYWORDS 任一关键词（ILIKE，大小写不敏感；全角/半角不做归一，
+       关键词按业务约定就是中文全角，见常量定义）；
+    3. monthly_avg = 有匹配的**月份**的平均值：分母是"出现过匹配行的自然月数"，
+       **不是** lookback_months —— 没还款的月份不摊薄均值（否则一个只还过两次款的
+       用户会被算成一半金额）。月份是否计入只看有没有匹配行，不看该月金额是否为 0；
+    4. forecast[k] = 今天所在月往后第 k+1 个月的还款额 = monthly_avg（两位小数），
+       month 是 "YYYY-MM"；**不预测本月剩余天数**（本月还没出账，强行拆日会误导）；
+    5. next_month_amount = forecast[0]；total_forecast = 各月金额之和（再定量两位）；
+    6. matched_merchants 按商户（strip 后，空→"未知商户"）汇总 count / total，
+       按 total 降序、同额按商户名升序（保证结果可复现），最多 10 条；
+    7. has_liability = matched_count > 0。无匹配 → 其余字段全 0 / 空列表，**不抛异常**。
+
+    参数校验（全部在**开连接之前**完成；非法入参不浪费一次数据库连接）
+    ------------------------------------------------------------
+    · user_id 复用 _normalize_bill_query_user_id（正整数，拒绝 bool / float）；
+    · months_ahead / lookback_months 必须是 1~12 的 int（bool / float / 字符串拒绝）；
+    · today 复用 _normalize_forecast_today（date / datetime / "YYYY-MM-DD"）。
+
+    返回字段（逐字固定，前端按 key 取，顺序无关）
+    ------------------------------------------
+        has_liability / matched_count / lookback_total / monthly_avg / forecast /
+        next_month_amount / total_forecast / matched_merchants
+
+    实现口径
+    --------
+    · **单条 SQL**：WHERE 里 user_id 是首项，关键词全参数绑定；不在 SQL 里分组，
+      月度桶在 Python 侧用 Decimal 累加（避免 float 累加误差），最后由
+      _money_to_float 统一定量两位小数（ROUND_HALF_UP，与页面口径一致）；
+    · amount 为 NULL 的脏行按 0 计，不影响 matched_count（SQL 确实命中了这一行）；
+    · date 列是 TEXT，按 ``b.date::date`` 比较；cast 失败的脏数据让异常原样上抛，
+      **不静默漏算**（少算会让预警金额偏低，比报错更危险）；
+    · 日志只记 user_id / 窗口 / months_ahead / matched_count，**绝不**记商户名
+      或金额明细（商户名可能带个人消费信息）。
+    """
+    uid = _normalize_bill_query_user_id(user_id)
+    ahead = _normalize_liability_months(months_ahead, "months_ahead")
+    lookback = _normalize_liability_months(lookback_months, "lookback_months")
+    end = _normalize_forecast_today(today)
+
+    # 窗口起点：往前推 lookback-1 个月的 1 号（含今天所在月，共 lookback 个自然月）。
+    month_index = (end.year * 12 + end.month - 1) - (lookback - 1)
+    start = date(month_index // 12, month_index % 12 + 1, 1)
+
+    if engine is None:
+        init_db()
+
+    # 关键词全部走绑定参数；参数名是固定常量，SQL 片段里没有任何用户输入。
+    params = {
+        "uid": uid,
+        "expense": EXPENSE_TYPE,
+        "start": start,
+        "end": end,
+    }
+    for index, keyword in enumerate(LIABILITY_KEYWORDS):
+        params[f"liability_kw_{index}"] = f"%{keyword}%"
+
+    stmt = text("\n".join([
+        "SELECT b.date::date AS day,",
+        "       COALESCE(b.merchant, '') AS merchant,",
+        "       COALESCE(b.payment_method, '') AS payment_method,",
+        "       b.amount AS amount",
+        "FROM public.bills AS b",
+        "WHERE b.user_id = :uid",
+        "  AND b.type = :expense",
+        "  AND b.date::date >= :start",
+        "  AND b.date::date <= :end",
+        f"  AND {_liability_match_clause()}",
+        "ORDER BY b.date::date ASC, b.id ASC",
+    ]))
+    with engine.connect() as conn:
+        rows = conn.execute(stmt, params).fetchall()
+
+    matched_count = 0
+    lookback_total = Decimal("0")
+    monthly_totals: dict[str, Decimal] = {}
+    merchant_totals: dict[str, dict] = {}
+
+    for row in rows:
+        # date::date 已由库完成 cast；这里只做类型防御（datetime 是 date 子类）。
+        day = row.day.date() if isinstance(row.day, datetime) else row.day
+        if not isinstance(day, date):
+            continue
+        matched_count += 1
+
+        amount = _as_decimal(row.amount)  # NULL 按 0 计（_as_decimal 已处理 None）
+        lookback_total += amount
+
+        month_key = _liability_month_key(day)
+        monthly_totals[month_key] = monthly_totals.get(month_key, Decimal("0")) + amount
+
+        merchant = str(row.merchant or "").strip() or LIABILITY_UNKNOWN_MERCHANT
+        bucket = merchant_totals.setdefault(merchant, {"count": 0, "total": Decimal("0")})
+        bucket["count"] += 1
+        bucket["total"] += amount
+
+    # 月均分母 = 有匹配的月份数（不摊薄没还款的月份）；没有任何匹配 → 0。
+    if monthly_totals:
+        monthly_avg = _money_to_float(lookback_total / len(monthly_totals))
+    else:
+        monthly_avg = 0.0
+
+    # 未来 months_ahead 个自然月（从今天所在月的下一个月开始数），每月金额同均值。
+    forecast = []
+    for offset in range(1, ahead + 1):
+        month_start = _liability_month_shift(end, offset)
+        forecast.append({
+            "month": _liability_month_key(month_start),
+            "amount": monthly_avg,
+        })
+
+    next_month_amount = forecast[0]["amount"]
+    total_forecast = _money_to_float(sum(item["amount"] for item in forecast))
+
+    matched_merchants = [
+        {
+            "merchant": merchant,
+            "count": bucket["count"],
+            "total": _money_to_float(bucket["total"]),
+        }
+        for merchant, bucket in merchant_totals.items()
+    ]
+    # 主键 total 降序；同额再按商户名升序，保证同一份数据每次输出完全一致。
+    matched_merchants.sort(key=lambda item: (-item["total"], item["merchant"]))
+    matched_merchants = matched_merchants[:LIABILITY_MATCHED_MERCHANTS_MAX]
+
+    logging.getLogger(__name__).info(
+        "[db] forecast_repayments user_id=%s range=%s..%s months_ahead=%s matched=%s",
+        uid, start, end, ahead, matched_count,
+    )
+
+    return {
+        "has_liability": matched_count > 0,
+        "matched_count": matched_count,
+        "lookback_total": _money_to_float(lookback_total),
+        "monthly_avg": monthly_avg,
+        "forecast": forecast,
+        "next_month_amount": next_month_amount,
+        "total_forecast": total_forecast,
+        "matched_merchants": matched_merchants,
+    }

@@ -625,6 +625,52 @@ def _get_subscription_advice_fn():
     return advice_fn if callable(advice_fn) else None
 
 
+# ===== 未来 3 个月还款预测：AI 压力预警的进程级缓存 =====
+# 与订阅建议同理：命中缓存直接复用、不调 API、不扣额度；未命中才调一次。
+# key = sha256(forecast + next_month_amount + balance + month)，任一变化都是新预警；
+# DebtWarningError 的本地兜底结果也写缓存（fallback=True），避免反复打不可用的 API。
+@st.cache_resource(show_spinner=False)
+def _debt_warning_store() -> dict:
+    """返回进程级缓存：{sha256 key: {"text": str, "fallback": bool}}。"""
+    return {}
+
+
+def _debt_amount(value) -> float:
+    """把后端返回值归一成有限的 float：非法 / NaN / inf 一律按 0.0 处理。"""
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return amount if math.isfinite(amount) else 0.0
+
+
+def _debt_warning_key(forecast, next_month_amount, balance, month) -> str:
+    """把还款预测关键信息归一化成稳定 key（字段顺序 / 中文都不影响哈希）。"""
+    payload = {
+        "forecast": forecast,
+        "next_month_amount": round(float(next_month_amount), 2),
+        "balance": round(float(balance), 2),
+        "month": str(month),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _get_debt_warning_fn():
+    """按模块属性取 ai_agent.generate_debt_warning：并行开发期缺失 / 打桩都能感知。"""
+    try:
+        import ai_agent as _ai_agent_mod
+    except Exception as _ai_import_exc:  # pragma: no cover - 依赖缺失时只降级
+        print(
+            f"[debt] ai_agent 不可用："
+            f"{type(_ai_import_exc).__name__}: {_ai_import_exc}"
+        )
+        return None
+    warning_fn = getattr(_ai_agent_mod, "generate_debt_warning", None)
+    return warning_fn if callable(warning_fn) else None
+
+
 # Sidebar
 with st.sidebar:
     # ---- 积分头衔荣誉卡片（纯本地计算；017 未执行 / 读库失败只隐藏卡片）----
@@ -1302,6 +1348,232 @@ with tab_dash:
                     )
                 if _advice_is_fallback:
                     st.caption("以上为本地建议（AI 暂不可用）")
+
+    # ===== 未来 3 个月还款预测：花呗/白条/信用卡/分期 → 柱状图 + AI 压力预警 =====
+    # 后端由并行方提供（db.forecast_repayments / ai_agent.generate_debt_warning）：
+    # 取数 / 画图 / AI 任何一步失败都只降级成一行 caption，绝不红屏、不影响下方账单明细。
+    try:
+        _debt_today_fn = getattr(db, "_report_today", None)
+        _debt_today = _debt_today_fn() if callable(_debt_today_fn) else None
+        # 走模块属性取函数：并行开发期缺失 / AppTest 打桩都能感知
+        _debt_forecast_fn = getattr(db, "forecast_repayments", None)
+        if not callable(_debt_forecast_fn):
+            _debt_forecast_fn = globals().get("forecast_repayments")
+        if not callable(_debt_forecast_fn):
+            raise RuntimeError("db.forecast_repayments 不可用")
+        _debt_fc = _debt_forecast_fn(
+            st.session_state.user_id,
+            months_ahead=3,
+            lookback_months=6,
+            today=_debt_today,
+        )
+        if not isinstance(_debt_fc, dict):
+            raise ValueError("forecast_repayments 返回值不是 dict")
+
+        if not _debt_fc.get("has_liability"):
+            st.success("🎉 未检测到花呗/白条/信用卡/分期记录，暂无未来还款压力")
+        else:
+            _debt_forecast_rows = []
+            for _debt_item in _debt_fc.get("forecast") or []:
+                if not isinstance(_debt_item, dict):
+                    continue
+                _debt_month = str(_debt_item.get("month") or "").strip()
+                if not _debt_month:
+                    continue
+                _debt_forecast_rows.append(
+                    {
+                        "month": _debt_month,
+                        "amount": _debt_amount(_debt_item.get("amount")),
+                    }
+                )
+            if not _debt_forecast_rows:
+                raise ValueError("forecast 为空或格式非法")
+
+            _debt_lookback_total = _debt_amount(_debt_fc.get("lookback_total"))
+            _debt_next = _debt_amount(_debt_fc.get("next_month_amount"))
+            _debt_total_forecast = _debt_amount(_debt_fc.get("total_forecast"))
+            _debt_monthly_avg = _debt_amount(_debt_fc.get("monthly_avg"))
+
+            st.subheader("🔮 未来 3 个月还款预测")
+            st.caption("按近 6 个月花呗/白条/信用卡/分期记录外推，仅供资金安排参考")
+
+            # streamlit-echarts 的 height 必须是字符串（如 "280px"）：传整数时前端
+            # 会拼成无单位的 style.height → canvas 高度为 0，图表整块空白。
+            _bar_option = {
+                "tooltip": {"trigger": "axis"},
+                "grid": {
+                    "left": "3%",
+                    "right": "4%",
+                    "bottom": "3%",
+                    "top": "12%",
+                    "containLabel": True,
+                },
+                "xAxis": {
+                    "type": "category",
+                    "data": [f["month"] for f in _debt_forecast_rows],
+                    "axisLine": {"lineStyle": {"color": "#E5E7EB"}},
+                    "axisLabel": {"color": "#6B7280"},
+                },
+                "yAxis": {
+                    "type": "value",
+                    "name": "元",
+                    "splitLine": {"lineStyle": {"color": "#F1F5F9"}},
+                },
+                "series": [
+                    {
+                        "type": "bar",
+                        "barWidth": "46%",
+                        "itemStyle": {
+                            "borderRadius": [8, 8, 0, 0],
+                            "color": {
+                                "type": "linear",
+                                "x": 0,
+                                "y": 0,
+                                "x2": 0,
+                                "y2": 1,
+                                "colorStops": [
+                                    {"offset": 0, "color": "#EF4444"},
+                                    {"offset": 1, "color": "#FCA5A5"},
+                                ],
+                            },
+                        },
+                        "data": [round(f["amount"], 2) for f in _debt_forecast_rows],
+                    }
+                ],
+            }
+            with st.container():
+                st_echarts(_bar_option, height="280px")
+
+            _debt_col1, _debt_col2, _debt_col3 = st.columns(3)
+            with _debt_col1:
+                st.metric("本月待还估算", f"¥{_debt_lookback_total:,.2f}")
+            with _debt_col2:
+                st.metric("下月预估", f"¥{_debt_next:,.2f}")
+            with _debt_col3:
+                st.metric("未来 3 个月合计", f"¥{_debt_total_forecast:,.2f}")
+
+            # 主要负债来源：最多展示前 3 个；脏数据（非 dict / 空商户名）直接跳过
+            _debt_merchants = []
+            for _debt_merchant in _debt_fc.get("matched_merchants") or []:
+                if not isinstance(_debt_merchant, dict):
+                    continue
+                _debt_merchant_name = str(_debt_merchant.get("merchant") or "").strip()
+                if not _debt_merchant_name:
+                    continue
+                _debt_merchants.append(
+                    {
+                        "merchant": _debt_merchant_name,
+                        "total": _debt_amount(_debt_merchant.get("total")),
+                    }
+                )
+            if _debt_merchants:
+                st.caption(
+                    "主要负债来源："
+                    + "、".join(
+                        f"{m['merchant']} ¥{m['total']:.0f}"
+                        for m in _debt_merchants[:3]
+                    )
+                )
+
+            # ---- AI 压力预警：仅当下月还款超过结余一半时才评估 ----
+            balance = float(balance)
+            _debt_ratio = (
+                _debt_next / balance
+                if math.isfinite(balance) and balance > 0
+                else None
+            )
+            if _debt_ratio is None:
+                st.caption("当前结余为 0 或负数，无法计算还款占比")
+            elif _debt_ratio <= 0.5:
+                # 压力可控：不调 AI、不扣额度
+                st.success(
+                    f"下月预计还款 ¥{_debt_next:.2f}，"
+                    f"占结余 {_debt_ratio * 100:.0f}%，压力可控"
+                )
+            else:
+                _debt_store = _debt_warning_store()
+                _debt_cache_key = _debt_warning_key(
+                    _debt_forecast_rows, _debt_next, balance, current_month_str
+                )
+                _debt_entry = _debt_store.get(_debt_cache_key)
+                _debt_warning_text = None
+                _debt_warning_fallback = False
+                if isinstance(_debt_entry, dict) and _debt_entry.get("text"):
+                    # 缓存命中：不调 API、不扣额度（跨 rerun / 跨会话都复用）
+                    _debt_warning_text = str(_debt_entry["text"])
+                    _debt_warning_fallback = bool(_debt_entry.get("fallback"))
+                elif st.session_state.get("ai_daily_count", 0) >= 20:
+                    # 额度用完：不调用、不写缓存（额度恢复后同一组数据仍可生成）
+                    st.caption("今日 AI 额度已用完，暂不生成预警")
+                else:
+                    # stats 只传影响预警文案的字段；数值已归一成有限 float
+                    _debt_stats = {
+                        "month": current_month_str,
+                        "balance": balance,
+                        "ratio": _debt_ratio,
+                        "next_month_amount": _debt_next,
+                        "lookback_total": _debt_lookback_total,
+                        "monthly_avg": _debt_monthly_avg,
+                        "total_forecast": _debt_total_forecast,
+                        "matched_count": int(
+                            _debt_amount(_debt_fc.get("matched_count"))
+                        ),
+                        "forecast": _debt_forecast_rows,
+                        "matched_merchants": _debt_merchants,
+                    }
+                    _debt_warning_fn = _get_debt_warning_fn()
+                    _debt_fallback_text = (
+                        f"⚠️ 你下个月要还 {_debt_next:.0f} 元，"
+                        f"占结余 {_debt_ratio * 100:.0f}%，"
+                        f"建议这个月先别买新衣服了。"
+                    )
+                    if _debt_warning_fn is None:
+                        # 后端尚未合入：本地兜底，不调 API、不计额度；后端就绪后自动恢复
+                        print("[debt] ai_agent.generate_debt_warning 不可用，使用本地兜底预警")
+                        _debt_warning_text = _debt_fallback_text
+                        _debt_warning_fallback = True
+                    else:
+                        try:
+                            with st.spinner("AI 正在评估还款压力…"):
+                                _debt_ai_text = _debt_warning_fn(
+                                    _debt_stats, get_deepseek_api_key()
+                                )
+                            if (
+                                not isinstance(_debt_ai_text, str)
+                                or not _debt_ai_text.strip()
+                            ):
+                                raise ValueError("generate_debt_warning 返回空文本")
+                        except Exception as _debt_ai_exc:
+                            # DebtWarningError（未配 key / 网络 / 解析）与其它异常统一兜底：
+                            # 不红屏，写缓存（fallback=True）避免反复打不可用的 API，按「已尝试」+1
+                            print(
+                                f"[debt] AI 压力预警失败："
+                                f"{type(_debt_ai_exc).__name__}: {_debt_ai_exc}"
+                            )
+                            _debt_warning_text = _debt_fallback_text
+                            _debt_warning_fallback = True
+                            _debt_store[_debt_cache_key] = {
+                                "text": _debt_warning_text,
+                                "fallback": True,
+                            }
+                            st.session_state.ai_daily_count += 1
+                        else:
+                            _debt_warning_text = _debt_ai_text.strip()
+                            _debt_warning_fallback = False
+                            _debt_store[_debt_cache_key] = {
+                                "text": _debt_warning_text,
+                                "fallback": False,
+                            }
+                            st.session_state.ai_daily_count += 1
+                if _debt_warning_text:
+                    st.error(_debt_warning_text)
+                    st.caption(
+                        "AI 压力预警"
+                        + ("（本地兜底）" if _debt_warning_fallback else "")
+                    )
+    except Exception as _debt_exc:
+        print(f"[debt] 还款预测失败：{type(_debt_exc).__name__}: {_debt_exc}")
+        st.caption("还款预测暂不可用")
 
     # ===== 账单明细：基于全量 df 的本地筛选 + 本地分页 =====
     # 说明：get_bills_paginated / get_total_bill_count 不再用于表格，但 import 保留

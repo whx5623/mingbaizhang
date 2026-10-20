@@ -2669,3 +2669,246 @@ def generate_weekly_challenge(stats: dict, api_key: str) -> dict:
         "points": parsed["points"],
         "raw": content.strip(),
     }
+
+
+# ============================================================================
+# 负债压力预警（DeepSeek Chat，纯文本一句话，供 app.py 首页/负债卡片展示）
+# ----------------------------------------------------------------------------
+# 输入是 app.py 已经算好的 stats（由 db.forecast_repayments 的结果拼成），
+# 本函数只负责「把数字翻译成一句不超过 60 字的预警」，不做任何统计/聚合；
+# 返回文本硬上限 80 字（模型偶尔不听话写成小作文，必须截断）。
+# · 失败统一走 DebtWarningError(code, message)，code ∈
+#     no_api_key / empty_stats / network / http / parse；
+# · 前置校验（key 空、预估还款额 <= 0、结余 <= 0）全部在**发请求之前**完成；
+# · 日志只记月份、字数、状态码与异常类型，绝不记 api_key、请求头或金额明细。
+# ============================================================================
+
+# 系统提示词必须**逐字**保持（产品口径，改一个字预警语气就跑偏）。
+DEBT_WARNING_SYSTEM_PROMPT = (
+    "你是一个懂大学生、说话直接但不刻薄的财务教练。用户下个月有一笔预估还款，"
+    "请写一条不超过 60 字的预警：必须包含“下个月要还 X 元”“占结余 Y%”两个信息，"
+    "并给一条这个月就能执行的具体省钱建议。不要寒暄、不要分点、不要解释，直接输出一句话。"
+)
+
+DEBT_WARNING_MODEL = "deepseek-chat"
+DEBT_WARNING_TEMPERATURE = 0.7
+DEBT_WARNING_MAX_TOKENS = 200
+DEBT_WARNING_TIMEOUT = 20
+DEBT_WARNING_MAX_CHARS = 80  # 返回文本硬上限：超过截断到 80 字并补「…」
+
+
+class DebtWarningError(Exception):
+    """还款压力预警生成失败。
+
+    code 取值：
+      no_api_key   未配置 DeepSeek API Key（**未发请求**）
+      empty_stats  预估还款额 <= 0 / 当前结余 <= 0 / stats 不是 dict（**未发请求**）
+      network      网络异常（超时 / 连接失败 / 其它请求层异常）
+      http         接口返回非 200（message 只带状态码，不带响应体）
+      parse        响应不是合法 JSON / choices/content 缺失或为空
+
+    message 为面向用户的中文提示，可直接展示。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"DebtWarningError(code={self.code!r}, message={self.message!r})"
+
+
+def _debt_amount(value) -> float:
+    """金额宽松转 float：None / bool / 非数字 / nan / inf → 0.0。
+
+    宽容的理由：stats 由 app.py 汇总，某个键缺失只说明"这项没有数据"；
+    但 next_month_amount / balance 这两个关键值另有硬校验（<= 0 直接
+    DebtWarningError），不会被这里悄悄放过。
+    """
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(amount):
+        return 0.0
+    return amount
+
+
+def _debt_ratio(value, next_month_amount: float, balance: float) -> float:
+    """还款占结余的比例（0~1）：优先用 app 传的 ratio，缺失/非法时用还款额/结余兜底。"""
+    ratio = _debt_amount(value)
+    if ratio <= 0 and next_month_amount > 0 and balance > 0:
+        return next_month_amount / balance
+    return ratio
+
+
+def _format_debt_forecast(forecast) -> str:
+    """未来三个月预测排成 "2026-11 1200.00 元；…"；结构不符的条目跳过，空 → "无"。"""
+    if not isinstance(forecast, (list, tuple)):
+        return "无"
+    items = []
+    for item in forecast:
+        if not isinstance(item, dict):
+            continue
+        month = str(item.get("month") or "").strip() or "未知月份"
+        amount = _debt_amount(item.get("amount"))
+        items.append(f"{month} {amount:.2f} 元")
+    return "；".join(items) if items else "无"
+
+
+def _debt_next_month(stats: dict) -> str:
+    """下月月份：优先 stats["next_month"]；调用方只传 forecast 时取 forecast[0]["month"]。"""
+    label = str(stats.get("next_month") or "").strip()
+    if label:
+        return label
+    forecast = stats.get("forecast")
+    if isinstance(forecast, (list, tuple)):
+        for item in forecast:
+            if isinstance(item, dict):
+                month = str(item.get("month") or "").strip()
+                if month:
+                    return month
+    return "下月"
+
+
+def _debt_top_merchant(stats: dict) -> str:
+    """最大负债商户：优先 stats["top_merchant"]；只传 matched_merchants（已按金额降序）时取首项。"""
+    label = str(stats.get("top_merchant") or "").strip()
+    if label:
+        return label
+    merchants = stats.get("matched_merchants")
+    if isinstance(merchants, (list, tuple)):
+        for item in merchants:
+            if isinstance(item, dict):
+                name = str(item.get("merchant") or "").strip()
+                if name:
+                    return name
+    return "无"
+
+
+def _build_debt_warning_user_content(stats: dict) -> str:
+    """把 app.py 汇总的还款压力 stats 排成中文条目（金额一律两位小数）。"""
+    month = str(stats.get("month") or "本月")
+    next_month = _debt_next_month(stats)
+    next_month_amount = _debt_amount(stats.get("next_month_amount"))
+    balance = _debt_amount(stats.get("balance"))
+    ratio = _debt_ratio(stats.get("ratio"), next_month_amount, balance)
+    top_merchant = _debt_top_merchant(stats)
+
+    lines = [
+        "这是我的下月还款压力数据，请按系统要求写一条预警：",
+        f"本月：{month}",
+        f"下月：{next_month}",
+        f"预估还款额：{next_month_amount:.2f} 元",
+        f"当前结余：{balance:.2f} 元",
+        f"预估还款占结余：{ratio * 100:.1f}%",
+        f"未来三个月预测：{_format_debt_forecast(stats.get('forecast'))}",
+        f"最大负债商户：{top_merchant}",
+    ]
+    return "\n".join(lines)
+
+
+def generate_debt_warning(stats: dict, api_key: str) -> str:
+    """根据还款压力统计生成一条不超过 60 字的预警，返回去除首尾空白后的文本。
+
+    失败一律抛 DebtWarningError（中文 message，可直接上页面）：
+      · api_key 为空                        → no_api_key（且**不发请求**）；
+      · stats 不是 dict / 预估还款额 <= 0 / 结余 <= 0 → empty_stats（且**不发请求**）；
+      · 超时 / 连接失败 / 其它请求层异常      → network；
+      · 非 200                              → http（只带状态码，不拼响应体）；
+      · 响应不是 JSON / content 缺失或为空   → parse。
+    返回文本超过 80 字时截断到 80 字并补「…」。
+    日志只记月份、字数、状态码与异常类型，**绝不**记 api_key 或金额明细。
+    """
+    # ① api_key：先查它，没有 key 时不该先花一次网络往返。
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise DebtWarningError(
+            "no_api_key",
+            "未配置 DEEPSEEK_API_KEY，还款预警暂不可用",
+        )
+    api_key = api_key.strip()
+
+    # ② 数据前置校验：没有预估还款 / 结余已为 0，都不该让模型对着 0 硬编预警。
+    if not isinstance(stats, dict):
+        raise DebtWarningError(
+            "empty_stats",
+            "还款数据不完整，暂时无法生成预警，请刷新后重试",
+        )
+    next_month_amount = _debt_amount(stats.get("next_month_amount"))
+    balance = _debt_amount(stats.get("balance"))
+    if next_month_amount <= 0 or balance <= 0:
+        raise DebtWarningError(
+            "empty_stats",
+            "下个月没有预估还款，暂时不需要还款预警",
+        )
+    month = str(stats.get("month") or "未知")
+
+    user_content = _build_debt_warning_user_content(stats)
+    payload = {
+        "model": DEBT_WARNING_MODEL,
+        "messages": [
+            {"role": "system", "content": DEBT_WARNING_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        # temperature 0.7：预警要直接但不刻薄；max_tokens 200 够 60 字 + 余量。
+        "temperature": DEBT_WARNING_TEMPERATURE,
+        "max_tokens": DEBT_WARNING_MAX_TOKENS,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ③ 发请求：超时/连接失败翻译成用户能看懂的句子（不把异常对象漏到页面）。
+    try:
+        resp = requests.post(
+            DEEPSEEK_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=DEBT_WARNING_TIMEOUT,
+        )
+    except requests.Timeout:
+        logger.warning("还款预警请求超时（月份=%s）", month)
+        raise DebtWarningError("network", "生成还款预警超时，请稍后再试") from None
+    except requests.ConnectionError:
+        logger.warning("还款预警请求连接失败（月份=%s）", month)
+        raise DebtWarningError("network", "网络连接失败，请检查网络") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：日志只记异常类型（确保不把 headers / key 带出去）。
+        logger.warning("还款预警请求失败（月份=%s，异常=%s）", month, type(exc).__name__)
+        raise DebtWarningError("network", "网络连接失败，请检查网络") from None
+
+    # ④ 非 200：只带状态码，不把响应体拼进 message（响应体可能含请求回显）。
+    if resp.status_code != 200:
+        logger.warning("还款预警接口返回 HTTP %s（月份=%s）", resp.status_code, month)
+        raise DebtWarningError(
+            "http",
+            f"AI 服务返回异常（HTTP {resp.status_code}），请稍后重试",
+        )
+
+    # ⑤ 解析：非 JSON / 结构不符 / content 为空 → 同一条"没有有效预警"。
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("还款预警响应不是合法 JSON（月份=%s）", month)
+        raise DebtWarningError("parse", "AI 没有返回有效预警，请重试") from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("还款预警响应结构不符合预期（月份=%s）", month)
+        raise DebtWarningError("parse", "AI 没有返回有效预警，请重试") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("还款预警响应 content 为空（月份=%s）", month)
+        raise DebtWarningError("parse", "AI 没有返回有效预警，请重试")
+
+    content = content.strip()
+    if len(content) > DEBT_WARNING_MAX_CHARS:
+        content = content[:DEBT_WARNING_MAX_CHARS] + "…"
+    logger.info("还款预警生成成功（月份=%s，字数=%d）", month, len(content))
+    return content
