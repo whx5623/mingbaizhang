@@ -728,6 +728,62 @@ def _get_latte_roast_fn():
     return roast_fn if callable(roast_fn) else None
 
 
+# ===== 财务沙盘推演：AI 沙盘点评的进程级缓存 =====
+# 与还款预警 / 灵魂拷问同理：key = sha256(归一化 stats)，命中直接复用、不调 API、不扣额度；
+# SandboxAdviceError 或其它异常的本地兜底结果也写缓存（fallback=True），
+# 避免反复打不可用的 API。
+@st.cache_resource(show_spinner=False)
+def _sandbox_advice_store() -> dict:
+    """返回进程级缓存：{sha256 key: {"text": str, "fallback": bool}}。"""
+    return {}
+
+
+def _sandbox_advice_key(stats: dict) -> str:
+    """把沙盘 stats 归一化成稳定 key（字段顺序 / 中文都不影响哈希）。"""
+    return hashlib.sha256(
+        json.dumps(
+            stats, sort_keys=True, ensure_ascii=False, default=str
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _get_sandbox_advice_fn():
+    """按模块属性取 ai_agent.generate_sandbox_advice：并行期缺失 / 打桩都能感知。"""
+    try:
+        import ai_agent as _ai_agent_mod
+    except Exception as _ai_import_exc:  # pragma: no cover - 依赖缺失时只降级
+        print(
+            f"[sandbox] ai_agent 不可用："
+            f"{type(_ai_import_exc).__name__}: {_ai_import_exc}"
+        )
+        return None
+    advice_fn = getattr(_ai_agent_mod, "generate_sandbox_advice", None)
+    return advice_fn if callable(advice_fn) else None
+
+
+def _sandbox_fallback_advice(result: dict) -> str:
+    """AI 不可用时的本地沙盘点评（不依赖 API，也不改变推演结果）。"""
+    try:
+        broke_index = result.get("broke_index")
+        min_balance = float(result.get("min_balance") or 0.0)
+    except (TypeError, ValueError):
+        broke_index = None
+        min_balance = 0.0
+    if result.get("broke_month"):
+        month_text = broke_index if broke_index is not None else "?"
+        return (
+            f"按此计划，你将在第 {month_text} 个月面临破产。"
+            f"建议先砍掉额外支出，或把每月支出再降 {abs(min_balance):.0f} 元左右。"
+        )
+    try:
+        final_balance = float(result.get("final_balance") or 0.0)
+    except (TypeError, ValueError):
+        final_balance = 0.0
+    return (
+        f"按此计划，6 个月后你还会有 ¥{final_balance:.0f} 结余，继续保持。"
+    )
+
+
 # Sidebar
 with st.sidebar:
     # ---- 积分头衔荣誉卡片（纯本地计算；017 未执行 / 读库失败只隐藏卡片）----
@@ -3565,6 +3621,391 @@ with tab_tools:
             if _challenge_show_completed:
                 st.success("🎉 本周挑战已完成，下周再来！")
                 st.caption(f"当前积分：{_challenge_points_now} 分")
+
+    # ---- 🧪 财务沙盘推演（放在「我的挑战」之后，Tab2 最后一张卡片）----
+    # 推演后端 db.simulate_sandbox / ai_agent.generate_sandbox_advice 由并行方提供：
+    # 缺失 / 异常只在卡片内降级，绝不红屏。
+    with st.container(border=True, key="card_sandbox"):
+        st.subheader("🧪 财务沙盘推演")
+        st.caption("假设未来的收支变化，推演接下来 6 个月的结余走势")
+
+        try:
+            _sandbox_col_extra, _sandbox_col_cut = st.columns(2)
+            with _sandbox_col_extra:
+                _sandbox_extra = st.number_input(
+                    "每月额外增加支出（元）",
+                    min_value=0,
+                    value=300,
+                    step=50,
+                    key="sandbox_extra",
+                )
+            with _sandbox_col_cut:
+                _sandbox_cut = st.number_input(
+                    "每月减少支出（元）",
+                    min_value=0,
+                    value=0,
+                    step=50,
+                    key="sandbox_cut",
+                )
+
+            if st.button(
+                "📊 推演未来 6 个月",
+                key="sandbox_run",
+                use_container_width=True,
+            ):
+                _sandbox_balance = float(total_income - total_expense)
+                try:
+                    _sandbox_month_expense = float(month_expense)
+                except (TypeError, ValueError):
+                    _sandbox_month_expense = 0.0
+                try:
+                    _sandbox_today = db._report_today()
+                except Exception as _sandbox_today_exc:
+                    print(
+                        f"[sandbox] 读取日报时钟失败："
+                        f"{type(_sandbox_today_exc).__name__}: {_sandbox_today_exc}"
+                    )
+                    _sandbox_today = date.today()
+                # 本月支出 / 已过天数 → 日均；再估算整月基线支出。
+                _sandbox_daily_avg = _sandbox_month_expense / max(
+                    int(getattr(_sandbox_today, "day", 1) or 1), 1
+                )
+                try:
+                    _sandbox_budget = float(st.session_state.monthly_budget)
+                except (TypeError, ValueError):
+                    _sandbox_budget = 0.0
+
+                if _sandbox_budget <= 0 and _sandbox_daily_avg <= 0:
+                    st.info("缺少预算与消费数据，无法推演")
+                else:
+                    _sandbox_monthly_base = (
+                        _sandbox_budget
+                        if _sandbox_budget > 0
+                        else _sandbox_daily_avg * 30.0
+                    )
+                    _sandbox_simulate_fn = getattr(
+                        db, "simulate_sandbox", None
+                    )
+                    if not callable(_sandbox_simulate_fn):
+                        print("[sandbox] db.simulate_sandbox 不可用")
+                        st.error("推演失败，请稍后再试")
+                    else:
+                        try:
+                            with st.spinner("正在推演未来 6 个月…"):
+                                _sandbox_result = _sandbox_simulate_fn(
+                                    _sandbox_balance,
+                                    _sandbox_monthly_base,
+                                    extra_expense=float(_sandbox_extra),
+                                    cut_expense=float(_sandbox_cut),
+                                    months=6,
+                                    today=_sandbox_today,
+                                )
+                            if not isinstance(_sandbox_result, dict) or not isinstance(
+                                _sandbox_result.get("months"), list
+                            ):
+                                raise ValueError(
+                                    "simulate_sandbox 返回结构不合规"
+                                )
+                        except Exception as _sandbox_sim_exc:
+                            print(
+                                f"[sandbox] 推演失败："
+                                f"{type(_sandbox_sim_exc).__name__}: "
+                                f"{_sandbox_sim_exc}"
+                            )
+                            st.session_state.pop("sandbox_result", None)
+                            st.error("推演失败，请稍后再试")
+                        else:
+                            # 结果持久化：按钮只在点击那一次为 True，rerun 后靠 session 继续展示。
+                            st.session_state["sandbox_result"] = {
+                                "input": {
+                                    "initial_balance": _sandbox_balance,
+                                    "monthly_base_expense": _sandbox_monthly_base,
+                                    "extra_expense": float(_sandbox_extra),
+                                    "cut_expense": float(_sandbox_cut),
+                                    "months": 6,
+                                    "today": str(_sandbox_today),
+                                },
+                                "result": _sandbox_result,
+                            }
+
+            # ---- 渲染推演结果：独立于按钮，rerun 后仍在 ----
+            _sandbox_saved = st.session_state.get("sandbox_result")
+            if (
+                isinstance(_sandbox_saved, dict)
+                and isinstance(_sandbox_saved.get("result"), dict)
+                and isinstance(
+                    _sandbox_saved["result"].get("months"), list
+                )
+            ):
+                try:
+                    _sandbox_result = _sandbox_saved["result"]
+                    _sandbox_input = _sandbox_saved.get("input")
+                    if not isinstance(_sandbox_input, dict):
+                        _sandbox_input = {}
+
+                    _months = [
+                        str(_month_row.get("month"))
+                        for _month_row in _sandbox_result["months"]
+                    ]
+                    _points = [
+                        {
+                            "value": _month_row.get("balance"),
+                            "itemStyle": {
+                                "color": (
+                                    "#EF4444"
+                                    if float(_month_row.get("balance") or 0.0) < 0
+                                    else "#1E88E5"
+                                )
+                            },
+                        }
+                        for _month_row in _sandbox_result["months"]
+                    ]
+                    _opt = {
+                        "tooltip": {"trigger": "axis"},
+                        "grid": {
+                            "left": "3%",
+                            "right": "4%",
+                            "bottom": "3%",
+                            "top": "12%",
+                            "containLabel": True,
+                        },
+                        "xAxis": {
+                            "type": "category",
+                            "data": _months,
+                            "axisLabel": {"color": "#6B7280"},
+                        },
+                        "yAxis": {
+                            "type": "value",
+                            "name": "结余（元）",
+                            "splitLine": {
+                                "lineStyle": {"color": "#F1F5F9"}
+                            },
+                        },
+                        "series": [
+                            {
+                                "type": "line",
+                                "smooth": True,
+                                "symbolSize": 9,
+                                "lineStyle": {
+                                    "width": 3,
+                                    "color": "#1E88E5",
+                                },
+                                "areaStyle": {
+                                    "opacity": 0.12,
+                                    "color": "#93C5FD",
+                                },
+                                "markLine": {
+                                    "silent": True,
+                                    "symbol": "none",
+                                    "lineStyle": {
+                                        "color": "#EF4444",
+                                        "type": "dashed",
+                                    },
+                                    "data": [
+                                        {
+                                            "yAxis": 0,
+                                            "label": {"formatter": "0 元"},
+                                        }
+                                    ],
+                                },
+                                "data": _points,
+                            }
+                        ],
+                    }
+                    st_echarts(_opt, height="300px")
+
+                    _sandbox_broke_month = _sandbox_result.get("broke_month")
+                    if _sandbox_broke_month:
+                        st.error(
+                            f"⚠️ 第 {_sandbox_result.get('broke_index')} 个月"
+                            f"（{_sandbox_broke_month}）结余将跌破 0，"
+                            "请提前调整计划！"
+                        )
+                    else:
+                        _sandbox_final_balance = float(
+                            _sandbox_result.get("final_balance") or 0.0
+                        )
+                        st.success(
+                            f"✅ 按此计划，6 个月后仍有结余 "
+                            f"¥{_sandbox_final_balance:.2f}"
+                        )
+
+                    _sandbox_metric1, _sandbox_metric2, _sandbox_metric3 = (
+                        st.columns(3)
+                    )
+                    with _sandbox_metric1:
+                        st.metric(
+                            "6 个月后结余",
+                            f"¥{float(_sandbox_result.get('final_balance') or 0.0):.2f}",
+                        )
+                    with _sandbox_metric2:
+                        st.metric(
+                            "最低结余",
+                            f"¥{float(_sandbox_result.get('min_balance') or 0.0):.2f}",
+                        )
+                    with _sandbox_metric3:
+                        st.metric(
+                            "破产月份",
+                            str(_sandbox_broke_month or "不会破产"),
+                        )
+
+                    # ---- AI 沙盘顾问：命中进程缓存不调 API、不扣额度 ----
+                    _sandbox_stats = {
+                        "input": dict(_sandbox_input),
+                        "result": _sandbox_result,
+                        "initial_balance": float(
+                            _sandbox_input.get(
+                                "initial_balance",
+                                _sandbox_result.get("initial_balance") or 0.0,
+                            )
+                        ),
+                        "monthly_base_expense": float(
+                            _sandbox_input.get(
+                                "monthly_base_expense",
+                                _sandbox_result.get("monthly_base_expense")
+                                or 0.0,
+                            )
+                        ),
+                        "extra_expense": float(
+                            _sandbox_input.get(
+                                "extra_expense",
+                                _sandbox_result.get("extra_expense") or 0.0,
+                            )
+                        ),
+                        "cut_expense": float(
+                            _sandbox_input.get(
+                                "cut_expense",
+                                _sandbox_result.get("cut_expense") or 0.0,
+                            )
+                        ),
+                        "months_count": int(
+                            _sandbox_result.get("months_count") or 6
+                        ),
+                        "broke_month": _sandbox_result.get("broke_month"),
+                        "broke_index": _sandbox_result.get("broke_index"),
+                        "min_balance": float(
+                            _sandbox_result.get("min_balance") or 0.0
+                        ),
+                        "final_balance": float(
+                            _sandbox_result.get("final_balance") or 0.0
+                        ),
+                        "months": [
+                            {
+                                "month": _month_row.get("month"),
+                                "balance": _month_row.get("balance"),
+                            }
+                            for _month_row in _sandbox_result["months"]
+                        ],
+                    }
+                    _sandbox_cache_key = _sandbox_advice_key(_sandbox_stats)
+                    _sandbox_store = _sandbox_advice_store()
+                    _sandbox_entry = _sandbox_store.get(_sandbox_cache_key)
+
+                    if not (
+                        isinstance(_sandbox_entry, dict)
+                        and _sandbox_entry.get("text")
+                    ):
+                        if st.session_state.get("ai_daily_count", 0) >= 20:
+                            # 额度用完：不调用、不写缓存（额度恢复后同一组数据仍可生成）
+                            st.caption("今日 AI 额度已用完，暂不生成沙盘点评")
+                            _sandbox_entry = None
+                        else:
+                            _sandbox_fallback_text = _sandbox_fallback_advice(
+                                _sandbox_result
+                            )
+                            _sandbox_advice_fn = _get_sandbox_advice_fn()
+                            if _sandbox_advice_fn is None:
+                                # 后端尚未合入：本地兜底并写缓存；按「已尝试」+1 额度
+                                print(
+                                    "[sandbox] ai_agent.generate_sandbox_advice "
+                                    "不可用，使用本地兜底"
+                                )
+                                _sandbox_entry = {
+                                    "text": _sandbox_fallback_text,
+                                    "fallback": True,
+                                }
+                                _sandbox_store[_sandbox_cache_key] = (
+                                    _sandbox_entry
+                                )
+                                st.session_state.ai_daily_count = (
+                                    st.session_state.get("ai_daily_count", 0)
+                                    + 1
+                                )
+                            else:
+                                try:
+                                    with st.spinner("AI 正在读沙盘结果…"):
+                                        _sandbox_ai_text = _sandbox_advice_fn(
+                                            _sandbox_stats,
+                                            get_deepseek_api_key(),
+                                        )
+                                    if (
+                                        not isinstance(_sandbox_ai_text, str)
+                                        or not _sandbox_ai_text.strip()
+                                    ):
+                                        raise ValueError(
+                                            "generate_sandbox_advice 返回空文本"
+                                        )
+                                except Exception as _sandbox_ai_exc:
+                                    # SandboxAdviceError（未配 key / 网络 / 解析）与
+                                    # 其它异常统一兜底：不红屏，写缓存避免反复失败。
+                                    print(
+                                        f"[sandbox] AI 沙盘点评失败："
+                                        f"{type(_sandbox_ai_exc).__name__}: "
+                                        f"{_sandbox_ai_exc}"
+                                    )
+                                    _sandbox_entry = {
+                                        "text": _sandbox_fallback_text,
+                                        "fallback": True,
+                                    }
+                                    _sandbox_store[_sandbox_cache_key] = (
+                                        _sandbox_entry
+                                    )
+                                    st.session_state.ai_daily_count = (
+                                        st.session_state.get(
+                                            "ai_daily_count", 0
+                                        )
+                                        + 1
+                                    )
+                                else:
+                                    _sandbox_entry = {
+                                        "text": _sandbox_ai_text.strip(),
+                                        "fallback": False,
+                                    }
+                                    _sandbox_store[_sandbox_cache_key] = (
+                                        _sandbox_entry
+                                    )
+                                    st.session_state.ai_daily_count = (
+                                        st.session_state.get(
+                                            "ai_daily_count", 0
+                                        )
+                                        + 1
+                                    )
+
+                    if isinstance(_sandbox_entry, dict) and _sandbox_entry.get(
+                        "text"
+                    ):
+                        st.info(_sandbox_entry["text"])
+                        st.caption(
+                            "AI 沙盘点评"
+                            + (
+                                "（本地兜底）"
+                                if _sandbox_entry.get("fallback")
+                                else ""
+                            )
+                        )
+                except Exception as _sandbox_render_exc:
+                    print(
+                        f"[sandbox] 结果渲染失败："
+                        f"{type(_sandbox_render_exc).__name__}: "
+                        f"{_sandbox_render_exc}"
+                    )
+                    st.caption("沙盘结果暂时无法展示，请重新推演")
+        except Exception as _sandbox_exc:
+            print(
+                f"[sandbox] 卡片渲染失败："
+                f"{type(_sandbox_exc).__name__}: {_sandbox_exc}"
+            )
+            st.caption("财务沙盘推演暂不可用")
 
 with tab_ai:
     # AI Chat

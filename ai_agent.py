@@ -3128,3 +3128,244 @@ def generate_latte_roast(stats: dict, api_key: str) -> str:
         content = content[:LATTE_ROAST_MAX_CHARS] + "…"
     logger.info("拿铁因子拷问生成成功（统计月数=%s，字数=%d）", months, len(content))
     return content
+
+
+# ============================================================================
+# 财务沙盘顾问（DeepSeek Chat，把 6 个月推演结果点评成一段话）
+# ----------------------------------------------------------------------------
+# 与「月度复盘」的区别：输入不是原始账单，而是 db.simulate_sandbox 的推演结果，
+# 所以文案重点是"第 X 个月面临破产"与"立刻能做的削减"，而不是解释钱花在哪。
+#   · 系统提示词逐字固定（产品口径，改一个字文案风格就跑偏）；
+#   · api_key 为空、stats 不合法时**不发请求**（先校验，再花网络往返）；
+#   · 日志只记月数、字数、状态码与异常类型，**绝不**记 api_key 或金额明细。
+# ============================================================================
+
+# 系统提示词必须**逐字**保持（产品口径）。
+SANDBOX_ADVICE_SYSTEM_PROMPT = (
+    "你是一个懂大学生、说话犀利但给出可执行方案的理财教练。请根据我的 6 个月财务沙盘推演结果，用不超过 60 字写一段总结点评：如果推演中某个月结余会跌破 0，必须点明“第 X 个月面临破产”并给 1~2 条立刻能做的削减建议；如果没有破产，就说明 6 个月后还能剩下多少钱并鼓励一句。不要寒暄、不要分点、不要解释，直接输出一段话。"
+)
+
+SANDBOX_ADVICE_MODEL = "deepseek-chat"
+SANDBOX_ADVICE_TEMPERATURE = 0.7  # 0.7：点评要犀利但不能跑题成段子
+SANDBOX_ADVICE_MAX_TOKENS = 200   # 60 字 + 余量
+SANDBOX_ADVICE_TIMEOUT = 20
+SANDBOX_ADVICE_MAX_CHARS = 80     # 返回文本硬上限：超过截断到 80 字并补「…」
+
+
+class SandboxAdviceError(Exception):
+    """沙盘顾问生成失败。
+
+    code 取值：
+      no_api_key   未配置 DeepSeek API Key（**未发请求**）
+      empty_stats  stats 不是 dict / months 缺失或为空（**未发请求**）
+      network      网络异常（超时 / 连接失败 / 其它请求层异常）
+      http         接口返回非 200（message 只带状态码，不带响应体）
+      parse        响应不是合法 JSON / choices/content 缺失或为空
+
+    message 为面向用户的中文提示，可直接展示。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"SandboxAdviceError(code={self.code!r}, message={self.message!r})"
+
+
+def _sandbox_advice_amount(value) -> float:
+    """stats 里的金额宽松转 float：None / bool / 非数字 / nan / inf → 0.0。
+
+    为什么宽容而不是抛错：stats 由调用方从 db.simulate_sandbox 的返回拼出来，
+    某个键缺失只说明"这项没有数据"，不该让整段点评失败；结构层面的硬校验
+    在 generate_sandbox_advice 里（stats 不是 dict / months 为空直接报错）。
+    """
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(amount):
+        return 0.0
+    return amount
+
+
+def _sandbox_advice_months(stats: dict) -> list[dict]:
+    """把 stats["months"] 收敛成 [{"month": str, "balance": float}]。
+
+    结构不对的条目直接跳过（绝不 KeyError）；months 不是 list/tuple 时返回 []，
+    由调用方统一翻译成 empty_stats。
+    """
+    entries: list[dict] = []
+    months = stats.get("months")
+    if not isinstance(months, (list, tuple)):
+        return entries
+    for item in months:
+        if not isinstance(item, dict):
+            continue
+        entries.append({
+            "month": str(item.get("month") or "").strip() or "未知月份",
+            "balance": _sandbox_advice_amount(item.get("balance")),
+        })
+    return entries
+
+
+def _build_sandbox_advice_user_content(stats: dict) -> str:
+    """把沙盘推演结果排成中文条目（金额一律两位小数，逐月一行）。"""
+    initial = _sandbox_advice_amount(stats.get("initial_balance"))
+    base = _sandbox_advice_amount(stats.get("monthly_base_expense"))
+    extra = _sandbox_advice_amount(stats.get("extra_expense"))
+    cut = _sandbox_advice_amount(stats.get("cut_expense"))
+    entries = _sandbox_advice_months(stats)
+
+    broke_month = str(stats.get("broke_month") or "").strip()
+    broke_index = stats.get("broke_index")
+    if isinstance(broke_index, bool) or not isinstance(broke_index, int):
+        broke_index = None
+    if broke_month:
+        broke_text = (
+            f"{broke_month}（第 {broke_index} 个月）"
+            if broke_index is not None
+            else broke_month
+        )
+    else:
+        broke_text = "无"
+
+    raw_final = stats.get("final_balance")
+    if raw_final is not None:
+        final_balance = _sandbox_advice_amount(raw_final)
+    elif entries:
+        final_balance = entries[-1]["balance"]
+    else:
+        final_balance = 0.0
+
+    balance_lines = [
+        f"  {item['month']}：{item['balance']:.2f} 元" for item in entries
+    ]
+    if not balance_lines:
+        balance_lines.append("  无")
+
+    lines = [
+        "这是我的沙盘推演结果，请按系统要求写一段总结点评：",
+        f"初始结余：{initial:.2f} 元",
+        f"每月基线支出：{base:.2f} 元",
+        f"额外支出：{extra:.2f} 元",
+        f"削减支出：{cut:.2f} 元",
+        "逐月结余：",
+        *balance_lines,
+        f"破产月份：{broke_text}",
+        f"最终结余：{final_balance:.2f} 元",
+    ]
+    return "\n".join(lines)
+
+
+def generate_sandbox_advice(stats: dict, api_key: str) -> str:
+    """根据 6 个月财务沙盘推演结果生成一段不超过 60 字的总结点评（strip 后文本）。
+
+    stats 约定（缺失字段按"无 / 0"处理，绝不 KeyError）：
+        {"initial_balance": 1500.0, "extra_expense": 300.0, "cut_expense": 0.0,
+         "monthly_base_expense": 1500.0,
+         "months": [{"month": "2027-01", "balance": -300.0}, ...],
+         "broke_month": "2027-01"|None, "broke_index": 4|None,
+         "final_balance": -200.0}
+
+    失败一律抛 SandboxAdviceError（中文 message，可直接上页面）：
+      · api_key 为空                        → no_api_key（且**不发请求**）；
+      · stats 不是 dict / months 缺失或为空   → empty_stats（且**不发请求**）；
+      · 超时 / 连接失败 / 其它请求层异常        → network；
+      · 非 200                              → http（只带状态码，不拼响应体）；
+      · 响应不是 JSON / content 缺失或为空     → parse。
+    返回文本超过 80 字时截断到 80 字并补「…」。
+    日志只记推演月数、字数、状态码与异常类型，**绝不**记 api_key 或金额明细。
+    """
+    # ① api_key：先查它，没有 key 时不该先花一次网络往返。
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise SandboxAdviceError(
+            "no_api_key",
+            "未配置 DEEPSEEK_API_KEY，沙盘顾问暂不可用",
+        )
+    api_key = api_key.strip()
+
+    # ② 数据前置校验：没有逐月推演结果时，模型只能硬编"建议"，毫无意义。
+    if not isinstance(stats, dict):
+        raise SandboxAdviceError(
+            "empty_stats",
+            "沙盘推演数据不完整，暂时无法生成点评，请刷新后重试",
+        )
+    entries = _sandbox_advice_months(stats)
+    if not entries:
+        raise SandboxAdviceError(
+            "empty_stats",
+            "还没有沙盘推演结果，先做一次推演再来看点评吧",
+        )
+    months_count = len(entries)
+
+    user_content = _build_sandbox_advice_user_content(stats)
+    payload = {
+        "model": SANDBOX_ADVICE_MODEL,
+        "messages": [
+            {"role": "system", "content": SANDBOX_ADVICE_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": SANDBOX_ADVICE_TEMPERATURE,
+        "max_tokens": SANDBOX_ADVICE_MAX_TOKENS,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ③ 发请求：超时/连接失败翻译成用户能看懂的句子（不把异常对象漏到页面）。
+    try:
+        resp = requests.post(
+            DEEPSEEK_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=SANDBOX_ADVICE_TIMEOUT,
+        )
+    except requests.Timeout:
+        logger.warning("沙盘顾问请求超时（推演月数=%s）", months_count)
+        raise SandboxAdviceError("network", "生成沙盘点评超时，请稍后再试") from None
+    except requests.ConnectionError:
+        logger.warning("沙盘顾问请求连接失败（推演月数=%s）", months_count)
+        raise SandboxAdviceError("network", "网络连接失败，请检查网络") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：日志只记异常类型（确保不把 headers / key 带出去）。
+        logger.warning(
+            "沙盘顾问请求失败（推演月数=%s，异常=%s）", months_count, type(exc).__name__
+        )
+        raise SandboxAdviceError("network", "网络连接失败，请检查网络") from None
+
+    # ④ 非 200：只带状态码，不把响应体拼进 message（响应体可能含请求回显）。
+    if resp.status_code != 200:
+        logger.warning("沙盘顾问接口返回 HTTP %s（推演月数=%s）", resp.status_code, months_count)
+        raise SandboxAdviceError(
+            "http",
+            f"AI 服务返回异常（HTTP {resp.status_code}），请稍后重试",
+        )
+
+    # ⑤ 解析：非 JSON / 结构不符 / content 为空 → 同一条"没有有效点评"。
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("沙盘顾问响应不是合法 JSON（推演月数=%s）", months_count)
+        raise SandboxAdviceError("parse", "AI 没有返回有效点评，请重试") from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("沙盘顾问响应结构不符合预期（推演月数=%s）", months_count)
+        raise SandboxAdviceError("parse", "AI 没有返回有效点评，请重试") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("沙盘顾问响应 content 为空（推演月数=%s）", months_count)
+        raise SandboxAdviceError("parse", "AI 没有返回有效点评，请重试")
+
+    content = content.strip()
+    if len(content) > SANDBOX_ADVICE_MAX_CHARS:
+        content = content[:SANDBOX_ADVICE_MAX_CHARS] + "…"
+    logger.info("沙盘顾问生成成功（推演月数=%s，字数=%d）", months_count, len(content))
+    return content

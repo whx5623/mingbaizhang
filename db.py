@@ -5524,3 +5524,162 @@ def project_latte_compound(daily_amount, annual_rate: float = 0.05,
             "interest": _money_to_float(Decimal(str(fv)) - Decimal(str(p))),
         })
     return results
+
+
+# ===========================================================================
+# 财务沙盘推演（未来 N 个月余额走势）
+# ---------------------------------------------------------------------------
+# 本段只**追加**：不改动上面任何既有函数、常量与取数口径。
+# 分工：
+#   · simulate_sandbox(...)  纯函数：不碰 DB、不读全局状态、不读本月已花金额，
+#                            只做「每月净变化」的加减推演（可直接单测）；
+# 依赖的既有件（全部在文件上方已定义，这里不重新实现）：
+#   _normalize_forecast_today（today 收敛成 date）/ _money_to_float（两位小数）
+#   / _liability_month_shift（月份序号平移）/ _liability_month_key（"YYYY-MM"）。
+# ===========================================================================
+
+SANDBOX_MONTHS_MIN = 1
+SANDBOX_MONTHS_MAX = 24
+
+
+def _normalize_sandbox_amount(value, label: str, *, allow_negative: bool = False) -> float:
+    """把沙盘的四个金额收敛成「有限」的 float；基线 / 额外 / 削减还要求 ≥ 0。
+
+    与 _normalize_forecast_amount 的唯一区别：initial_balance 允许为负
+    （负值表示**已经**透支，这是真实状态而不是非法输入），其余三个金额
+    （基线月支出 / 额外支出 / 削减支出）仍必须 ≥ 0 —— 负的"基线支出"会让
+    净变化方向整体反过来，属于调用方 bug，不静默接受。
+    拒绝顺序：① bool（True == 1.0 会把"开关"静默当成金额）；
+             ② 数字串 / bytes（不静默 float("100")，类型错就是错）；
+             ③ 不能转 float（None / 容器）；
+             ④ nan / inf（会污染整条余额曲线）；
+             ⑤ 不允许负时传负数。
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{label}非法：{value!r}（不是数字）")
+    if isinstance(value, (str, bytes)):
+        # 与 _normalize_forecast_amount 的差别：沙盘是**金额参数**而非表单回填，
+        # "100" 这种数字串一旦被 float() 接受，就把"类型写错"伪装成"写对"。
+        raise ValueError(f"{label}非法：{value!r}（不是数字）")
+    try:
+        amount = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label}非法：{value!r}（不是数字）") from exc
+    if not math.isfinite(amount):
+        raise ValueError(f"{label}非法：{value!r}（必须是有限数字，不允许 nan/inf）")
+    if amount < 0 and not allow_negative:
+        raise ValueError(f"{label}不能为负数：{value!r}")
+    return amount
+
+
+def _normalize_sandbox_months(months) -> int:
+    """推演月数必须是 1~24 的 int（bool / float / 字符串一律拒绝，不静默截断）。
+
+    不静默转换的理由与 _normalize_forecast_days 同口径：``int(2.5)`` 截断成 2
+    会把"写错区间"伪装成"写对区间"；上界 24 对应"最多看两年"的产品口径，
+    months=0 则推演结果为空、min() 直接报错。
+    """
+    if isinstance(months, bool) or not isinstance(months, int):
+        raise ValueError(f"months 必须是 1~{SANDBOX_MONTHS_MAX} 的整数：{months!r}")
+    if not SANDBOX_MONTHS_MIN <= months <= SANDBOX_MONTHS_MAX:
+        raise ValueError(f"months 必须是 1~{SANDBOX_MONTHS_MAX} 的整数：{months!r}")
+    return months
+
+
+def simulate_sandbox(initial_balance, monthly_base_expense,
+                     extra_expense=0.0, cut_expense=0.0,
+                     months: int = 6, today=None) -> dict:
+    """模拟「按当前收支节奏，未来 N 个月每个月末还能剩多少钱」：纯函数，不碰 DB。
+
+    基线月支出由调用方决定（预算或日均×30），本函数只做加减推演：
+    它不读本月已花金额、不读预算表、也不关心钱花在哪一类，只回答
+    "每月固定净变化 net_change 连续作用 N 个月，余额曲线长什么样"。
+
+    模型（每月月末结算；月份从今天所在月的**下一个月**开始，共 months 个）
+    ---------------------------------------------------------------------
+      net_change = cut_expense - extra_expense - monthly_base_expense
+      balance_i  = balance_{i-1} + net_change          （i = 1..months）
+      balance_0  = initial_balance
+
+    参数
+    ----
+    initial_balance     : 起始余额（允许为负：负值表示**已经**透支）。
+    monthly_base_expense: 每月基线支出（预算，或日均×30；≥ 0）。
+    extra_expense       : 每月额外支出（≥ 0，默认 0）。
+    cut_expense         : 每月削减掉的支出（≥ 0，默认 0）。
+    months              : 推演月数，1~24 的 int（bool / float / 字符串拒绝）。
+    today               : date / datetime / "YYYY-MM-DD"；None → 今天。
+                          复用 _normalize_forecast_today，**只**用于确定月份标签起点。
+
+    返回（逐字固定，前端按 key 取，顺序无关）
+    ----------------------------------------
+      months        : [{"month": "YYYY-MM", "balance": float,
+                        "net_change": float, "below_zero": bool}, ...]
+      broke_month   : 第一次 balance < 0（**严格小于 0**）的月份，没有则 None
+      broke_index   : 对应的第几个月（1-based），没有则 None
+      min_balance   : 各月月末余额的最小值（只统计推演出的月份，不含初始余额）
+      final_balance : 最后一个月月末余额
+      initial_balance / monthly_base_expense / extra_expense / cut_expense
+                    : 定量到两位小数后的入参回显
+      months_count  : 推演月数 months
+
+    口径与边界
+    ----------
+    · 金额全部 round2（_money_to_float，ROUND_HALF_UP）：net_change 先定量，
+      之后每个月的 balance 都基于**已定量**的上月余额相加，所以返回字典里
+      "本月余额 - 上月余额 == net_change" 严格成立，前端再算也不会差一分钱；
+    · 余额 0 不算破产（严格 < 0 才是 broke），"刚好月光"不会被误报；
+    · 初始余额已经 < 0、且第 1 个月仍然 < 0 → broke_index=1、broke_month=第 1 个月；
+    · net_change 为正（削减 > 基线 + 额外）→ 余额逐月上升，broke_month=None；
+    · months=1 正常推演一个月；非法入参在计算任何字段之前抛 ValueError，
+      绝不返回"半个结果"。
+    """
+    initial = _normalize_sandbox_amount(
+        initial_balance, "初始结余 initial_balance", allow_negative=True
+    )
+    base = _normalize_sandbox_amount(
+        monthly_base_expense, "每月基线支出 monthly_base_expense"
+    )
+    extra = _normalize_sandbox_amount(extra_expense, "额外支出 extra_expense")
+    cut = _normalize_sandbox_amount(cut_expense, "削减支出 cut_expense")
+    count = _normalize_sandbox_months(months)
+    start = _normalize_forecast_today(today)
+
+    # 入参与净变化先定量：后面每月都用"已定量"的值相加，展示值自洽。
+    initial = _money_to_float(initial)
+    base = _money_to_float(base)
+    extra = _money_to_float(extra)
+    cut = _money_to_float(cut)
+    net_change = _money_to_float(cut - extra - base)
+
+    balance = initial
+    month_rows: list[dict] = []
+    broke_month = None
+    broke_index = None
+    for index in range(1, count + 1):
+        month_day = _liability_month_shift(start, index)
+        balance = _money_to_float(balance + net_change)
+        below_zero = balance < 0
+        month_rows.append({
+            "month": _liability_month_key(month_day),
+            "balance": balance,
+            "net_change": net_change,
+            "below_zero": below_zero,
+        })
+        # 只记**第一次**跌破 0 的月份；之后再怎么跌也不覆盖。
+        if below_zero and broke_month is None:
+            broke_month = month_rows[-1]["month"]
+            broke_index = index
+
+    return {
+        "months": month_rows,
+        "broke_month": broke_month,
+        "broke_index": broke_index,
+        "min_balance": min(row["balance"] for row in month_rows),
+        "final_balance": month_rows[-1]["balance"],
+        "initial_balance": initial,
+        "monthly_base_expense": base,
+        "extra_expense": extra,
+        "cut_expense": cut,
+        "months_count": count,
+    }
