@@ -5683,3 +5683,157 @@ def simulate_sandbox(initial_balance, monthly_base_expense,
         "cut_expense": cut,
         "months_count": count,
     }
+
+
+# ===========================================================================
+# 财务沙盘推演 · 多情景对比（保守 / 现行 / 激进）
+# ---------------------------------------------------------------------------
+# 只换「每月基线支出」，逐档复用 simulate_sandbox，不复制任何算法：
+#   · 保守 = 基线 × 0.8（消费习惯收紧 20%）
+#   · 现行 = 基线 × 1.0（与单线推演逐分钱一致）
+#   · 激进 = 基线 × 1.2（消费习惯放松 20%）
+# 额外支出 / 削减支出三档共用：它们是用户主动加的「计划修正」，
+# 不是消费习惯本身，所以不跟着 ±20% 一起缩放。
+# ===========================================================================
+
+SANDBOX_SCENARIO_SPECS = (
+    ("conservative", "保守消费（省20%）", 0.8),
+    ("current", "现行消费", 1.0),
+    ("aggressive", "激进消费（多花20%）", 1.2),
+)
+
+
+def _normalize_sandbox_ratio(value, label: str) -> float:
+    """情景系数必须是 > 0 的有限 float（bool / 数字串 / nan / inf / 0 一律拒绝）。"""
+    if isinstance(value, bool) or isinstance(value, (str, bytes)):
+        raise ValueError(f"{label}非法：{value!r}（不是数字）")
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label}非法：{value!r}（不是数字）") from exc
+    if not math.isfinite(ratio) or ratio <= 0:
+        raise ValueError(f"{label}必须是大于 0 的有限数字：{value!r}")
+    return ratio
+
+
+def _normalize_sandbox_specs(specs):
+    """把情景定义收敛成 ((key, label, ratio), ...)，且必须恰好有一个 key='current'。
+
+    拒绝：不是序列 / 条目不是三元组 / key 或 label 为空 / key 重复 /
+    系数非法 / 没有 current（前端要靠它取主指标与 0 元参考线）。
+    """
+    if specs is None:
+        specs = SANDBOX_SCENARIO_SPECS
+    if isinstance(specs, (str, bytes)) or not isinstance(specs, (list, tuple)):
+        raise ValueError(f"specs 必须是 (key, label, ratio) 序列：{specs!r}")
+    if not specs:
+        raise ValueError("specs 不能为空：至少要有一档情景")
+
+    normalized = []
+    seen = set()
+    for item in specs:
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            raise ValueError(f"specs 的每一项必须是 (key, label, ratio)：{item!r}")
+        key, label, ratio = item
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError(f"情景 key 必须是非空字符串：{key!r}")
+        key = key.strip()
+        if key in seen:
+            raise ValueError(f"情景 key 重复：{key!r}")
+        seen.add(key)
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError(f"情景 label 必须是非空字符串：{label!r}")
+        normalized.append(
+            (key, label.strip(), _normalize_sandbox_ratio(ratio, f"情景 {key} 的系数"))
+        )
+    if "current" not in seen:
+        raise ValueError("specs 必须包含 key='current' 的现行情景")
+    return tuple(normalized)
+
+
+def simulate_sandbox_scenarios(initial_balance, monthly_base_expense,
+                               extra_expense=0.0, cut_expense=0.0,
+                               months: int = 6, today=None, specs=None) -> dict:
+    """在同一组 today / months 上并行推演三档消费习惯，返回可直接喂给图表的结构。
+
+    口径
+    ----
+    · 每档只改「每月基线支出」：base × ratio（先定量到两位小数再推演），
+      初始结余 / 额外支出 / 削减支出三档共用；
+    · 本函数不复制算法，逐档调用 simulate_sandbox，因此「现行」一档与直接调用
+      simulate_sandbox(initial, base, extra, cut, months, today) **逐分钱相等**；
+    · 非法入参在推演任何一档之前抛 ValueError（金额 / months / today 由
+      simulate_sandbox 校验，specs 与 ratio 由本函数校验）。
+
+    参数
+    ----
+    initial_balance / monthly_base_expense / extra_expense / cut_expense :
+        同 simulate_sandbox；monthly_base_expense 是「现行档」的基线。
+    months : 1~24 的 int，三档共用。
+    today  : date / datetime / "YYYY-MM-DD"，只决定月份标签起点。
+    specs  : 自定义 ((key, label, ratio), ...)；None → SANDBOX_SCENARIO_SPECS。
+
+    返回（逐字固定，前端按 key 取）
+    --------------------------------
+      months        : ["YYYY-MM", ...] 三档共享的 x 轴标签（长度 = months）
+      months_count  : 推演月数
+      initial_balance / extra_expense / cut_expense : 定量后的公共入参回显
+      scenarios     : [{"key", "label", "ratio", "monthly_base_expense",
+                        "months": [{...}], "broke_month", "broke_index",
+                        "min_balance", "final_balance", "months_count"}, ...]
+                      顺序与 specs 一致
+      current       : scenarios 中 key="current" 的那一项（同一对象，不是副本）
+    """
+    normalized = _normalize_sandbox_specs(specs)
+    # 先校验并定量基线：基线是数字串 / None 时要在乘法之前就报错，
+    # 而不是让 "100" * 0.8 抛 TypeError。
+    base = _money_to_float(
+        _normalize_sandbox_amount(
+            monthly_base_expense, "每月基线支出 monthly_base_expense"
+        )
+    )
+    initial = _money_to_float(
+        _normalize_sandbox_amount(
+            initial_balance, "初始结余 initial_balance", allow_negative=True
+        )
+    )
+    extra = _money_to_float(
+        _normalize_sandbox_amount(extra_expense, "额外支出 extra_expense")
+    )
+    cut = _money_to_float(
+        _normalize_sandbox_amount(cut_expense, "削减支出 cut_expense")
+    )
+
+    scenarios = []
+    for key, label, ratio in normalized:
+        result = simulate_sandbox(
+            initial,
+            _money_to_float(base * ratio),
+            extra_expense=extra,
+            cut_expense=cut,
+            months=months,
+            today=today,
+        )
+        scenarios.append({
+            "key": key,
+            "label": label,
+            "ratio": ratio,
+            "monthly_base_expense": result["monthly_base_expense"],
+            "months": result["months"],
+            "months_count": result["months_count"],
+            "broke_month": result["broke_month"],
+            "broke_index": result["broke_index"],
+            "min_balance": result["min_balance"],
+            "final_balance": result["final_balance"],
+        })
+
+    current = next(item for item in scenarios if item["key"] == "current")
+    return {
+        "months": [row["month"] for row in current["months"]],
+        "months_count": current["months_count"],
+        "initial_balance": initial,
+        "extra_expense": extra,
+        "cut_expense": cut,
+        "scenarios": scenarios,
+        "current": current,
+    }

@@ -3131,7 +3131,7 @@ def generate_latte_roast(stats: dict, api_key: str) -> str:
 
 
 # ============================================================================
-# 财务沙盘顾问（DeepSeek Chat，把 6 个月推演结果点评成一段话）
+# 财务沙盘顾问（DeepSeek Chat，把 N 个月推演结果点评成一段话）
 # ----------------------------------------------------------------------------
 # 与「月度复盘」的区别：输入不是原始账单，而是 db.simulate_sandbox 的推演结果，
 # 所以文案重点是"第 X 个月面临破产"与"立刻能做的削减"，而不是解释钱花在哪。
@@ -3140,10 +3140,26 @@ def generate_latte_roast(stats: dict, api_key: str) -> str:
 #   · 日志只记月数、字数、状态码与异常类型，**绝不**记 api_key 或金额明细。
 # ============================================================================
 
-# 系统提示词必须**逐字**保持（产品口径）。
-SANDBOX_ADVICE_SYSTEM_PROMPT = (
-    "你是一个懂大学生、说话犀利但给出可执行方案的理财教练。请根据我的 6 个月财务沙盘推演结果，用不超过 60 字写一段总结点评：如果推演中某个月结余会跌破 0，必须点明“第 X 个月面临破产”并给 1~2 条立刻能做的削减建议；如果没有破产，就说明 6 个月后还能剩下多少钱并鼓励一句。不要寒暄、不要分点、不要解释，直接输出一段话。"
+# 系统提示词模板：{months} 由调用方按实际推演月数填充。
+# 6 个月时渲染结果与旧文案逐字一致（产品口径不变），其它月数只替换两处「N 个月」。
+_SANDBOX_ADVICE_SYSTEM_PROMPT_TEMPLATE = (
+    "你是一个懂大学生、说话犀利但给出可执行方案的理财教练。请根据我的 {months} 个月财务沙盘推演结果，用不超过 60 字写一段总结点评：如果推演中某个月结余会跌破 0，必须点明“第 X 个月面临破产”并给 1~2 条立刻能做的削减建议；如果没有破产，就说明 {months} 个月后还能剩下多少钱并鼓励一句。不要寒暄、不要分点、不要解释，直接输出一段话。"
 )
+
+# 向后兼容：模块级常量仍是「6 个月」成品文案（逐字保持，供旧调用与断言使用）。
+SANDBOX_ADVICE_SYSTEM_PROMPT = _SANDBOX_ADVICE_SYSTEM_PROMPT_TEMPLATE.format(months=6)
+
+
+def _build_sandbox_advice_system_prompt(months_count) -> str:
+    """按实际推演月数渲染系统提示词；月数非法（非数字 / < 1）时回落到 6。"""
+    try:
+        months = int(months_count)
+    except (TypeError, ValueError):
+        months = 6
+    if months < 1:
+        months = 6
+    return _SANDBOX_ADVICE_SYSTEM_PROMPT_TEMPLATE.format(months=months)
+
 
 SANDBOX_ADVICE_MODEL = "deepseek-chat"
 SANDBOX_ADVICE_TEMPERATURE = 0.7  # 0.7：点评要犀利但不能跑题成段子
@@ -3265,7 +3281,10 @@ def _build_sandbox_advice_user_content(stats: dict) -> str:
 
 
 def generate_sandbox_advice(stats: dict, api_key: str) -> str:
-    """根据 6 个月财务沙盘推演结果生成一段不超过 60 字的总结点评（strip 后文本）。
+    """根据财务沙盘推演结果生成一段不超过 60 字的总结点评（strip 后文本）。
+
+    点评口径按 stats 里的实际月数走（1~24 个月都支持）：系统提示词中的
+    「N 个月」由 _build_sandbox_advice_system_prompt 填入，6 个月时与旧文案逐字一致。
 
     stats 约定（缺失字段按"无 / 0"处理，绝不 KeyError）：
         {"initial_balance": 1500.0, "extra_expense": 300.0, "cut_expense": 0.0,
@@ -3306,10 +3325,11 @@ def generate_sandbox_advice(stats: dict, api_key: str) -> str:
     months_count = len(entries)
 
     user_content = _build_sandbox_advice_user_content(stats)
+    system_prompt = _build_sandbox_advice_system_prompt(months_count)
     payload = {
         "model": SANDBOX_ADVICE_MODEL,
         "messages": [
-            {"role": "system", "content": SANDBOX_ADVICE_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
         "temperature": SANDBOX_ADVICE_TEMPERATURE,

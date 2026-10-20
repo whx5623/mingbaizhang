@@ -86,6 +86,17 @@ except ImportError as _poster_import_exc:
         f"{type(_poster_import_exc).__name__}: {_poster_import_exc}"
     )
 
+# 沙盘多情景折线图（纯函数拼 ECharts option）：缺失只让图表降级成一行提示，
+# 推演结果与指标卡仍然展示，绝不红屏。
+try:
+    from sandbox_chart import build_sandbox_option
+except ImportError as _sandbox_chart_import_exc:
+    build_sandbox_option = None
+    print(
+        f"[sandbox] 折线图模块不可用："
+        f"{type(_sandbox_chart_import_exc).__name__}: {_sandbox_chart_import_exc}"
+    )
+
 
 class _ChartInsightFallbackError(Exception):
     """ai_agent.ChartInsightError 尚未合入时的占位异常（保证 except 子句可用）。"""
@@ -762,13 +773,23 @@ def _get_sandbox_advice_fn():
 
 
 def _sandbox_fallback_advice(result: dict) -> str:
-    """AI 不可用时的本地沙盘点评（不依赖 API，也不改变推演结果）。"""
+    """AI 不可用时的本地沙盘点评（不依赖 API，也不改变推演结果）。
+
+    月数取 result["months_count"]（滑块 1~24 都支持），缺失 / 非法时回落 6 ——
+    否则用户推演 12 个月，兜底文案却说"6 个月后"，等于给了个假结论。
+    """
     try:
         broke_index = result.get("broke_index")
         min_balance = float(result.get("min_balance") or 0.0)
     except (TypeError, ValueError):
         broke_index = None
         min_balance = 0.0
+    try:
+        months_count = int(result.get("months_count") or 6)
+    except (TypeError, ValueError):
+        months_count = 6
+    if months_count < 1:
+        months_count = 6
     if result.get("broke_month"):
         month_text = broke_index if broke_index is not None else "?"
         return (
@@ -780,7 +801,7 @@ def _sandbox_fallback_advice(result: dict) -> str:
     except (TypeError, ValueError):
         final_balance = 0.0
     return (
-        f"按此计划，6 个月后你还会有 ¥{final_balance:.0f} 结余，继续保持。"
+        f"按此计划，{months_count} 个月后你还会有 ¥{final_balance:.0f} 结余，继续保持。"
     )
 
 
@@ -3623,11 +3644,23 @@ with tab_tools:
                 st.caption(f"当前积分：{_challenge_points_now} 分")
 
     # ---- 🧪 财务沙盘推演（放在「我的挑战」之后，Tab2 最后一张卡片）----
-    # 推演后端 db.simulate_sandbox / ai_agent.generate_sandbox_advice 由并行方提供：
-    # 缺失 / 异常只在卡片内降级，绝不红屏。
+    # 推演后端 db.simulate_sandbox_scenarios / ai_agent.generate_sandbox_advice、
+    # 折线图 option（sandbox_chart）任一缺失 / 异常都只在卡片内降级，绝不红屏。
     with st.container(border=True, key="card_sandbox"):
         st.subheader("🧪 财务沙盘推演")
-        st.caption("假设未来的收支变化，推演接下来 6 个月的结余走势")
+        _sandbox_months = st.slider(
+            "推演月数（月）",
+            min_value=1,
+            max_value=24,
+            value=6,
+            step=1,
+            key="sandbox_months",
+            help="1~24 个月自由拖拽；月份从下个月开始算",
+        )
+        st.caption(
+            f"假设未来的收支变化，推演接下来 {_sandbox_months} 个月的结余走势："
+            "保守消费省 20%、现行消费不变、激进消费多花 20%"
+        )
 
         try:
             _sandbox_col_extra, _sandbox_col_cut = st.columns(2)
@@ -3649,7 +3682,7 @@ with tab_tools:
                 )
 
             if st.button(
-                "📊 推演未来 6 个月",
+                f"📊 推演未来 {_sandbox_months} 个月",
                 key="sandbox_run",
                 use_container_width=True,
             ):
@@ -3683,28 +3716,40 @@ with tab_tools:
                         if _sandbox_budget > 0
                         else _sandbox_daily_avg * 30.0
                     )
-                    _sandbox_simulate_fn = getattr(
-                        db, "simulate_sandbox", None
+                    _sandbox_scenarios_fn = getattr(
+                        db, "simulate_sandbox_scenarios", None
                     )
-                    if not callable(_sandbox_simulate_fn):
-                        print("[sandbox] db.simulate_sandbox 不可用")
+                    if not callable(_sandbox_scenarios_fn):
+                        print("[sandbox] db.simulate_sandbox_scenarios 不可用")
                         st.error("推演失败，请稍后再试")
                     else:
                         try:
-                            with st.spinner("正在推演未来 6 个月…"):
-                                _sandbox_result = _sandbox_simulate_fn(
+                            with st.spinner(
+                                f"正在推演未来 {_sandbox_months} 个月的三种情景…"
+                            ):
+                                _sandbox_scenarios = _sandbox_scenarios_fn(
                                     _sandbox_balance,
                                     _sandbox_monthly_base,
                                     extra_expense=float(_sandbox_extra),
                                     cut_expense=float(_sandbox_cut),
-                                    months=6,
+                                    months=int(_sandbox_months),
                                     today=_sandbox_today,
                                 )
-                            if not isinstance(_sandbox_result, dict) or not isinstance(
-                                _sandbox_result.get("months"), list
+                            if (
+                                not isinstance(_sandbox_scenarios, dict)
+                                or not isinstance(
+                                    _sandbox_scenarios.get("scenarios"), list
+                                )
+                                or not _sandbox_scenarios["scenarios"]
+                                or not isinstance(
+                                    _sandbox_scenarios.get("current"), dict
+                                )
+                                or not isinstance(
+                                    _sandbox_scenarios.get("months"), list
+                                )
                             ):
                                 raise ValueError(
-                                    "simulate_sandbox 返回结构不合规"
+                                    "simulate_sandbox_scenarios 返回结构不合规"
                                 )
                         except Exception as _sandbox_sim_exc:
                             print(
@@ -3712,121 +3757,89 @@ with tab_tools:
                                 f"{type(_sandbox_sim_exc).__name__}: "
                                 f"{_sandbox_sim_exc}"
                             )
-                            st.session_state.pop("sandbox_result", None)
+                            st.session_state.pop("sandbox_result_v2", None)
                             st.error("推演失败，请稍后再试")
                         else:
                             # 结果持久化：按钮只在点击那一次为 True，rerun 后靠 session 继续展示。
-                            st.session_state["sandbox_result"] = {
+                            st.session_state["sandbox_result_v2"] = {
                                 "input": {
                                     "initial_balance": _sandbox_balance,
                                     "monthly_base_expense": _sandbox_monthly_base,
                                     "extra_expense": float(_sandbox_extra),
                                     "cut_expense": float(_sandbox_cut),
-                                    "months": 6,
+                                    "months": int(_sandbox_months),
                                     "today": str(_sandbox_today),
                                 },
-                                "result": _sandbox_result,
+                                "scenarios": _sandbox_scenarios,
                             }
 
             # ---- 渲染推演结果：独立于按钮，rerun 后仍在 ----
-            _sandbox_saved = st.session_state.get("sandbox_result")
+            _sandbox_saved = st.session_state.get("sandbox_result_v2")
             if (
                 isinstance(_sandbox_saved, dict)
-                and isinstance(_sandbox_saved.get("result"), dict)
+                and isinstance(_sandbox_saved.get("scenarios"), dict)
                 and isinstance(
-                    _sandbox_saved["result"].get("months"), list
+                    _sandbox_saved["scenarios"].get("scenarios"), list
                 )
+                and isinstance(_sandbox_saved["scenarios"].get("current"), dict)
             ):
                 try:
-                    _sandbox_result = _sandbox_saved["result"]
+                    _sandbox_chart_data = _sandbox_saved["scenarios"]
                     _sandbox_input = _sandbox_saved.get("input")
                     if not isinstance(_sandbox_input, dict):
                         _sandbox_input = {}
+                    _sandbox_current = _sandbox_chart_data["current"]
+                    _sandbox_months_count = int(
+                        _sandbox_chart_data.get("months_count")
+                        or len(_sandbox_chart_data.get("months") or [])
+                        or 6
+                    )
 
-                    _months = [
-                        str(_month_row.get("month"))
-                        for _month_row in _sandbox_result["months"]
-                    ]
-                    _points = [
-                        {
-                            "value": _month_row.get("balance"),
-                            "itemStyle": {
-                                "color": (
-                                    "#EF4444"
-                                    if float(_month_row.get("balance") or 0.0) < 0
-                                    else "#1E88E5"
-                                )
-                            },
-                        }
-                        for _month_row in _sandbox_result["months"]
-                    ]
-                    _opt = {
-                        "tooltip": {"trigger": "axis"},
-                        "grid": {
-                            "left": "3%",
-                            "right": "4%",
-                            "bottom": "3%",
-                            "top": "12%",
-                            "containLabel": True,
-                        },
-                        "xAxis": {
-                            "type": "category",
-                            "data": _months,
-                            "axisLabel": {"color": "#6B7280"},
-                        },
-                        "yAxis": {
-                            "type": "value",
-                            "name": "结余（元）",
-                            "splitLine": {
-                                "lineStyle": {"color": "#F1F5F9"}
-                            },
-                        },
-                        "series": [
-                            {
-                                "type": "line",
-                                "smooth": True,
-                                "symbolSize": 9,
-                                "lineStyle": {
-                                    "width": 3,
-                                    "color": "#1E88E5",
-                                },
-                                "areaStyle": {
-                                    "opacity": 0.12,
-                                    "color": "#93C5FD",
-                                },
-                                "markLine": {
-                                    "silent": True,
-                                    "symbol": "none",
-                                    "lineStyle": {
-                                        "color": "#EF4444",
-                                        "type": "dashed",
-                                    },
-                                    "data": [
-                                        {
-                                            "yAxis": 0,
-                                            "label": {"formatter": "0 元"},
-                                        }
-                                    ],
-                                },
-                                "data": _points,
-                            }
-                        ],
-                    }
-                    st_echarts(_opt, height="300px")
+                    # 滑块 / 输入框改过但没点按钮：明确提示「下面是旧结果」，
+                    # 否则用户拖完滑块会误以为图已经变了（图上的月份其实是上一次的）。
+                    try:
+                        _sandbox_input_extra = float(
+                            _sandbox_input.get("extra_expense")
+                        )
+                        _sandbox_input_cut = float(
+                            _sandbox_input.get("cut_expense")
+                        )
+                    except (TypeError, ValueError):
+                        _sandbox_input_extra = float(_sandbox_extra)
+                        _sandbox_input_cut = float(_sandbox_cut)
+                    if (
+                        _sandbox_months_count != int(_sandbox_months)
+                        or _sandbox_input_extra != float(_sandbox_extra)
+                        or _sandbox_input_cut != float(_sandbox_cut)
+                    ):
+                        st.caption(
+                            "⚠️ 参数已变更，下方仍是上一次推演的结果，"
+                            "点「推演」按钮更新"
+                        )
 
-                    _sandbox_broke_month = _sandbox_result.get("broke_month")
+                    # ---- 三条情景折线（tooltip 金额带 ¥，0 元参考线）----
+                    if build_sandbox_option is None:
+                        st.caption("折线图模块暂不可用，下方指标仍然有效")
+                    else:
+                        st_echarts(
+                            build_sandbox_option(_sandbox_chart_data),
+                            height="340px",
+                        )
+
+                    # 破产提示只看「现行」一档：那才是用户当前真实的消费节奏。
+                    _sandbox_broke_month = _sandbox_current.get("broke_month")
                     if _sandbox_broke_month:
                         st.error(
-                            f"⚠️ 第 {_sandbox_result.get('broke_index')} 个月"
+                            f"⚠️ 现行消费下，第 {_sandbox_current.get('broke_index')} 个月"
                             f"（{_sandbox_broke_month}）结余将跌破 0，"
                             "请提前调整计划！"
                         )
                     else:
                         _sandbox_final_balance = float(
-                            _sandbox_result.get("final_balance") or 0.0
+                            _sandbox_current.get("final_balance") or 0.0
                         )
                         st.success(
-                            f"✅ 按此计划，6 个月后仍有结余 "
+                            f"✅ 按现行消费，{_sandbox_months_count} 个月后仍有结余 "
                             f"¥{_sandbox_final_balance:.2f}"
                         )
 
@@ -3835,13 +3848,13 @@ with tab_tools:
                     )
                     with _sandbox_metric1:
                         st.metric(
-                            "6 个月后结余",
-                            f"¥{float(_sandbox_result.get('final_balance') or 0.0):.2f}",
+                            f"{_sandbox_months_count} 个月后结余",
+                            f"¥{float(_sandbox_current.get('final_balance') or 0.0):.2f}",
                         )
                     with _sandbox_metric2:
                         st.metric(
                             "最低结余",
-                            f"¥{float(_sandbox_result.get('min_balance') or 0.0):.2f}",
+                            f"¥{float(_sandbox_current.get('min_balance') or 0.0):.2f}",
                         )
                     with _sandbox_metric3:
                         st.metric(
@@ -3849,52 +3862,67 @@ with tab_tools:
                             str(_sandbox_broke_month or "不会破产"),
                         )
 
+                    # 三档期末结余横向对比：图看走势，这行看落点。
+                    _sandbox_final_parts = []
+                    for _scenario in _sandbox_chart_data["scenarios"]:
+                        if not isinstance(_scenario, dict):
+                            continue
+                        _sandbox_final_parts.append(
+                            f"{_scenario.get('label') or _scenario.get('key')} "
+                            f"¥{float(_scenario.get('final_balance') or 0.0):.2f}"
+                        )
+                    if _sandbox_final_parts:
+                        st.caption(
+                            f"推演 {_sandbox_months_count} 个月后的期末结余："
+                            + " ｜ ".join(_sandbox_final_parts)
+                        )
+
                     # ---- AI 沙盘顾问：命中进程缓存不调 API、不扣额度 ----
+                    # 点评对象是「现行」档（stats 里就是现行逐月余额），
+                    # 月数按月滑块走，系统提示词由 ai_agent 按实际月数渲染。
                     _sandbox_stats = {
                         "input": dict(_sandbox_input),
-                        "result": _sandbox_result,
+                        "result": _sandbox_current,
                         "initial_balance": float(
                             _sandbox_input.get(
                                 "initial_balance",
-                                _sandbox_result.get("initial_balance") or 0.0,
+                                _sandbox_chart_data.get("initial_balance") or 0.0,
                             )
                         ),
                         "monthly_base_expense": float(
                             _sandbox_input.get(
                                 "monthly_base_expense",
-                                _sandbox_result.get("monthly_base_expense")
+                                _sandbox_current.get("monthly_base_expense")
                                 or 0.0,
                             )
                         ),
                         "extra_expense": float(
                             _sandbox_input.get(
                                 "extra_expense",
-                                _sandbox_result.get("extra_expense") or 0.0,
+                                _sandbox_chart_data.get("extra_expense") or 0.0,
                             )
                         ),
                         "cut_expense": float(
                             _sandbox_input.get(
                                 "cut_expense",
-                                _sandbox_result.get("cut_expense") or 0.0,
+                                _sandbox_chart_data.get("cut_expense") or 0.0,
                             )
                         ),
-                        "months_count": int(
-                            _sandbox_result.get("months_count") or 6
-                        ),
-                        "broke_month": _sandbox_result.get("broke_month"),
-                        "broke_index": _sandbox_result.get("broke_index"),
+                        "months_count": _sandbox_months_count,
+                        "broke_month": _sandbox_current.get("broke_month"),
+                        "broke_index": _sandbox_current.get("broke_index"),
                         "min_balance": float(
-                            _sandbox_result.get("min_balance") or 0.0
+                            _sandbox_current.get("min_balance") or 0.0
                         ),
                         "final_balance": float(
-                            _sandbox_result.get("final_balance") or 0.0
+                            _sandbox_current.get("final_balance") or 0.0
                         ),
                         "months": [
                             {
                                 "month": _month_row.get("month"),
                                 "balance": _month_row.get("balance"),
                             }
-                            for _month_row in _sandbox_result["months"]
+                            for _month_row in (_sandbox_current.get("months") or [])
                         ],
                     }
                     _sandbox_cache_key = _sandbox_advice_key(_sandbox_stats)
@@ -3911,7 +3939,7 @@ with tab_tools:
                             _sandbox_entry = None
                         else:
                             _sandbox_fallback_text = _sandbox_fallback_advice(
-                                _sandbox_result
+                                _sandbox_current
                             )
                             _sandbox_advice_fn = _get_sandbox_advice_fn()
                             if _sandbox_advice_fn is None:
