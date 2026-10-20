@@ -5988,3 +5988,674 @@ def simulate_sandbox_scenarios(initial_balance, monthly_base_expense,
         "scenarios": scenarios,
         "current": current,
     }
+
+
+# ---------------------------------------------------------------------------
+# 同龄人财务基准 · 四维雷达（模块末尾新增 section，不依赖任何既有函数的行为）
+# ---------------------------------------------------------------------------
+# 设计口径
+# --------
+# · 四个维度固定为「消费克制力 / 饮食健康度 / 结余能力 / 理财意识」，与
+#   peer_chart.PEER_DIMENSIONS 逐字、逐序一致（两边任一改动必须同步）。
+# · 全部是**纯函数 + 一条只读 SQL**：页面拿到 Tab1 的 DataFrame 后直接算「我」，
+#   再单独取一次全站匿名均值；函数之间不共享状态，单测可直接断言。
+# · 金额一律走 _money_to_float（Decimal + ROUND_HALF_UP 定量），比率一律收敛到
+#   合理区间并保留 4 位小数：前端只做展示，不在展示层再兜底脏值。
+# · 「全站匿名均值」只吐聚合结果，**绝不吐 user_id / 单笔明细**；SQL 参数全部绑定，
+#   日期窗口用 [月初, 下月初) 与日报口径一致。
+# ---------------------------------------------------------------------------
+
+# 雷达图的四个维度。顺序即 ECharts radar.indicator 的顺序，也是 score_radar 的 key 顺序。
+RADAR_DIMENSIONS = ("消费克制力", "饮食健康度", "结余能力", "理财意识")
+
+# 少于 2 个人就不叫「对比」：页面据此提示样本不足，只展示自己的分数。
+PEER_MIN_USERS = 2
+
+# 迁移 012 未执行（bills.category 不存在）时的固定文案：页面会 try/except 接住并降级，
+# 所以这里只要保证是 RuntimeError + 中文、可读，不红屏。
+_PEER_CATEGORY_MISSING = "分类功能未启用：请先执行 migrations/012_bills_category.sql"
+
+# 参与「饮食习惯」计算的四个分类。餐饮 = 恩格尔系数近似；奶茶咖啡单独一档；
+# 娱乐 + 购物合并成「非必要消费」，用于消费克制力。
+_RADAR_PEER_CATEGORY_KEYS = ("餐饮", "奶茶咖啡", "购物", "娱乐")
+
+# 数据库连接串脱敏：异常文本里可能带着 postgresql+psycopg2://user:pass@host/db，
+# 而 get_peer_benchmark 的 RuntimeError 会一路冒到页面的 st.warning 里 —— 必须抹掉。
+# 只匹配「scheme://...」整段，替换成固定占位，既保留排错信息又不泄露凭据。
+_DB_URL_IN_TEXT = re.compile(r"(?i)\b[a-z][a-z0-9+.\-]*://[^\s'\"<>]+")
+
+
+def _radar_month_label(month: str) -> str:
+    """把 "YYYY-MM" 渲染成页面用的 "2026年10月"。
+
+    调用前必须已通过 _parse_report_month 校验，这里只做展示层拼接：
+    月份去前导零（10 月显示 "10"，1 月显示 "1"），与 app.py 既有文案一致。
+    """
+    return f"{int(month[:4])}年{int(month[5:7])}月"
+
+
+def _radar_normalize_today(today=None) -> date:
+    """把 today 收敛成 datetime.date：None → 北京时间今天；非法输入抛 ValueError。
+
+    datetime 是 date 的子类，必须先拦下来取 .date()，否则后续和 date 比较时
+    会带时分秒，把「当月/历史月」的判断弄出边界误差。
+    """
+    if today is None:
+        return _report_today()
+    if isinstance(today, datetime):
+        return today.date()
+    if isinstance(today, date):
+        return today
+    if isinstance(today, str):
+        raw = today.strip()
+        if _ISO_DATE_PATTERN.fullmatch(raw):
+            try:
+                return datetime.strptime(raw, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+        raise ValueError(f"today 必须是 date / datetime / YYYY-MM-DD：{today!r}")
+    raise ValueError(f"today 必须是 date / datetime / YYYY-MM-DD：{today!r}")
+
+
+def _radar_elapsed_days(month_start: date, month_end: date, today: date) -> int:
+    """已过天数：当月 → today.day；历史月份 → 整月天数；未来月份 → 0。
+
+    口径与 report_user_stats 完全一致（那边把 0 当「不做除法」的哨兵）。
+    这里保留 0 的语义，除法统一在 _peer_metrics_from_row 里按 1 兜底。
+    """
+    if month_start <= today < month_end:
+        return today.day
+    if today >= month_end:
+        return (month_end - month_start).days
+    return 0
+
+
+def _radar_decimal(value) -> Decimal:
+    """把任意金额收敛成 Decimal；脏值（None / 非数字 / NaN / inf）一律当 0，绝不抛错。
+
+    必须把非有限值也归 0：Decimal("NaN") 参与大小比较会抛 InvalidOperation，
+    一旦漏到后面的 `expense_dec > 0` 就会把整块模块炸掉。
+    """
+    try:
+        number = _as_decimal(value)
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal("0")
+    if not number.is_finite():
+        return Decimal("0")
+    return number
+
+
+def _radar_decimal_sum(values) -> Decimal:
+    """逐项累加金额（Decimal），单条脏值跳过，不影响其余行。"""
+    total = Decimal("0")
+    for value in values:
+        total += _radar_decimal(value)
+    return total
+
+
+def _radar_int(value) -> int:
+    """把计数收敛成非负整数；None / NaN / 非法值 → 0。"""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, number)
+
+
+def _radar_ratio(numerator, denominator) -> float:
+    """比率 = numerator / denominator，收敛到 [0, 1] 并保留 4 位小数。
+
+    分母 <= 0（支出为 0 / 本月还没开始）→ 0.0，不做除法；NaN / inf 同样归 0。
+    """
+    num = _radar_decimal(numerator)
+    den = _radar_decimal(denominator)
+    try:
+        if den <= 0:
+            return 0.0
+        value = float(num / den)
+    except (InvalidOperation, OverflowError, ValueError):
+        return 0.0
+    if not math.isfinite(value):
+        return 0.0
+    return round(max(0.0, min(1.0, value)), 4)
+
+
+def _radar_score_clamp(value) -> float:
+    """得分收敛到 [0, 100] 并保留 1 位小数；NaN / inf / 非数字 → 0.0。
+
+    score_radar 的每个维度都经过这里：页面渲染前不需要再防御脏值。
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(number):
+        return 0.0
+    return round(max(0.0, min(100.0, number)), 1)
+
+
+def _radar_metric_value(metrics, key: str) -> float:
+    """从 metrics 里安全取一个数值：不是 dict / 缺字段 / 脏值一律返回 0。
+
+    score_radar 的契约是「绝不 KeyError」—— 页面即使传了半成品 dict 也只是
+    该字段按 0 代入公式，而不是整块模块红屏。
+    """
+    if not isinstance(metrics, dict):
+        return 0.0
+    try:
+        number = float(metrics.get(key, 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(number):
+        return 0.0
+    return number
+
+
+def _peer_metrics_from_row(*, month, month_label, expense, income, bill_count,
+                           active_days, elapsed_days, category_totals=None) -> dict:
+    """由一组「已聚合」的原始数字算出雷达图需要的全部指标（唯一公式来源）。
+
+    compute_radar_metrics（DataFrame 口径）和 get_peer_benchmark（SQL 口径）都调用
+    本函数，公式只写一遍：两边的差异仅在「怎么把原始账单聚合成这几个数」。
+
+    参数
+    ----
+    month / month_label : 归一后的 "YYYY-MM" 与 "YYYY年M月" 展示文案。
+    expense / income    : 本月支出 / 收入合计（Decimal / float / str 均可）。
+    bill_count          : 本月有效账单笔数（收入 + 支出）。
+    active_days         : 本月有记账的自然日数（去重后的天数）。
+    elapsed_days        : 已过天数（当月 = 今天几号；历史月 = 整月；未来月 = 0）。
+    category_totals     : {"餐饮","奶茶咖啡","购物","娱乐"} → 金额；None 表示
+                          「没有 category 列」，此时三个占比一律 0.0。
+
+    返回
+    ----
+    逐字固定的 dict（key 与 app.py Tab1 的消费方约定一致）：
+        month, month_label, has_data, has_expense, expense, income, net,
+        bill_count, active_days, elapsed_days, daily_expense,
+        milk_tea_share, food_share, fun_share, saving_rate, record_ratio
+    金额保留两位小数；占比 / 记录率保留 4 位小数且在 [0, 1]；saving_rate 可为负。
+    """
+    expense_dec = _radar_decimal(expense)
+    income_dec = _radar_decimal(income)
+    expense_value = _money_to_float(expense_dec)
+    income_value = _money_to_float(income_dec)
+    net_dec = income_dec - expense_dec
+    net_value = _money_to_float(net_dec)
+
+    bill_count_value = _radar_int(bill_count)
+    active_days_value = _radar_int(active_days)
+    elapsed_days_value = _radar_int(elapsed_days)
+
+    # 未来月份 elapsed_days = 0：对外仍返回 0，只在除法处按 1 兜底，避免 ZeroDivisionError。
+    elapsed_for_division = elapsed_days_value if elapsed_days_value > 0 else 1
+    daily_expense = _money_to_float(expense_dec / Decimal(elapsed_for_division))
+
+    # 三个占比只在「有支出且分类可用」时才算；否则 0.0（页面此时会隐藏分类模块）。
+    milk_tea_share = 0.0
+    food_share = 0.0
+    fun_share = 0.0
+    if category_totals is not None and expense_dec > 0:
+        totals = {
+            name: _radar_decimal(category_totals.get(name, 0))
+            for name in _RADAR_PEER_CATEGORY_KEYS
+        }
+        milk_tea_share = _radar_ratio(totals["奶茶咖啡"], expense_dec)
+        food_share = _radar_ratio(totals["餐饮"], expense_dec)
+        fun_share = _radar_ratio(totals["购物"] + totals["娱乐"], expense_dec)
+
+    # 结余率：收入 > 0 时按 net / income 如实算（可为负、可超过 -1）；
+    # 收入 <= 0 时用哨兵值把「纯花钱」和「完全没数据」区分开：
+    #   有支出 → -1.0（结余能力最差），无支出 → 0.0（无数据，不奖不罚）。
+    if income_dec > 0:
+        try:
+            saving_value = float(net_dec / income_dec)
+        except (InvalidOperation, OverflowError, ValueError):
+            saving_value = 0.0
+        saving_rate = round(saving_value, 4) if math.isfinite(saving_value) else 0.0
+    elif expense_dec > 0:
+        saving_rate = -1.0
+    else:
+        saving_rate = 0.0
+
+    # 记录率：已过天数为 0（未来月份）时记 0，不做除法。
+    record_ratio = (
+        _radar_ratio(active_days_value, elapsed_days_value)
+        if elapsed_days_value > 0
+        else 0.0
+    )
+
+    return {
+        "month": month,
+        "month_label": month_label,
+        "has_data": bill_count_value > 0,
+        "has_expense": expense_dec > 0,
+        "expense": expense_value,
+        "income": income_value,
+        "net": net_value,
+        "bill_count": bill_count_value,
+        "active_days": active_days_value,
+        "elapsed_days": elapsed_days_value,
+        "daily_expense": daily_expense,
+        "milk_tea_share": milk_tea_share,
+        "food_share": food_share,
+        "fun_share": fun_share,
+        "saving_rate": saving_rate,
+        "record_ratio": record_ratio,
+    }
+
+
+def compute_radar_metrics(df, month: str, today=None) -> dict:
+    """统计某个月的雷达图原始指标（纯函数，不读库、不改 df）。
+
+    入参
+    ----
+    df    : app.py Tab1 已有的账单 DataFrame，列：date / date_parsed / merchant /
+            amount / type / category（category 列可能不存在）。
+    month : "YYYY-MM"，严格校验；非法直接 ValueError（复用 _parse_report_month）。
+    today : 默认北京时间今天；决定「已过天数」，测试可注入固定日期。
+
+    口径
+    ----
+    · 只统计 month 这一个月：[月初, 下月初)，与日报口径一致；
+    · 金额全部先用 _as_decimal 收敛再累加，最后 _money_to_float 定量到分；
+    · 脏数据逐行跳过：日期解析失败（NaT）或金额非数字的行**不进任何统计**；
+    · 空表 / 本月没有账单 / 没有日期列 → has_data=False，金额 / 占比 / 笔数全 0，
+      elapsed_days 仍按月份回显（它是「已过天数」，不是消费指标），不抛错；
+    · 没有 category 列 → milk_tea_share / food_share / fun_share 均为 0.0
+      （页面据此隐藏这个模块，不会把「分类没启用」误读成「习惯很好」）。
+
+    返回的 dict 逐字固定，见 _peer_metrics_from_row 的 docstring。
+    """
+    month_start, month_end = _parse_report_month(month)
+    month_text = month.strip()
+    month_label = _radar_month_label(month_text)
+    today_date = _radar_normalize_today(today)
+    elapsed_days = _radar_elapsed_days(month_start, month_end, today_date)
+
+    empty = _peer_metrics_from_row(
+        month=month_text,
+        month_label=month_label,
+        expense=0,
+        income=0,
+        bill_count=0,
+        active_days=0,
+        elapsed_days=elapsed_days,
+        category_totals=None,
+    )
+    if df is None or not hasattr(df, "columns") or len(df) == 0:
+        return empty
+
+    # 日期列：优先用 app.py 已经解析好的 date_parsed，没有就现场解析 date。
+    try:
+        if "date_parsed" in df.columns:
+            parsed = pd.to_datetime(df["date_parsed"], errors="coerce")
+            # date_parsed 整列都解析不出来（例如上游只给了 date）时退回到 date 列，
+            # 只在这一列**完全没有有效值**时兜底，避免把个别 NaT 脏行「复活」。
+            if not bool(parsed.notna().any()) and "date" in df.columns:
+                parsed = pd.to_datetime(df["date"], errors="coerce")
+        elif "date" in df.columns:
+            parsed = pd.to_datetime(df["date"], errors="coerce")
+        else:
+            return empty
+        # 带时区的 date_parsed（少见）先摘掉时区再和 naive 的月初/下月初比较，
+        # 否则 pandas 会直接抛「Cannot compare tz-naive and tz-aware」。
+        if getattr(parsed.dt, "tz", None) is not None:
+            parsed = parsed.dt.tz_localize(None)
+    except (TypeError, ValueError, AttributeError):
+        logging.getLogger(__name__).warning(
+            "[db] 雷达图：账单日期列解析失败，本月按「无数据」处理", exc_info=True
+        )
+        return empty
+
+    if "amount" not in df.columns:
+        return empty
+    try:
+        # errors="coerce"：非数字金额变 NaN，随后和坏日期一起被 valid 掩码剔除。
+        amounts = pd.to_numeric(df["amount"], errors="coerce").astype(float)
+    except (TypeError, ValueError):
+        return empty
+
+    # 月份边界用 Timestamp 比较：parsed 是 datetime64[ns]，两边必须同类型。
+    try:
+        in_month = (parsed >= pd.Timestamp(month_start)) & (parsed < pd.Timestamp(month_end))
+    except TypeError:
+        return empty
+    valid = parsed.notna() & amounts.notna() & in_month
+    if not bool(valid.any()):
+        return empty
+
+    work = df.loc[valid]
+    parsed = parsed.loc[valid]
+    amounts = amounts.loc[valid]
+
+    # type 列缺失 / 脏值：按「既不是收入也不是支出」处理（不计入两侧金额），
+    # 但仍是本月的一笔账单 → 参与 bill_count / active_days。
+    if "type" in work.columns:
+        types = work["type"].astype(str).str.strip()
+    else:
+        types = pd.Series("", index=work.index, dtype=object)
+    expense_mask = types == EXPENSE_TYPE
+    income_mask = types == INCOME_TYPE
+
+    expense_dec = _radar_decimal_sum(amounts[expense_mask])
+    income_dec = _radar_decimal_sum(amounts[income_mask])
+
+    try:
+        active_days = int(parsed.dt.normalize().nunique())
+    except (TypeError, ValueError):
+        active_days = 0
+
+    # 分类占比：只对支出行求和；列不存在 → None（三个 share 由 _peer_metrics_from_row 记 0）。
+    category_totals = None
+    if "category" in work.columns:
+        normalized_categories = work["category"].map(_normalize_category_value)
+        category_totals = {}
+        for name in _RADAR_PEER_CATEGORY_KEYS:
+            category_totals[name] = _radar_decimal_sum(
+                amounts[expense_mask & (normalized_categories == name)]
+            )
+
+    return _peer_metrics_from_row(
+        month=month_text,
+        month_label=month_label,
+        expense=expense_dec,
+        income=income_dec,
+        bill_count=len(work),
+        active_days=active_days,
+        elapsed_days=elapsed_days,
+        category_totals=category_totals,
+    )
+
+
+def score_radar(metrics: dict) -> dict:
+    """把 compute_radar_metrics 的指标折成四个 0~100 的得分（纯函数）。
+
+    公式（与页面文案、README 的口径逐字一致）
+    ------------------------------------------
+    消费克制力 = clamp(100 - fun_share * 150)
+        娱乐 + 购物 占比越低越高：占比 0 → 100 分，占比 2/3 → 0 分。
+    饮食健康度 = clamp(100 - milk_tea_share * 200 - max(0, food_share - 0.5) * 100)
+        奶茶咖啡占比每 1% 扣 2 分（翻倍惩罚）；餐饮占比超过 50% 之后再按超出部分扣分。
+    结余能力   = clamp(50 + saving_rate * 100)
+        结余率 0% = 50 分，省下 30% = 80 分，透支 50% = 0 分。
+    理财意识   = clamp(record_ratio * 70 + min(bill_count / 30, 1) * 30)
+        记账天数占比占 7 成、笔数密度（30 笔封顶）占 3 成。
+
+    容错
+    ----
+    · metrics 不是 dict 或空 dict（一点有效数据都没有）→ 四个维度整体记 0 分：
+      「无数据」绝不能因为公式的常数项被误读成「100 分的好习惯」；
+    · metrics 是 dict 但只缺部分字段 → 缺的字段按 0 代入公式，**绝不 KeyError**；
+      值非数字 / NaN / inf 同样按 0，并在 clamp 内部兜底。
+    返回值的 key 恰好是 RADAR_DIMENSIONS 四项，value 是保留 1 位小数的 float
+    （页面 tooltip 再取整展示）。
+    """
+    if not isinstance(metrics, dict) or not metrics:
+        return {dim: 0.0 for dim in RADAR_DIMENSIONS}
+
+    fun_share = _radar_metric_value(metrics, "fun_share")
+    milk_tea_share = _radar_metric_value(metrics, "milk_tea_share")
+    food_share = _radar_metric_value(metrics, "food_share")
+    saving_rate = _radar_metric_value(metrics, "saving_rate")
+    record_ratio = _radar_metric_value(metrics, "record_ratio")
+    bill_count = _radar_metric_value(metrics, "bill_count")
+
+    return {
+        "消费克制力": _radar_score_clamp(100 - fun_share * 150),
+        "饮食健康度": _radar_score_clamp(
+            100 - milk_tea_share * 200 - max(0.0, food_share - 0.5) * 100
+        ),
+        "结余能力": _radar_score_clamp(50 + saving_rate * 100),
+        "理财意识": _radar_score_clamp(
+            record_ratio * 70 + min(bill_count / 30, 1) * 30
+        ),
+    }
+
+
+def _peer_avg_money(metric_rows: list[dict], key: str) -> float:
+    """多用户某项金额指标的算术平均（每人等权），用 Decimal 求和后定量到分。"""
+    if not metric_rows:
+        return 0.0
+    total = sum((_radar_decimal(row.get(key, 0)) for row in metric_rows), Decimal("0"))
+    return _money_to_float(total / Decimal(len(metric_rows)))
+
+
+def _peer_avg_ratio(metric_rows: list[dict], key: str) -> float:
+    """多用户某项比率指标的算术平均，保留 4 位小数。
+
+    注意：不在这里 clamp —— share / record_ratio 在单人指标里已经收敛到 [0, 1]，
+    而 saving_rate 允许为负，硬 clamp 会把「平均透支」显示成 0。
+    """
+    if not metric_rows:
+        return 0.0
+    total = sum((_radar_metric_value(row, key) for row in metric_rows), 0.0)
+    return round(total / len(metric_rows), 4)
+
+
+def _peer_empty_avg() -> dict:
+    """样本为 0 时的 avg 骨架：key 与正常返回逐字一致，值全 0。"""
+    return {
+        "expense": 0.0,
+        "income": 0.0,
+        "net": 0.0,
+        "daily_expense": 0.0,
+        "milk_tea_share": 0.0,
+        "food_share": 0.0,
+        "fun_share": 0.0,
+        "saving_rate": 0.0,
+        "bill_count": 0.0,
+        "record_ratio": 0.0,
+    }
+
+
+def _peer_error_text(exc: Exception) -> str:
+    """把数据库异常压成一句可展示的中文原因：抹掉连接串、截断超长 SQL。
+
+    SQLAlchemy 的 OperationalError 文本里可能带 `postgresql+psycopg2://user:pass@host`，
+    而本函数的返回值会进页面提示 —— 先脱敏再展示，同时保留异常类名方便排错。
+    """
+    message = str(exc).strip() or exc.__class__.__name__
+    message = _DB_URL_IN_TEXT.sub("<数据库连接已隐藏>", message)
+    if len(message) > 200:
+        message = message[:200] + "…"
+    return message
+
+
+def get_peer_benchmark(month: str | None = None, today=None) -> dict:
+    """统计全站「每用户本月指标 → 四维得分」的匿名算术平均（每人等权）。
+
+    参数
+    ----
+    month : "YYYY-MM"；None → 取 today 所在月。非法格式直接 ValueError。
+    today : 默认北京时间今天；决定当月「已过天数」（记录率的分母）。
+
+    口径
+    ----
+    · 一条 GROUP BY user_id 的只读 SQL 取每用户当月的：支出、收入、奶茶咖啡、
+      餐饮、娱乐 + 购物、账单笔数、活跃天数（COUNT(DISTINCT date::date)）；
+    · 每用户先按 _peer_metrics_from_row 算指标（与 compute_radar_metrics 同一公式），
+      再 score_radar 算分，最后**对指标/得分分别取算术平均**；
+    · 只统计**当月有支出**的用户（HAVING SUM(支出) > 0）：0 支出用户的
+      fun_share / milk_tea_share 恒为 0，会把「消费克制力 / 饮食健康度」拉到 100 分，
+      让全站均值虚高，失去对比意义；
+    · 返回结构绝不含 user_id / 单笔明细，只有聚合值与人数。
+
+    返回
+    ----
+    {
+      "month": "2026-10", "month_label": "2026年10月",
+      "user_count": int, "min_users": PEER_MIN_USERS, "enough_users": bool,
+      "avg": {... 10 个指标 ...},
+      "scores": {四个维度: float},
+    }
+    没有用户 → user_count=0、avg / scores 全 0、enough_users=False（不抛错）。
+
+    异常
+    ----
+    · bills.category 不存在 → RuntimeError("分类功能未启用：请先执行 migrations/012_...")
+      （页面 try/except 接住后降级，不红屏）；
+    · 数据库异常（含历史脏日期导致 date::date cast 失败）→ RuntimeError(
+      "同龄人基准统计失败：...")，文本已脱敏，不含连接串 / 密码。
+    """
+    today_date = _radar_normalize_today(today)
+    # 先解析再 strip：month 不是字符串时让 _parse_report_month 抛 ValueError，
+    # 而不是在这里先吃一个 AttributeError（对外契约是「非法月份 → ValueError」）。
+    raw_month = (
+        f"{today_date.year:04d}-{today_date.month:02d}" if month is None else month
+    )
+    month_start, month_end = _parse_report_month(raw_month)
+    month_text = raw_month.strip()
+    month_label = _radar_month_label(month_text)
+    elapsed_days = _radar_elapsed_days(month_start, month_end, today_date)
+
+    empty_scores = {dim: 0.0 for dim in RADAR_DIMENSIONS}
+
+    if engine is None:
+        try:
+            init_db()
+        except Exception as exc:  # noqa: BLE001 - 统一包装成页面能接住的 RuntimeError
+            # 只记脱敏后的一句话：SQLAlchemy 的异常文本里可能带连接串 / 密码，
+            # 直接 exc_info=True 会把凭据写进日志文件。
+            logging.getLogger(__name__).warning(
+                "[db] 同龄人基准统计前初始化数据库失败：%s", _peer_error_text(exc)
+            )
+            raise RuntimeError(f"同龄人基准统计失败：{_peer_error_text(exc)}") from exc
+
+    # 分类列不存在时，三个「饮食习惯」指标没有口径可言：显式抛错让页面隐藏模块，
+    # 而不是悄悄返回一堆 0 分（那会被误读成「大家都很健康」）。
+    if not _bills_category_supported():
+        raise RuntimeError(_PEER_CATEGORY_MISSING)
+
+    sql = text("""
+        WITH scoped AS (
+            SELECT b.user_id,
+                   b.amount,
+                   b.type,
+                   COALESCE(NULLIF(btrim(b.category), ''), :fallback) AS category,
+                   b.date::date AS bill_date
+            FROM public.bills b
+            WHERE b.date::date >= :start
+              AND b.date::date <  :end
+        ),
+        per_user AS (
+            SELECT s.user_id,
+                   COALESCE(SUM(s.amount) FILTER (WHERE s.type = :expense), 0) AS expense,
+                   COALESCE(SUM(s.amount) FILTER (WHERE s.type = :income), 0)  AS income,
+                   COUNT(*) AS bill_count,
+                   COUNT(DISTINCT s.bill_date) AS active_days,
+                   COALESCE(SUM(s.amount) FILTER (
+                       WHERE s.type = :expense AND s.category = :cat_food), 0) AS food_expense,
+                   COALESCE(SUM(s.amount) FILTER (
+                       WHERE s.type = :expense AND s.category = :cat_milk), 0) AS milk_expense,
+                   COALESCE(SUM(s.amount) FILTER (
+                       WHERE s.type = :expense AND s.category = :cat_shop), 0) AS shop_expense,
+                   COALESCE(SUM(s.amount) FILTER (
+                       WHERE s.type = :expense AND s.category = :cat_fun), 0) AS fun_expense
+            FROM scoped s
+            GROUP BY s.user_id
+            -- 0 支出用户会把「消费克制力 / 饮食健康度」顶到 100 分，必须排除。
+            HAVING COALESCE(SUM(s.amount) FILTER (WHERE s.type = :expense), 0) > 0
+        )
+        SELECT expense, income, bill_count, active_days,
+               food_expense, milk_expense, shop_expense, fun_expense
+        FROM per_user
+        ORDER BY user_id
+    """)
+    params = {
+        "start": month_start,
+        "end": month_end,
+        "fallback": FALLBACK_CATEGORY,
+        "expense": EXPENSE_TYPE,
+        "income": INCOME_TYPE,
+        "cat_food": "餐饮",
+        "cat_milk": "奶茶咖啡",
+        "cat_shop": "购物",
+        "cat_fun": "娱乐",
+    }
+
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+    except Exception as exc:  # noqa: BLE001 - 统一包装成 RuntimeError，且文本脱敏
+        # 同上：日志只写脱敏后的原因，不写原始异常（可能含连接串 / 密码）。
+        logging.getLogger(__name__).warning(
+            "[db] 同龄人基准统计失败（SQL 执行阶段）：%s", _peer_error_text(exc)
+        )
+        raise RuntimeError(f"同龄人基准统计失败：{_peer_error_text(exc)}") from exc
+
+    if not rows:
+        return {
+            "month": month_text,
+            "month_label": month_label,
+            "user_count": 0,
+            "min_users": PEER_MIN_USERS,
+            "enough_users": False,
+            "avg": _peer_empty_avg(),
+            "scores": empty_scores,
+        }
+
+    metric_rows = []
+    score_rows = []
+    for row in rows:
+        metrics = _peer_metrics_from_row(
+            month=month_text,
+            month_label=month_label,
+            expense=row.expense,
+            income=row.income,
+            bill_count=row.bill_count,
+            active_days=row.active_days,
+            elapsed_days=elapsed_days,
+            category_totals={
+                "餐饮": row.food_expense,
+                "奶茶咖啡": row.milk_expense,
+                "购物": row.shop_expense,
+                "娱乐": row.fun_expense,
+            },
+        )
+        metric_rows.append(metrics)
+        score_rows.append(score_radar(metrics))
+
+    user_count = len(metric_rows)
+    bill_count_total = sum(row["bill_count"] for row in metric_rows)
+    avg = {
+        "expense": _peer_avg_money(metric_rows, "expense"),
+        "income": _peer_avg_money(metric_rows, "income"),
+        "net": _peer_avg_money(metric_rows, "net"),
+        "daily_expense": _peer_avg_money(metric_rows, "daily_expense"),
+        "milk_tea_share": _peer_avg_ratio(metric_rows, "milk_tea_share"),
+        "food_share": _peer_avg_ratio(metric_rows, "food_share"),
+        "fun_share": _peer_avg_ratio(metric_rows, "fun_share"),
+        "saving_rate": _peer_avg_ratio(metric_rows, "saving_rate"),
+        # 笔数均值保留 2 位：1 个人 10 笔、1 个人 1 笔 → 5.5 笔，取整会丢信息。
+        "bill_count": round(bill_count_total / user_count, 2),
+        "record_ratio": _peer_avg_ratio(metric_rows, "record_ratio"),
+    }
+    scores = {
+        dim: round(
+            sum(row[dim] for row in score_rows) / user_count, 1
+        )
+        for dim in RADAR_DIMENSIONS
+    }
+    # 平均分理论上仍在 [0, 100]，这里再夹一次：浮点平均 + round 不会越界，
+    # 但显式收敛能保证页面拿到的值一定符合雷达图 max=100 的刻度。
+    scores = {dim: _radar_score_clamp(value) for dim, value in scores.items()}
+
+    return {
+        "month": month_text,
+        "month_label": month_label,
+        "user_count": user_count,
+        "min_users": PEER_MIN_USERS,
+        "enough_users": user_count >= PEER_MIN_USERS,
+        "avg": avg,
+        "scores": scores,
+    }
+
+
+def radar_available() -> bool:
+    """雷达图模块是否可用：等价于 bills.category 是否存在（迁移 012 是否执行）。
+
+    页面在渲染前先问一句，可以在「没有分类」时直接隐藏整块，而不是先打一次
+    get_peer_benchmark 再靠异常分支降级。函数本身不抛错（探测失败按 False 处理）。
+    """
+    return bool(_bills_category_supported())

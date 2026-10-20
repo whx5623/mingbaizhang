@@ -3754,3 +3754,349 @@ def generate_monthly_memoir(stats: dict, api_key: str) -> dict:
         blessing = blessing[:MONTHLY_MEMOIR_MAX_BLESSING_CHARS] + "…"
     logger.info("月度回忆录生成成功（月份=%s，正文字数=%d）", month_label, len(memoir))
     return {"memoir": memoir, "blessing": blessing}
+
+
+# ============================================================================
+# 同龄人点评（DeepSeek Chat：把「我的雷达图 vs 全站均值」写成一段扎心短评）
+# ----------------------------------------------------------------------------
+# 与「沙盘顾问 / 月度回忆录」同构：先校验（没 key、没数据都不发请求）→ 组 payload
+# → 发请求 → 异常分层 → 清洗模型输出（去引号、「点评：」前缀）→ 截断 → 脱敏日志。
+# 差异只在入参与返回：入参是 app.py 组装好的 comparison，返回是一段纯字符串
+# （不带引号、不带「点评：」前缀），可以直接贴到页面上。
+# 日志只记月份、字数、状态码与异常类型，**绝不**记 api_key 或正文内容。
+# ============================================================================
+
+# 系统提示词逐字固定（产品口径，改一个字文案风格就跑偏）。
+PEER_ROAST_SYSTEM_PROMPT = (
+    "你是一个说话扎心的理财学长。请根据我的雷达图与全站均值的对比，写一段 50 字左右的点评。"
+    "例如：“你的结余能力超过了全校 80% 的同学，但奶茶消费量居然是平均水平的 2 倍，你是想开奶茶店吗？”"
+)
+
+PEER_ROAST_MODEL = "deepseek-chat"
+PEER_ROAST_TEMPERATURE = 0.8  # 0.8：要扎心、要有梗，但不能飘成段子
+PEER_ROAST_MAX_TOKENS = 300   # 50 字 + 余量
+PEER_ROAST_TIMEOUT = 20
+PEER_ROAST_MAX_CHARS = 120    # 返回文本硬上限：超过截断到 120 字并补「…」
+
+# 模型常见的"包装"：首尾中英文引号 / 括号，以及「点评：」前缀（全角半角冒号都认）。
+_PEER_ROAST_EDGE_CHARS = " \t\r\n\u3000\"'“”‘’「」『』《》【】[]（）()"
+_PEER_ROAST_PREFIX = re.compile(r"^(?:点\s*评\s*[:：]\s*)+")
+# 输出格式要求不进 system prompt，跟沙盘顾问 / 回忆录一样追加在 user message 末尾。
+_PEER_ROAST_OUTPUT_RULE = (
+    "写一段 50 字左右的点评，一到两句话，直接说，不要分点、不要复述所有数字，"
+    "不要加『点评：』前缀。"
+)
+
+
+class PeerRoastError(Exception):
+    """同龄人点评生成失败。
+
+    code 取值：
+      no_api_key   未配置 DeepSeek API Key（**未发请求**）
+      empty_stats  comparison 不是 dict / mine 与 peer 都没有有效得分 /
+                   metrics 不是 dict（**未发请求**）
+      network      网络异常（超时 / 连接失败 / 其它请求层异常）
+      http         接口返回非 200（message 只带状态码，不带响应体）
+      parse        响应不是合法 JSON / choices/content 缺失或为空 / 清洗后为空
+
+    message 为面向用户的中文提示，可直接展示。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"PeerRoastError(code={self.code!r}, message={self.message!r})"
+
+
+def _peer_roast_amount(value) -> float:
+    """comparison 里的数值宽松转 float：None / bool / 非数字 / nan / inf → 0.0。
+
+    为什么宽容而不是抛错：comparison 由 app.py 从雷达图结果拼出来，某个键缺失
+    只说明"这项没有数据"，不该让整段点评失败；结构层面的硬校验在
+    generate_peer_roast 里（comparison 不是 dict / 两边都没有得分直接报错）。
+    """
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(number):
+        return 0.0
+    return number
+
+
+def _peer_roast_count(value) -> int:
+    """用户数宽松转 int：None / bool / 非数字 / nan / inf / 负数 → 0。"""
+    if isinstance(value, bool):
+        return 0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(number) or number <= 0:
+        return 0
+    return int(number)
+
+
+def _peer_roast_text(value) -> str:
+    """comparison 里的文本宽松转 str：None / bool → ""，其余 str() 后 strip。"""
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    try:
+        return str(value).strip()
+    except (TypeError, ValueError):
+        return ""
+
+
+def _peer_roast_number_text(value) -> str:
+    """得分 / 差值的展示口径：整数不带小数点（62），半档保留一位（62.5）。"""
+    return f"{_peer_roast_amount(value):g}"
+
+
+def _peer_roast_percent_text(value) -> str:
+    """占比展示口径：0.13 → "13%"（先乘 100，再收敛成整数或一位小数）。"""
+    return f"{round(_peer_roast_amount(value) * 100, 1):g}%"
+
+
+def _peer_roast_mapping(value) -> dict[str, float]:
+    """把 mine / peer / gaps 收敛成 {维度名: float}；不是 dict → {}（绝不 KeyError）。
+
+    维度名统一走 _peer_roast_text，值统一走 _peer_roast_amount：单项数据脏了
+    就按 0 处理（维度本身还在，只是这一项没数据），不影响其它维度。
+    """
+    result: dict[str, float] = {}
+    if not isinstance(value, dict):
+        return result
+    for key, item in value.items():
+        name = _peer_roast_text(key)
+        if not name:
+            continue
+        result[name] = _peer_roast_amount(item)
+    return result
+
+
+def _peer_roast_clean(content: str) -> str:
+    """去掉首尾空白、中英文引号与「点评：」前缀（模型爱加的包装）。
+
+    引号与前缀可能嵌套（「点评：“xxx”」），所以循环剥几轮直到稳定；
+    剥完为空由调用方统一翻译成 parse。
+    """
+    text = content.strip()
+    for _ in range(3):
+        previous = text
+        text = text.strip(_PEER_ROAST_EDGE_CHARS)
+        text = _PEER_ROAST_PREFIX.sub("", text)
+        text = text.strip(_PEER_ROAST_EDGE_CHARS)
+        if text == previous:
+            break
+    return text
+
+
+def _build_peer_roast_user_content(comparison: dict) -> str:
+    """把 comparison 排成中文条目，并在末尾追加输出格式要求（格式要求不进 system prompt）。"""
+    month_label = _peer_roast_text(comparison.get("month_label"))
+    user_count = _peer_roast_count(comparison.get("user_count"))
+    mine = _peer_roast_mapping(comparison.get("mine"))
+    peer = _peer_roast_mapping(comparison.get("peer"))
+    gaps = _peer_roast_mapping(comparison.get("gaps"))
+    raw_metrics = comparison.get("metrics")
+    metrics = raw_metrics if isinstance(raw_metrics, dict) else {}
+
+    # 维度顺序以「我的得分」为主，再补只出现在全站均值里的维度（缺维度天然跳过）。
+    names = list(mine)
+    names += [name for name in peer if name not in mine]
+
+    if month_label and user_count:
+        lines = [f"本月：{month_label}（全站 {user_count} 位同学样本）"]
+    elif month_label:
+        lines = [f"本月：{month_label}"]
+    elif user_count:
+        lines = [f"本月（全站 {user_count} 位同学样本）"]
+    else:
+        lines = ["本月（样本：全站均值）"]
+
+    mine_items = [
+        f"{name} {_peer_roast_number_text(mine[name])}"
+        for name in names
+        if name in mine
+    ]
+    peer_items = [
+        f"{name} {_peer_roast_number_text(peer[name])}"
+        for name in names
+        if name in peer
+    ]
+    if mine_items:
+        lines.append("我的得分：" + " / ".join(mine_items))
+    if peer_items:
+        lines.append("全站均值：" + " / ".join(peer_items))
+
+    ahead: list[str] = []
+    behind: list[str] = []
+    for name in names:
+        # gaps 有就用 gaps，没有（或这一维缺）就现场相减，绝不 KeyError。
+        if name in gaps:
+            gap = gaps[name]
+        else:
+            gap = mine.get(name, 0.0) - peer.get(name, 0.0)
+        if gap > 0:
+            ahead.append(f"{name} +{_peer_roast_number_text(gap)}")
+        elif gap < 0:
+            behind.append(name + " " + _peer_roast_number_text(gap))
+    if ahead or behind:
+        parts = []
+        if ahead:
+            parts.append("、".join(ahead))
+        if behind:
+            parts.append("、".join(behind))
+        lines.append("领先/落后：" + "；".join(parts))
+    else:
+        lines.append("领先/落后：各项基本持平")
+
+    segments: list[str] = []
+    if "my_daily_expense" in metrics or "peer_daily_expense" in metrics:
+        my_daily = _peer_roast_amount(metrics.get("my_daily_expense"))
+        peer_daily = _peer_roast_amount(metrics.get("peer_daily_expense"))
+        segments.append(f"日均支出我 ¥{my_daily:.2f} / 全站 ¥{peer_daily:.2f}")
+    if "my_milk_tea_share" in metrics or "peer_milk_tea_share" in metrics:
+        my_tea = _peer_roast_percent_text(metrics.get("my_milk_tea_share"))
+        peer_tea = _peer_roast_percent_text(metrics.get("peer_milk_tea_share"))
+        segments.append(f"奶茶占比 {my_tea} / {peer_tea}")
+    if "my_saving_rate" in metrics or "peer_saving_rate" in metrics:
+        my_rate = _peer_roast_percent_text(metrics.get("my_saving_rate"))
+        peer_rate = _peer_roast_percent_text(metrics.get("peer_saving_rate"))
+        segments.append(f"结余率 {my_rate} / {peer_rate}")
+    if segments:
+        lines.append("关键指标：" + "；".join(segments))
+
+    lines.append("输出要求：" + _PEER_ROAST_OUTPUT_RULE)
+    return "\n".join(lines)
+
+
+def generate_peer_roast(comparison: dict, api_key: str) -> str:
+    """根据「我的雷达图 vs 全站均值」生成一段 50 字左右的扎心点评（strip 后的纯字符串）。
+
+    comparison 约定（由 app.py 组装；缺失维度 / 非数字按 0 或跳过，绝不 KeyError）：
+        {"month_label": "2026年10月", "user_count": 2,
+         "mine": {"消费克制力": 62.0, ...}, "peer": {"消费克制力": 48.0, ...},
+         "gaps": {"消费克制力": 14.0, ...},
+         "metrics": {"my_daily_expense": 15.1, "peer_daily_expense": 18.9,
+                     "my_milk_tea_share": 0.13, "peer_milk_tea_share": 0.05,
+                     "my_saving_rate": 0.35, "peer_saving_rate": 0.18,
+                     "my_expense": 452.0, "peer_expense": 379.2}}
+
+    失败一律抛 PeerRoastError（中文 message，可直接上页面）：
+      · api_key 为空                                    → no_api_key（且**不发请求**）；
+      · comparison 不是 dict / mine 与 peer 都没有得分     → empty_stats（且**不发请求**）；
+      · metrics 不是 dict                               → empty_stats（且**不发请求**）；
+      · 超时 / 连接失败 / 其它请求层异常                    → network；
+      · 非 200                                         → http（只带状态码，不拼响应体）；
+      · 响应不是 JSON / content 缺失或为空 / 清洗后为空     → parse。
+    返回前去掉首尾中英文引号与「点评：」前缀；超过 120 字截断补「…」。
+    日志只记月份、字数、状态码与异常类型，**绝不**记 api_key 或正文内容。
+    """
+    # ① api_key：先查它，没有 key 时不该先花一次网络往返。
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise PeerRoastError(
+            "no_api_key",
+            "未配置 DEEPSEEK_API_KEY，同龄人点评暂不可用",
+        )
+    api_key = api_key.strip()
+
+    # ② 数据前置校验：两边都没有得分 / metrics 结构不对时，模型只能硬编，毫无意义。
+    if not isinstance(comparison, dict):
+        raise PeerRoastError(
+            "empty_stats",
+            "雷达图对比数据不完整，暂时无法生成点评，请刷新后重试",
+        )
+    mine = _peer_roast_mapping(comparison.get("mine"))
+    peer = _peer_roast_mapping(comparison.get("peer"))
+    if not mine and not peer:
+        raise PeerRoastError(
+            "empty_stats",
+            "还没有可对比的雷达图数据，先记几笔账单再来看点评吧",
+        )
+    if not isinstance(comparison.get("metrics"), dict):
+        raise PeerRoastError(
+            "empty_stats",
+            "雷达图对比数据不完整，暂时无法生成点评，请刷新后重试",
+        )
+
+    month_label = _peer_roast_text(comparison.get("month_label")) or "未知月份"
+    user_content = _build_peer_roast_user_content(comparison)
+    payload = {
+        "model": PEER_ROAST_MODEL,
+        "messages": [
+            {"role": "system", "content": PEER_ROAST_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": PEER_ROAST_TEMPERATURE,
+        "max_tokens": PEER_ROAST_MAX_TOKENS,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ③ 发请求：超时/连接失败翻译成用户能看懂的句子（不把异常对象漏到页面）。
+    try:
+        resp = requests.post(
+            DEEPSEEK_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=PEER_ROAST_TIMEOUT,
+        )
+    except requests.Timeout:
+        logger.warning("同龄人点评请求超时（月份=%s）", month_label)
+        raise PeerRoastError("network", "生成同龄人点评超时，请稍后再试") from None
+    except requests.ConnectionError:
+        logger.warning("同龄人点评请求连接失败（月份=%s）", month_label)
+        raise PeerRoastError("network", "网络连接失败，请检查网络") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：日志只记异常类型（确保不把 headers / key 带出去）。
+        logger.warning(
+            "同龄人点评请求失败（月份=%s，异常=%s）", month_label, type(exc).__name__
+        )
+        raise PeerRoastError("network", "网络连接失败，请检查网络") from None
+
+    # ④ 非 200：只带状态码，不把响应体拼进 message（响应体可能含请求回显）。
+    if resp.status_code != 200:
+        logger.warning("同龄人点评接口返回 HTTP %s（月份=%s）", resp.status_code, month_label)
+        raise PeerRoastError(
+            "http",
+            f"AI 服务返回异常（HTTP {resp.status_code}），请稍后重试",
+        )
+
+    # ⑤ 解析：非 JSON / 结构不符 / content 为空 → 同一条"没有有效点评"。
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("同龄人点评响应不是合法 JSON（月份=%s）", month_label)
+        raise PeerRoastError("parse", "AI 没有返回有效点评，请重试") from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("同龄人点评响应结构不符合预期（月份=%s）", month_label)
+        raise PeerRoastError("parse", "AI 没有返回有效点评，请重试") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("同龄人点评响应 content 为空（月份=%s）", month_label)
+        raise PeerRoastError("parse", "AI 没有返回有效点评，请重试")
+
+    # ⑥ 清洗：去首尾引号与「点评：」前缀；洗空了说明模型只回了包装，按解析失败处理。
+    content = _peer_roast_clean(content)
+    if not content:
+        logger.warning("同龄人点评响应解析不出正文（月份=%s）", month_label)
+        raise PeerRoastError("parse", "AI 没有返回有效点评，请重试")
+
+    if len(content) > PEER_ROAST_MAX_CHARS:
+        content = content[:PEER_ROAST_MAX_CHARS] + "…"
+    logger.info("同龄人点评生成成功（月份=%s，字数=%d）", month_label, len(content))
+    return content

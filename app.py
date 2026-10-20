@@ -97,6 +97,17 @@ except ImportError as _sandbox_chart_import_exc:
         f"{type(_sandbox_chart_import_exc).__name__}: {_sandbox_chart_import_exc}"
     )
 
+# 同龄人基准雷达图（纯函数拼 ECharts option）：缺失只让这块降级成一行提示，
+# 不影响其它图表与业务。
+try:
+    from peer_chart import PEER_DIMENSIONS, build_radar_option, format_score
+except ImportError as _peer_chart_exc:
+    PEER_DIMENSIONS, build_radar_option, format_score = (), None, None
+    print(
+        f"[peer] 雷达图模块不可用："
+        f"{type(_peer_chart_exc).__name__}: {_peer_chart_exc}"
+    )
+
 
 class _ChartInsightFallbackError(Exception):
     """ai_agent.ChartInsightError 尚未合入时的占位异常（保证 except 子句可用）。"""
@@ -104,6 +115,10 @@ class _ChartInsightFallbackError(Exception):
 
 class _LatteRoastFallbackError(Exception):
     """ai_agent.LatteRoastError 尚未合入时的占位异常（保证 except 子句可用）。"""
+
+
+class _PeerRoastFallbackError(Exception):
+    """ai_agent.PeerRoastError 尚未合入时的占位异常（保证 except 子句可用）。"""
 
 
 st.set_page_config(layout="wide")
@@ -737,6 +752,128 @@ def _get_latte_roast_fn():
         return None
     roast_fn = getattr(_ai_agent_mod, "generate_latte_roast", None)
     return roast_fn if callable(roast_fn) else None
+
+
+# ===== 同龄人财务基准：AI 学长点评的取用与本地兜底 =====
+# generate_peer_roast 由并行方实现：刻意不用 `from ai_agent import ...`，
+# import 期不存在会把整页打红；按模块属性取既能感知「稍后合入」，也方便测试打桩。
+def _get_peer_roast_fn():
+    """按模块属性取 ai_agent.generate_peer_roast：并行开发期缺失 / 打桩都能感知。"""
+    try:
+        import ai_agent as _ai_agent_mod
+    except Exception as _ai_import_exc:  # pragma: no cover - 依赖缺失时只降级
+        print(
+            f"[peer] ai_agent 不可用："
+            f"{type(_ai_import_exc).__name__}: {_ai_import_exc}"
+        )
+        return None
+    roast_fn = getattr(_ai_agent_mod, "generate_peer_roast", None)
+    return roast_fn if callable(roast_fn) else None
+
+
+def _peer_number(value, default=0.0):
+    """归一成有限 float：非法 / NaN / inf 一律退回 default。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _peer_pct(value):
+    """占比 / 结余率 → 百分数。
+
+    与 db._peer_metrics_from_row 的口径一致：milk_tea_share / saving_rate 都是
+    0~1 的小数（结余率可为负，支出远超收入时还会小于 -1），统一乘 100 展示。
+    """
+    return _peer_number(value) * 100.0
+
+
+def _peer_fmt_score(value):
+    """维度分展示：优先用 peer_chart.format_score，模块缺失时本地格式化。"""
+    if callable(format_score):
+        try:
+            return format_score(value)
+        except Exception:  # pragma: no cover - 第三方纯函数异常时本地兜底
+            pass
+    if value is None:
+        return "--"
+    try:
+        return f"{float(value):.0f}"
+    except (TypeError, ValueError):
+        return "--"
+
+
+def _peer_short_exc(exc, limit=60):
+    """异常文案短版：最多 60 字，避免把长 SQL / 堆栈糊到页面上。"""
+    text = str(exc or "").strip().replace("\n", " ")
+    if not text:
+        text = type(exc).__name__ if exc is not None else "未知错误"
+    return text[:limit]
+
+
+# 兜底点评里的「扎心」与「给糖」：按维度取一句，维度不在表里就走通用文案。
+_PEER_DIM_JABS = {
+    "消费克制力": "手比脑子快，冲动消费有点上头",
+    "饮食健康度": "奶茶怕是没少喝",
+    "结余能力": "月底钱包容易见底",
+    "理财意识": "钱还躺在活期里睡大觉",
+}
+_PEER_DIM_PRAISE = {
+    "消费克制力": "手还算稳",
+    "饮食健康度": "吃得还算克制",
+    "结余能力": "还能攒下点",
+    "理财意识": "账记得还算明白",
+}
+
+
+def _peer_fallback_roast(mine, peer):
+    """AI 不可用时的本地点评（≤60 字、不出现「AI」字样）：只吃两组得分，不联网。"""
+    mine = mine if isinstance(mine, dict) else {}
+    peer = peer if isinstance(peer, dict) else {}
+    dims = tuple(PEER_DIMENSIONS) or tuple(peer.keys()) or tuple(mine.keys())
+    gaps = {}
+    for dim in dims:
+        try:
+            gaps[dim] = float(mine.get(dim, 0) or 0) - float(peer.get(dim, 0) or 0)
+        except (TypeError, ValueError):
+            continue
+    if not gaps:
+        return "先把账记明白，再去和同龄人比高低，你还有机会反超。"
+
+    worst = max(gaps, key=lambda _dim: abs(gaps[_dim]))
+    gap = gaps[worst]
+    if abs(gap) < 0.5:
+        return "四个维度和全站咬得很紧，继续保持，下次争取拉开差距。"
+
+    score = _peer_fmt_score(abs(gap))
+    if gap < 0:
+        text = (
+            f"「{worst}」比全站低 {score} 分，"
+            f"{_PEER_DIM_JABS.get(worst, '还得再省着点')}"
+        )
+        # 只在我落后时给颗糖：找一个我领先的维度夸一句，免得只剩打击
+        best = None
+        for dim, value in gaps.items():
+            if dim == worst or value <= 0.5:
+                continue
+            if best is None or value > gaps[best]:
+                best = dim
+        if best is not None:
+            text += (
+                f"；好歹「{best}」高出 {_peer_fmt_score(gaps[best])} 分，"
+                f"{_PEER_DIM_PRAISE.get(best, '还算稳')}"
+            )
+    else:
+        text = (
+            f"「{worst}」比全站高 {score} 分，"
+            f"{_PEER_DIM_PRAISE.get(worst, '继续保持')}"
+        )
+
+    text += "。"
+    if len(text) > 60:
+        text = text[:59].rstrip("；，、") + "。"
+    return text
 
 
 # ===== 财务沙盘推演：AI 沙盘点评的进程级缓存 =====
@@ -2183,6 +2320,426 @@ with tab_dash:
             except Exception as _rose_exc:
                 print(f"[chart] 玫瑰图渲染失败：{type(_rose_exc).__name__}: {_rose_exc}")
                 st.warning("玫瑰图暂时无法渲染，请刷新页面重试")
+
+    # ===== 同龄人财务基准雷达（匿名对比）=====
+    # 数据全部来自并行方：我的指标 db.compute_radar_metrics / 得分 db.score_radar /
+    # 全站均值 db.get_peer_benchmark / 开关 db.radar_available。任一函数缺失、抛错
+    # 都只降级成一行 caption，绝不红屏；样本不足时不画图、不出按钮。
+    with st.container(border=True, key="card_peer_radar"):
+        st.subheader("同龄人都在怎么花钱？")
+        st.caption("基于全站同学本月的匿名账单聚合，只比均值，看不到任何人的明细")
+
+        # 1) 按模块属性取函数：并行方尚未合入 / 测试打桩都能感知，import 期绝不报错
+        _peer_metric_fn = getattr(db, "compute_radar_metrics", None)
+        _peer_score_fn = getattr(db, "score_radar", None)
+        _peer_bench_fn = getattr(db, "get_peer_benchmark", None)
+        _radar_available_fn = getattr(db, "radar_available", None)
+        _peer_fns_ready = all(
+            callable(_peer_fn)
+            for _peer_fn in (
+                _peer_metric_fn,
+                _peer_score_fn,
+                _peer_bench_fn,
+                _radar_available_fn,
+            )
+        )
+
+        if not _peer_fns_ready:
+            st.caption("同龄人基准功能暂不可用")
+        else:
+            # radar_available 只是廉价开关（分类未启用等）：抛错同样按不可用处理
+            try:
+                _peer_enabled = bool(_radar_available_fn())
+            except Exception as _peer_avail_exc:
+                print(
+                    f"[peer] radar_available 调用失败："
+                    f"{type(_peer_avail_exc).__name__}: {_peer_avail_exc}"
+                )
+                _peer_enabled = False
+
+            if not _peer_enabled:
+                st.caption("同龄人基准功能暂不可用")
+            else:
+                # 2) 我的本月指标（用 Tab1 已有的 df + current_month_str）
+                _peer_my_metrics = None
+                try:
+                    _peer_my_metrics = _peer_metric_fn(df, current_month_str)
+                except Exception as _peer_metric_exc:
+                    print(
+                        f"[peer] 我的雷达指标计算失败："
+                        f"{type(_peer_metric_exc).__name__}: {_peer_metric_exc}"
+                    )
+                    _peer_my_metrics = None
+
+                if not isinstance(_peer_my_metrics, dict) or not _peer_my_metrics:
+                    st.caption("你的本月指标暂时算不出来，请稍后再试")
+                elif not _peer_my_metrics.get("has_expense"):
+                    st.caption("本月还没有支出，先记几笔再来看你和同龄人的差距")
+                else:
+                    # 3) 我的得分；后端违约（非 dict / 空）时降级，不画半张假图
+                    _peer_my_scores = {}
+                    try:
+                        _peer_score_raw = _peer_score_fn(_peer_my_metrics)
+                    except Exception as _peer_score_exc:
+                        print(
+                            f"[peer] 我的雷达得分计算失败："
+                            f"{type(_peer_score_exc).__name__}: {_peer_score_exc}"
+                        )
+                        _peer_score_raw = None
+                    if isinstance(_peer_score_raw, dict):
+                        _peer_my_scores = _peer_score_raw
+
+                    if not _peer_my_scores:
+                        st.caption("你的同龄人得分暂时算不出来，请稍后再试")
+                    else:
+                        # 4) 全站均值：RuntimeError 带上后端中文提示（截断 60 字），
+                        #    其它异常只给通用文案，细节进服务端日志。
+                        _peer_bench = None
+                        _peer_bench_runtime_exc = None
+                        try:
+                            _peer_bench = _peer_bench_fn(current_month_str)
+                        except RuntimeError as _peer_bench_exc:
+                            _peer_bench_runtime_exc = _peer_bench_exc
+                        except Exception as _peer_bench_exc:
+                            print(
+                                f"[peer] 全站基准取数失败："
+                                f"{type(_peer_bench_exc).__name__}: {_peer_bench_exc}"
+                            )
+
+                        if _peer_bench_runtime_exc is not None:
+                            st.caption(
+                                "同龄人基准暂不可用："
+                                f"{_peer_short_exc(_peer_bench_runtime_exc)}"
+                            )
+                        elif not isinstance(_peer_bench, dict) or not _peer_bench:
+                            st.caption("同龄人基准暂时取不到，请稍后再试")
+                        else:
+                            try:
+                                _peer_user_count = int(
+                                    _peer_bench.get("user_count") or 0
+                                )
+                            except (TypeError, ValueError):
+                                _peer_user_count = 0
+                            # 样本门槛以 db.PEER_MIN_USERS 为准（当前 2 人），不在页面里写死
+                            try:
+                                _peer_min_users = int(
+                                    getattr(db, "PEER_MIN_USERS", 2) or 2
+                                )
+                            except (TypeError, ValueError):
+                                _peer_min_users = 2
+                            _peer_enough_users = bool(
+                                _peer_bench.get("enough_users")
+                            ) and _peer_user_count >= _peer_min_users
+
+                            if not _peer_enough_users:
+                                st.caption(
+                                    f"同龄人基准还在攒样本（至少 {_peer_min_users} 位同学本月有支出），"
+                                    "先记好自己的账，过几天再来看看"
+                                )
+                            else:
+                                _peer_scores = _peer_bench.get("scores")
+                                if not isinstance(_peer_scores, dict):
+                                    _peer_scores = {}
+                                _peer_avg = _peer_bench.get("avg")
+                                if not isinstance(_peer_avg, dict):
+                                    _peer_avg = {}
+                                _peer_dims = (
+                                    tuple(PEER_DIMENSIONS)
+                                    or tuple(_peer_scores.keys())
+                                )
+
+                                # 5) 左雷达图 + 右侧对比与点评
+                                _peer_col_chart, _peer_col_text = st.columns(
+                                    [1.3, 1]
+                                )
+                                with _peer_col_chart:
+                                    if build_radar_option is None:
+                                        st.caption(
+                                            "雷达图暂时无法渲染，请刷新页面重试"
+                                        )
+                                    else:
+                                        try:
+                                            st_echarts(
+                                                build_radar_option(
+                                                    _peer_my_scores,
+                                                    _peer_scores,
+                                                    peer_label="全站平均",
+                                                    user_count=_peer_user_count,
+                                                ),
+                                                height="430px",
+                                            )
+                                        except Exception as _peer_chart_exc:
+                                            print(
+                                                f"[peer] 雷达图渲染失败："
+                                                f"{type(_peer_chart_exc).__name__}: "
+                                                f"{_peer_chart_exc}"
+                                            )
+                                            st.caption(
+                                                "雷达图暂时无法渲染，请刷新页面重试"
+                                            )
+
+                                with _peer_col_text:
+                                    _peer_mine_daily = _peer_number(
+                                        _peer_my_metrics.get("daily_expense")
+                                    )
+                                    _peer_peer_daily = _peer_number(
+                                        _peer_avg.get("daily_expense")
+                                    )
+                                    _peer_mine_milk = _peer_pct(
+                                        _peer_my_metrics.get("milk_tea_share")
+                                    )
+                                    _peer_peer_milk = _peer_pct(
+                                        _peer_avg.get("milk_tea_share")
+                                    )
+                                    _peer_mine_saving = _peer_pct(
+                                        _peer_my_metrics.get("saving_rate")
+                                    )
+                                    _peer_peer_saving = _peer_pct(
+                                        _peer_avg.get("saving_rate")
+                                    )
+
+                                    _peer_m1, _peer_m2, _peer_m3 = st.columns(3)
+                                    with _peer_m1:
+                                        st.metric(
+                                            "日均支出",
+                                            f"¥{_peer_mine_daily:.2f}",
+                                            delta=(
+                                                f"{_peer_mine_daily - _peer_peer_daily:+.2f}"
+                                                f"（全站 ¥{_peer_peer_daily:.2f}）"
+                                            ),
+                                            delta_color="inverse",
+                                        )
+                                    with _peer_m2:
+                                        st.metric(
+                                            "奶茶占比",
+                                            f"{_peer_mine_milk:.1f}%",
+                                            delta=(
+                                                f"{_peer_mine_milk - _peer_peer_milk:+.1f}"
+                                                f" 个百分点（全站 {_peer_peer_milk:.1f}%）"
+                                            ),
+                                            delta_color="inverse",
+                                        )
+                                    with _peer_m3:
+                                        st.metric(
+                                            "结余率",
+                                            f"{_peer_mine_saving:.1f}%",
+                                            delta=(
+                                                f"{_peer_mine_saving - _peer_peer_saving:+.1f}"
+                                                f" 个百分点（全站 {_peer_peer_saving:.1f}%）"
+                                            ),
+                                            delta_color="normal",
+                                        )
+
+                                    # 差距最大的维度：取绝对值最大者，分数用 format_score 展示
+                                    _peer_gaps = {}
+                                    for _peer_dim in _peer_dims:
+                                        try:
+                                            _peer_gaps[_peer_dim] = float(
+                                                _peer_my_scores.get(_peer_dim, 0) or 0
+                                            ) - float(
+                                                _peer_scores.get(_peer_dim, 0) or 0
+                                            )
+                                        except (TypeError, ValueError):
+                                            continue
+                                    if not _peer_gaps:
+                                        st.caption("四个维度和全站咬得很紧，继续保持")
+                                    else:
+                                        _peer_worst_dim = max(
+                                            _peer_gaps,
+                                            key=lambda _dim: abs(_peer_gaps[_dim]),
+                                        )
+                                        _peer_worst_gap = _peer_gaps[
+                                            _peer_worst_dim
+                                        ]
+                                        if abs(_peer_worst_gap) < 0.5:
+                                            st.caption(
+                                                "四个维度和全站咬得很紧，继续保持"
+                                            )
+                                        else:
+                                            st.caption(
+                                                f"差距最大：「{_peer_worst_dim}」比全站"
+                                                f"{'高' if _peer_worst_gap > 0 else '低'} "
+                                                f"{_peer_fmt_score(abs(_peer_worst_gap))} 分"
+                                            )
+
+                                    # 组装对照数据：字段固定、值统一归一，缓存 key 才稳定
+                                    _peer_comparison = {
+                                        "month_label": _peer_bench.get("month_label")
+                                        or current_month_str,
+                                        "user_count": _peer_user_count,
+                                        "mine": _peer_my_scores,
+                                        "peer": _peer_scores,
+                                        "gaps": {
+                                            _peer_dim: round(
+                                                _peer_number(
+                                                    _peer_my_scores.get(_peer_dim)
+                                                )
+                                                - _peer_number(
+                                                    _peer_scores.get(_peer_dim)
+                                                ),
+                                                1,
+                                            )
+                                            for _peer_dim in _peer_dims
+                                        },
+                                        "metrics": {
+                                            "my_daily_expense": _peer_my_metrics.get(
+                                                "daily_expense"
+                                            ),
+                                            "peer_daily_expense": _peer_avg.get(
+                                                "daily_expense"
+                                            ),
+                                            "my_milk_tea_share": _peer_my_metrics.get(
+                                                "milk_tea_share"
+                                            ),
+                                            "peer_milk_tea_share": _peer_avg.get(
+                                                "milk_tea_share"
+                                            ),
+                                            "my_saving_rate": _peer_my_metrics.get(
+                                                "saving_rate"
+                                            ),
+                                            "peer_saving_rate": _peer_avg.get(
+                                                "saving_rate"
+                                            ),
+                                            "my_expense": _peer_my_metrics.get(
+                                                "expense"
+                                            ),
+                                            "peer_expense": _peer_avg.get("expense"),
+                                        },
+                                    }
+                                    _peer_comparison_key = hashlib.sha256(
+                                        json.dumps(
+                                            _peer_comparison,
+                                            sort_keys=True,
+                                            ensure_ascii=False,
+                                            default=str,
+                                        ).encode("utf-8")
+                                    ).hexdigest()
+
+                                    if st.button(
+                                        "🩻 让学长点评一下", key="peer_roast_btn"
+                                    ):
+                                        _peer_saved_roast = st.session_state.get(
+                                            "peer_roast"
+                                        )
+                                        _peer_cache_hit = (
+                                            isinstance(_peer_saved_roast, dict)
+                                            and _peer_saved_roast.get("key")
+                                            == _peer_comparison_key
+                                            and bool(
+                                                str(
+                                                    _peer_saved_roast.get("text")
+                                                    or ""
+                                                ).strip()
+                                            )
+                                        )
+                                        if _peer_cache_hit:
+                                            # 同一份对照数据已点评过：不调 API、不扣额度
+                                            pass
+                                        elif (
+                                            st.session_state.get(
+                                                "ai_daily_count", 0
+                                            )
+                                            >= 20
+                                        ):
+                                            st.warning(
+                                                "今日免费额度已用完，请明天再来"
+                                            )
+                                        else:
+                                            _peer_roast_fn = _get_peer_roast_fn()
+                                            _peer_fallback_text = (
+                                                _peer_fallback_roast(
+                                                    _peer_my_scores, _peer_scores
+                                                )
+                                            )
+                                            _peer_roast_text = ""
+                                            _peer_roast_is_fallback = False
+                                            _peer_roast_attempted = False
+                                            if _peer_roast_fn is None:
+                                                # 后端未上线：本地兜底，不计额度
+                                                print(
+                                                    "[peer] ai_agent.generate_peer_roast "
+                                                    "不可用，使用本地兜底"
+                                                )
+                                                _peer_roast_text = (
+                                                    _peer_fallback_text
+                                                )
+                                                _peer_roast_is_fallback = True
+                                            else:
+                                                _peer_roast_attempted = True
+                                                try:
+                                                    with st.spinner(
+                                                        "学长正在翻你的账单…"
+                                                    ):
+                                                        _peer_roast_raw = (
+                                                            _peer_roast_fn(
+                                                                _peer_comparison,
+                                                                get_deepseek_api_key(),
+                                                            )
+                                                        )
+                                                    _peer_roast_text = (
+                                                        _peer_roast_raw.strip()
+                                                        if isinstance(
+                                                            _peer_roast_raw, str
+                                                        )
+                                                        else ""
+                                                    )
+                                                    if not _peer_roast_text:
+                                                        raise ValueError(
+                                                            "generate_peer_roast "
+                                                            "返回空文本"
+                                                        )
+                                                except Exception as _peer_roast_exc:
+                                                    # PeerRoastError（未配 key / 网络 / 解析）
+                                                    # 与其它异常统一兜底：不红屏，按「已尝试」扣 1 次。
+                                                    print(
+                                                        f"[peer] AI 学长点评失败："
+                                                        f"{type(_peer_roast_exc).__name__}: "
+                                                        f"{_peer_roast_exc}"
+                                                    )
+                                                    _peer_roast_text = (
+                                                        _peer_fallback_text
+                                                    )
+                                                    _peer_roast_is_fallback = True
+                                            if not _peer_roast_text:
+                                                _peer_roast_text = (
+                                                    _peer_fallback_text
+                                                )
+                                                _peer_roast_is_fallback = True
+
+                                            st.session_state["peer_roast"] = {
+                                                "key": _peer_comparison_key,
+                                                "text": _peer_roast_text,
+                                                "fallback": _peer_roast_is_fallback,
+                                            }
+                                            if _peer_roast_attempted:
+                                                # 失败也算尝试过；函数缺失（后端未上线）不扣
+                                                st.session_state.ai_daily_count = (
+                                                    st.session_state.get(
+                                                        "ai_daily_count", 0
+                                                    )
+                                                    + 1
+                                                )
+
+                                    # 渲染独立于按钮：rerun 后只要对照数据没变就继续展示
+                                    _peer_saved_roast = st.session_state.get(
+                                        "peer_roast"
+                                    )
+                                    if (
+                                        isinstance(_peer_saved_roast, dict)
+                                        and _peer_saved_roast.get("key")
+                                        == _peer_comparison_key
+                                        and str(
+                                            _peer_saved_roast.get("text") or ""
+                                        ).strip()
+                                    ):
+                                        st.info(_peer_saved_roast["text"])
+                                        _peer_roast_caption = (
+                                            "AI 学长点评 · 基于 "
+                                            f"{_peer_user_count} 位同学的匿名均值"
+                                        )
+                                        if _peer_saved_roast.get("fallback"):
+                                            _peer_roast_caption += "（本地兜底）"
+                                        st.caption(_peer_roast_caption)
 
     # ===== 消费日历热力图（本月 / 近三个月）=====
     # 数据由并行方 db.get_daily_expense_totals 提供（连续零填充的每日支出合计）：
