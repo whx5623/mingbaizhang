@@ -3389,3 +3389,368 @@ def generate_sandbox_advice(stats: dict, api_key: str) -> str:
         content = content[:SANDBOX_ADVICE_MAX_CHARS] + "…"
     logger.info("沙盘顾问生成成功（推演月数=%s，字数=%d）", months_count, len(content))
     return content
+
+
+# ============================================================================
+# 月度消费回忆录（DeepSeek Chat，把本月几笔「锚点消费」写成一段日记）
+# ----------------------------------------------------------------------------
+# 与「财务沙盘顾问」的差异：输入不是推演结果，而是 db.build_memoir_anchors 的
+# 锚点（本月最开心 / 最心疼 / 最高频商户）；输出也不是一段话，而是
+# {"memoir": 正文, "blessing": 下月寄语} 两段，因此比沙盘点评多一步「切分」。
+# 错误分层与请求写法严格照抄沙盘顾问：
+#   · api_key 为空、stats 不可写时**不发请求**（先校验，再花网络往返）；
+#   · 日志只记月份、字数、状态码与异常类型，**绝不**记 api_key 或正文内容。
+# ============================================================================
+
+# 系统提示词逐字固定（产品口径，改一个字文案风格就跑偏）。
+MONTHLY_MEMOIR_SYSTEM_PROMPT = (
+    "你是一个懂大学生、文笔温暖又带点幽默的日记主理人。请根据我本月的这几笔关键消费，"
+    "用第一人称写一段 150 字左右的“月度消费回忆录”。不要罗列数据，要写出消费背后的情绪和故事。"
+    "最后给一句下个月的寄语。"
+)
+
+MONTHLY_MEMOIR_MODEL = "deepseek-chat"
+MONTHLY_MEMOIR_TEMPERATURE = 0.9        # 0.9：回忆录要有画面感和情绪，不怕文风跳一点
+MONTHLY_MEMOIR_MAX_TOKENS = 500         # 150 字正文 + 一句寄语 + 余量
+MONTHLY_MEMOIR_TIMEOUT = 25
+MONTHLY_MEMOIR_MAX_CHARS = 320          # 正文硬上限：超过截断到 320 字并补「…」
+MONTHLY_MEMOIR_MAX_BLESSING_CHARS = 40  # 寄语硬上限：超过截断到 40 字并补「…」
+
+# 「下月寄语」标记：容忍「下 月 寄 语」「寄　语」（全角空格）这类模型手滑写法。
+# 冒号不放进匹配里（全角/半角/省略冒号都由后面的 strip 兜住）。
+_MONTHLY_MEMOIR_BLESSING_MARKER = re.compile(r"下\s*月\s*寄\s*语")
+# 正文结尾要剥掉的分隔线 / 破折号字符（"——"、"***"、"---"）。
+_MONTHLY_MEMOIR_MEMOIR_TAIL_CHARS = " \t\r\n\u3000—–－-·*=~_"
+# 寄语首尾要去掉的冒号 / 引号 / 空白：模型常写成「下月寄语：“少喝两杯奶茶”」。
+_MONTHLY_MEMOIR_BLESSING_EDGE_CHARS = (
+    " \t\r\n\u3000:：\"'“”‘’「」『』《》【】[]()（）"
+)
+
+
+class MonthlyMemoirError(Exception):
+    """月度消费回忆录生成失败。
+
+    code 取值：
+      no_api_key   未配置 DeepSeek API Key（**未发请求**）
+      empty_stats  stats 不是 dict / 没有可写的内容（**未发请求**）
+      network      网络异常（超时 / 连接失败 / 其它请求层异常）
+      http         接口返回非 200（message 只带状态码，不带响应体）
+      parse        响应不是合法 JSON / choices/content 缺失或为空 / 解析不出正文
+
+    message 为面向用户的中文提示，可直接展示。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"MonthlyMemoirError(code={self.code!r}, message={self.message!r})"
+
+
+def _monthly_memoir_amount(value) -> float:
+    """stats 里的金额宽松转 float：None / bool / 非数字 / nan / inf → 0.0。
+
+    为什么宽容而不是抛错：stats 由 db.build_memoir_anchors 产出，某个键缺失只
+    说明"这项没有数据"，不该让整段回忆录失败；结构层面的硬校验在
+    generate_monthly_memoir 里（stats 不是 dict / 什么都没有直接报错）。
+    """
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(amount):
+        return 0.0
+    return amount
+
+
+def _monthly_memoir_count(value) -> int:
+    """stats 里的次数宽松转 int：None / bool / 非数字 / nan / inf / 负数 → 0。"""
+    if isinstance(value, bool):
+        return 0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(number) or number <= 0:
+        return 0
+    return int(number)
+
+
+def _monthly_memoir_text(value) -> str:
+    """stats 里的文本宽松转 str：None / bool → ""，其余 str() 后 strip。"""
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    try:
+        return str(value).strip()
+    except (TypeError, ValueError):
+        return ""
+
+
+def _monthly_memoir_anchor(stats: dict, key: str) -> dict:
+    """把 stats[key] 收敛成一条锚点；不是 dict / 什么内容都没有 → None（整行不写）。
+
+    这些字段混在一起按需取用：happiest / painful 用 merchant/amount/date/category，
+    top_merchant 用 merchant/count/total，缺的字段一律给"空 / 0"，绝不 KeyError。
+    """
+    raw = stats.get(key)
+    if not isinstance(raw, dict):
+        return None
+    anchor = {
+        "merchant": _monthly_memoir_text(raw.get("merchant")),
+        "amount": _monthly_memoir_amount(raw.get("amount")),
+        "date": _monthly_memoir_text(raw.get("date")),
+        "category": _monthly_memoir_text(raw.get("category")),
+        "count": _monthly_memoir_count(raw.get("count")),
+        "total": _monthly_memoir_amount(raw.get("total")),
+    }
+    if (
+        not anchor["merchant"]
+        and not anchor["amount"]
+        and not anchor["count"]
+        and not anchor["total"]
+    ):
+        return None
+    return anchor
+
+
+def _monthly_memoir_month(stats: dict) -> str:
+    """取展示用月份文案：优先 month_label（"2026年10月"），退回 month（"2026-10"）。"""
+    month_label = _monthly_memoir_text(stats.get("month_label"))
+    if month_label:
+        return month_label
+    return _monthly_memoir_text(stats.get("month"))
+
+
+def _monthly_memoir_expense_line(label: str, anchor: dict) -> str:
+    """拼「最开心的一笔：淘宝 ¥299.00（2026-10-12，购物）」这类锚点行。"""
+    merchant = anchor["merchant"] or "未知商户"
+    line = f"{label}：{merchant} ¥{anchor['amount']:.2f}"
+    extra = [item for item in (anchor["date"], anchor["category"]) if item]
+    if extra:
+        line += "（" + "，".join(extra) + "）"
+    return line
+
+
+def _monthly_memoir_merchant_line(label: str, anchor: dict) -> str:
+    """拼「最高频商户：食堂，3 次，累计 ¥53.00」。"""
+    merchant = anchor["merchant"] or "未知商户"
+    line = f"{label}：{merchant}"
+    if anchor["count"]:
+        line += f"，{anchor['count']} 次"
+    if anchor["total"]:
+        line += f"，累计 ¥{anchor['total']:.2f}"
+    return line
+
+
+def _build_monthly_memoir_user_content(stats: dict) -> str:
+    """把 stats 排成中文条目，并在末尾追加输出格式要求（格式要求不进 system prompt）。"""
+    month_text = _monthly_memoir_month(stats)
+    happiest = _monthly_memoir_anchor(stats, "happiest")
+    painful = _monthly_memoir_anchor(stats, "painful")
+    top_merchant = _monthly_memoir_anchor(stats, "top_merchant")
+
+    expense = _monthly_memoir_amount(stats.get("expense"))
+    income = _monthly_memoir_amount(stats.get("income"))
+    raw_net = stats.get("net")
+    net = _monthly_memoir_amount(raw_net) if raw_net is not None else income - expense
+    bill_count = _monthly_memoir_count(stats.get("bill_count"))
+    has_expense = bool(stats.get("has_expense"))
+
+    lines = ["这是我本月最值得写的几笔消费，请按系统要求写一段月度消费回忆录："]
+    if month_text:
+        lines.append(f"本月：{month_text}")
+    if happiest is not None:
+        lines.append(_monthly_memoir_expense_line("最开心的一笔", happiest))
+    if painful is not None:
+        lines.append(_monthly_memoir_expense_line("最心疼的一笔", painful))
+    if top_merchant is not None:
+        lines.append(_monthly_memoir_merchant_line("最高频商户", top_merchant))
+    if has_expense or expense or income or net:
+        lines.append(
+            f"本月支出：¥{expense:.2f}，收入：¥{income:.2f}，总结余：¥{net:.2f}"
+        )
+    if bill_count:
+        lines.append(f"本月账单：{bill_count} 笔")
+    lines.append(
+        "输出格式要求：先用第一人称写回忆录正文（150 字左右），"
+        "最后单独一行以「下月寄语：」开头写一句下个月的寄语；"
+        "不要分点、不要解释、不要复述上面的数字。"
+    )
+    return "\n".join(lines)
+
+
+def _monthly_memoir_last_sentence(text: str) -> tuple[str, str]:
+    """没有「下月寄语」标记时的兜底：最后一句当寄语，其余当正文。"""
+    body = text.strip()
+    cut = max(body.rfind("。"), body.rfind("\n"))
+    if cut < 0:
+        # 只有一句、连句号都没有：能写出来的都是正文，不硬切（避免死板失败）。
+        return body, ""
+    if body[cut + 1:].strip():
+        return body[:cut], body[cut + 1:].strip()
+    # 结尾正好是句号 / 空行：往前找一个分隔符；寄语仍从原串切，保住句末标点。
+    head = body[:cut].rstrip()
+    prev = max(head.rfind("。"), head.rfind("\n"))
+    if prev < 0:
+        # 通篇只有一句话：整段当正文，不硬造空寄语。
+        return head, ""
+    return body[:prev], body[prev + 1:].strip()
+
+
+def _monthly_memoir_split(content: str) -> tuple[str, str]:
+    """把模型输出切成（正文, 下月寄语）。
+
+    · 有「下月寄语」标记（兼容全角 / 半角冒号、「寄　语」中间有空格）：标记前是正文，
+      标记后去掉首尾冒号引号空白就是寄语；
+    · 没有标记：最后一句当寄语、其余当正文（不因为模型少写四个字就整段失败）。
+    """
+    text = content.strip()
+    match = _MONTHLY_MEMOIR_BLESSING_MARKER.search(text)
+    if match:
+        memoir_raw = text[:match.start()]
+        blessing_raw = text[match.end():]
+    else:
+        memoir_raw, blessing_raw = _monthly_memoir_last_sentence(text)
+
+    memoir = memoir_raw.strip().rstrip(_MONTHLY_MEMOIR_MEMOIR_TAIL_CHARS).strip()
+    blessing = blessing_raw.strip().strip(_MONTHLY_MEMOIR_BLESSING_EDGE_CHARS).strip()
+    return memoir, blessing
+
+
+def generate_monthly_memoir(stats: dict, api_key: str) -> dict:
+    """根据本月锚点数据生成「月度消费回忆录」：{"memoir": 正文, "blessing": 下月寄语}。
+
+    stats 约定（由 db.build_memoir_anchors 产出；缺失字段按"无 / 0"处理，绝不 KeyError）：
+        {"month": "2026-10", "month_label": "2026年10月",
+         "has_expense": True, "expense": 452.0, "income": 1500.0,
+         "net": 1048.0, "bill_count": 7,
+         "happiest": {"merchant": "淘宝", "amount": 299.0,
+                      "date": "2026-10-12", "category": "购物"} | None,
+         "painful": {...} | None,
+         "top_merchant": {"merchant": "食堂", "count": 3, "total": 53.0} | None}
+
+    失败一律抛 MonthlyMemoirError（中文 message，可直接上页面）：
+      · api_key 为空                              → no_api_key（且**不发请求**）；
+      · stats 不是 dict / 没有任何可写的内容        → empty_stats（且**不发请求**）；
+      · 超时 / 连接失败 / 其它请求层异常              → network；
+      · 非 200                                    → http（只带状态码，不拼响应体）；
+      · 响应不是 JSON / content 缺失或为空 / 切不出正文 → parse。
+    正文超过 320 字截断补「…」，寄语超过 40 字截断补「…」。
+    日志只记月份、字数、状态码与异常类型，**绝不**记 api_key 或正文内容。
+    """
+    # ① api_key：先查它，没有 key 时不该先花一次网络往返。
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise MonthlyMemoirError(
+            "no_api_key",
+            "未配置 DEEPSEEK_API_KEY，月度回忆录暂不可用",
+        )
+    api_key = api_key.strip()
+
+    # ② 数据前置校验：一个月什么都没记时，模型只能硬编故事，毫无意义。
+    if not isinstance(stats, dict):
+        raise MonthlyMemoirError(
+            "empty_stats",
+            "本月消费数据不完整，暂时无法生成回忆录，请刷新后重试",
+        )
+
+    anchors = {
+        key: _monthly_memoir_anchor(stats, key)
+        for key in ("happiest", "painful", "top_merchant")
+    }
+    has_expense = bool(stats.get("has_expense"))
+    expense = _monthly_memoir_amount(stats.get("expense"))
+    income = _monthly_memoir_amount(stats.get("income"))
+    bill_count = _monthly_memoir_count(stats.get("bill_count"))
+    if (
+        not has_expense
+        and not any(anchors.values())
+        and not expense
+        and not income
+        and not bill_count
+    ):
+        raise MonthlyMemoirError(
+            "empty_stats",
+            "本月还没有消费记录，先记几笔再来写回忆录吧",
+        )
+
+    month_label = _monthly_memoir_month(stats) or "未知月份"
+    user_content = _build_monthly_memoir_user_content(stats)
+    payload = {
+        "model": MONTHLY_MEMOIR_MODEL,
+        "messages": [
+            {"role": "system", "content": MONTHLY_MEMOIR_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": MONTHLY_MEMOIR_TEMPERATURE,
+        "max_tokens": MONTHLY_MEMOIR_MAX_TOKENS,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ③ 发请求：超时/连接失败翻译成用户能看懂的句子（不把异常对象漏到页面）。
+    try:
+        resp = requests.post(
+            DEEPSEEK_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=MONTHLY_MEMOIR_TIMEOUT,
+        )
+    except requests.Timeout:
+        logger.warning("月度回忆录请求超时（月份=%s）", month_label)
+        raise MonthlyMemoirError("network", "生成月度回忆录超时，请稍后再试") from None
+    except requests.ConnectionError:
+        logger.warning("月度回忆录请求连接失败（月份=%s）", month_label)
+        raise MonthlyMemoirError("network", "网络连接失败，请检查网络") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：日志只记异常类型（确保不把 headers / key 带出去）。
+        logger.warning(
+            "月度回忆录请求失败（月份=%s，异常=%s）", month_label, type(exc).__name__
+        )
+        raise MonthlyMemoirError("network", "网络连接失败，请检查网络") from None
+
+    # ④ 非 200：只带状态码，不把响应体拼进 message（响应体可能含请求回显）。
+    if resp.status_code != 200:
+        logger.warning("月度回忆录接口返回 HTTP %s（月份=%s）", resp.status_code, month_label)
+        raise MonthlyMemoirError(
+            "http",
+            f"AI 服务返回异常（HTTP {resp.status_code}），请稍后重试",
+        )
+
+    # ⑤ 解析：非 JSON / 结构不符 / content 为空 → 同一条"没有有效回忆录"。
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("月度回忆录响应不是合法 JSON（月份=%s）", month_label)
+        raise MonthlyMemoirError("parse", "AI 没有返回有效回忆录，请重试") from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("月度回忆录响应结构不符合预期（月份=%s）", month_label)
+        raise MonthlyMemoirError("parse", "AI 没有返回有效回忆录，请重试") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("月度回忆录响应 content 为空（月份=%s）", month_label)
+        raise MonthlyMemoirError("parse", "AI 没有返回有效回忆录，请重试")
+
+    # ⑥ 切分：正文 + 下月寄语；正文为空说明模型只写了一句寄语，按解析失败处理。
+    memoir, blessing = _monthly_memoir_split(content)
+    if not memoir:
+        logger.warning("月度回忆录响应解析不出正文（月份=%s）", month_label)
+        raise MonthlyMemoirError("parse", "AI 没有返回有效回忆录，请重试")
+
+    if len(memoir) > MONTHLY_MEMOIR_MAX_CHARS:
+        memoir = memoir[:MONTHLY_MEMOIR_MAX_CHARS] + "…"
+    if len(blessing) > MONTHLY_MEMOIR_MAX_BLESSING_CHARS:
+        blessing = blessing[:MONTHLY_MEMOIR_MAX_BLESSING_CHARS] + "…"
+    logger.info("月度回忆录生成成功（月份=%s，正文字数=%d）", month_label, len(memoir))
+    return {"memoir": memoir, "blessing": blessing}

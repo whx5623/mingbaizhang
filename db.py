@@ -2963,6 +2963,157 @@ def get_month_category_totals(user_id, month: str) -> dict[str, float]:
     return {row.category: _money_to_float(row.total) for row in rows}
 
 
+# ===========================================================================
+# 月度消费回忆录 · 锚点提取（纯函数：吃 DataFrame，不碰数据库）
+# ---------------------------------------------------------------------------
+# Tab1 已经有全量账单 DataFrame（load_all_data），回忆录只需要本月最值得写的
+# 几笔，所以这里不新增 SQL，只做「从账单里挑故事」：
+#   · happiest    : 娱乐 / 购物里金额最大的一笔（「最开心的一笔消费」）
+#   · painful     : 本月金额最大的单笔支出（「最心疼的一笔」）
+#   · top_merchant: 本月出现次数最多的商户（同次数比累计金额，再比名称）
+#   · net         : 本月收入 - 支出
+# 返回结构逐字固定：app.py 直接展示，ai_agent.generate_monthly_memoir 直接当 stats 用。
+# ===========================================================================
+
+MEMOIR_HAPPY_CATEGORIES = ("娱乐", "购物")
+
+
+def build_memoir_anchors(df, month: str) -> dict:
+    """从账单 DataFrame 里提取本月 4 个「回忆录锚点」。纯函数，不读库、不写库。
+
+    参数
+    ----
+    df    : 至少包含 date / merchant / amount / type 列的 DataFrame
+            （app.py 的 load_all_data 返回；有 category 更好，没有就按"其他"处理）。
+    month : "YYYY-MM"（严格校验，复用 _parse_report_month）。
+
+    返回（逐字固定）
+    ----------------
+      month / month_label / has_expense
+      expense / income / net / bill_count
+      happiest     : {"merchant", "amount", "date", "category"} | None
+      painful      : {"merchant", "amount", "date", "category"} | None
+      top_merchant : {"merchant", "count", "total"} | None
+
+    口径：
+      · 金额一律两位小数（_money_to_float），日期一律 "YYYY-MM-DD" 字符串
+        （JSON 可序列化，直接能进 session_state / 喂给 AI）；
+      · 空表 / 没有本月账单 / 没有支出 → has_expense=False，三个锚点都是 None，
+        金额是 0.0，绝不抛错（"这个月没记账"不是错误）；
+      · 金额非数字的行（历史脏数据）直接跳过，不让整段回忆录挂掉；
+      · 并列时取 DataFrame 里先出现的那一行（账单默认按日期倒序，结果稳定）。
+    """
+    if not isinstance(month, str):
+        raise ValueError(f"月份格式必须是 YYYY-MM（例如 2026-10）：{month!r}")
+    _parse_report_month(month)  # 严格校验格式，非法在动 DataFrame 之前就抛 ValueError
+    month_label = f"{month[:4]}年{int(month[5:7])}月"
+
+    empty = {
+        "month": month,
+        "month_label": month_label,
+        "has_expense": False,
+        "expense": 0.0,
+        "income": 0.0,
+        "net": 0.0,
+        "bill_count": 0,
+        "happiest": None,
+        "painful": None,
+        "top_merchant": None,
+    }
+    if df is None or getattr(df, "empty", True):
+        return empty
+
+    work = df.copy()
+    # 日期：上层已经解析好 date_parsed 就复用，没有就从 date 现解析（两种都缺 → 空结果）。
+    if "date_parsed" in work.columns:
+        dates = pd.to_datetime(work["date_parsed"], errors="coerce")
+    elif "date" in work.columns:
+        dates = pd.to_datetime(work["date"], errors="coerce")
+    else:
+        return empty
+    work = work.assign(_date=dates)
+    work = work[work["_date"].dt.strftime("%Y-%m") == month]
+    if work.empty:
+        return empty
+
+    work = work.assign(_amount=pd.to_numeric(work.get("amount"), errors="coerce"))
+    work = work.dropna(subset=["_date", "_amount"]).copy()
+    if work.empty:
+        return empty
+
+    work["_type"] = work["type"].astype(str).str.strip() if "type" in work.columns else ""
+    if "merchant" in work.columns:
+        work["_merchant"] = (
+            work["merchant"]
+            .astype(str)
+            .str.strip()
+            .replace({"": "未知商户", "nan": "未知商户", "None": "未知商户"})
+        )
+    else:
+        work["_merchant"] = "未知商户"
+    if "category" in work.columns:
+        work["_category"] = (
+            work["category"]
+            .fillna(FALLBACK_CATEGORY)
+            .astype(str)
+            .str.strip()
+            .replace({"": FALLBACK_CATEGORY, "nan": FALLBACK_CATEGORY})
+        )
+    else:
+        work["_category"] = FALLBACK_CATEGORY
+
+    expense = work[work["_type"] == EXPENSE_TYPE]
+    income = work[work["_type"] == INCOME_TYPE]
+
+    def _pick(frame):
+        """取金额最大的一行；空表返回 None（并列时 idxmax 取先出现的那行）。"""
+        if frame.empty:
+            return None
+        row = frame.loc[frame["_amount"].idxmax()]
+        return {
+            "merchant": str(row["_merchant"]),
+            "amount": _money_to_float(row["_amount"]),
+            "date": row["_date"].strftime("%Y-%m-%d"),
+            "category": str(row["_category"]),
+        }
+
+    happiest = _pick(expense[expense["_category"].isin(MEMOIR_HAPPY_CATEGORIES)])
+    painful = _pick(expense)
+
+    top_merchant = None
+    if not expense.empty:
+        grouped = (
+            expense.groupby("_merchant")
+            .agg(count=("_amount", "size"), total=("_amount", "sum"))
+            .reset_index()
+            .sort_values(
+                ["count", "total", "_merchant"], ascending=[False, False, True]
+            )
+        )
+        row = grouped.iloc[0]
+        top_merchant = {
+            "merchant": str(row["_merchant"]),
+            "count": int(row["count"]),
+            "total": _money_to_float(row["total"]),
+        }
+
+    expense_total = _money_to_float(expense["_amount"].sum()) if not expense.empty else 0.0
+    income_total = _money_to_float(income["_amount"].sum()) if not income.empty else 0.0
+
+    return {
+        "month": month,
+        "month_label": month_label,
+        "has_expense": not expense.empty,
+        "expense": expense_total,
+        "income": income_total,
+        "net": _money_to_float(income_total - expense_total),
+        "bill_count": int(len(work)),
+        "happiest": happiest,
+        "painful": painful,
+        "top_merchant": top_merchant,
+    }
+
+
 def generate_smart_budget(user_id, total_budget, month: str | None = None) -> dict:
     """让 AI 按某个月的真实分类支出，给出一个总预算 = total_budget 的分配方案。
 

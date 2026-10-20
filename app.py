@@ -805,6 +805,114 @@ def _sandbox_fallback_advice(result: dict) -> str:
     )
 
 
+# ===== 本月消费回忆录：AI 写手可能还没合入（并行开发），一律走防御式取用 =====
+def _get_monthly_memoir_fn():
+    """按模块属性取 ai_agent.generate_monthly_memoir：缺失 / 未合入时返回 None。
+
+    刻意不用 `from ai_agent import ...`：函数正由并行方实现，import 期不存在会
+    直接把整页打红；getattr 取属性既能感知「稍后才上线」，也方便测试打桩。
+    """
+    try:
+        import ai_agent as _ai_agent_mod
+    except Exception as _ai_import_exc:  # pragma: no cover - 依赖缺失时只降级
+        print(
+            f"[memoir] ai_agent 不可用："
+            f"{type(_ai_import_exc).__name__}: {_ai_import_exc}"
+        )
+        return None
+    memoir_fn = getattr(_ai_agent_mod, "generate_monthly_memoir", None)
+    return memoir_fn if callable(memoir_fn) else None
+
+
+def _memoir_anchor_key(anchors: dict) -> str:
+    """锚点 → 稳定缓存 key（字段顺序 / 中文都不影响哈希）。
+
+    与 ai_agent 收到的是同一份 stats，所以「账单没变」= key 不变 = 直接复用上次
+    的回忆录，不重复调 API、不重复扣额度。
+    """
+    return hashlib.sha256(
+        json.dumps(
+            anchors, sort_keys=True, ensure_ascii=False, default=str
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _memoir_amount(value) -> float:
+    """把锚点里的金额归一成有限 float：脏数据 / NaN / inf 一律 0.0。"""
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return amount if math.isfinite(amount) else 0.0
+
+
+def _memoir_fallback(anchors: dict) -> dict:
+    """AI 不可用时的本地回忆录（第一人称、150 字左右 + 一句寄语）。
+
+    只吃 anchors，不读库、不联网、不消耗额度；文案里刻意不出现「AI」二字，
+    避免用户把本地兜底误当成模型生成内容。
+    """
+    anchors = anchors if isinstance(anchors, dict) else {}
+    month_label = str(anchors.get("month_label") or "这个月")
+    expense = _memoir_amount(anchors.get("expense"))
+    income = _memoir_amount(anchors.get("income"))
+    net = _memoir_amount(anchors.get("net"))
+    try:
+        bill_count = int(anchors.get("bill_count") or 0)
+    except (TypeError, ValueError):
+        bill_count = 0
+
+    happiest = anchors.get("happiest")
+    painful = anchors.get("painful")
+    top_merchant = anchors.get("top_merchant")
+
+    pieces = [
+        f"{month_label}过完了，我记了 {bill_count} 笔账，花掉 ¥{expense:.2f}。"
+    ]
+    if isinstance(happiest, dict):
+        _happy_cat = str(happiest.get("category") or "").strip()
+        pieces.append(
+            f"最开心的一笔是「{happiest.get('merchant') or '某家店'}」的 "
+            f"¥{_memoir_amount(happiest.get('amount')):.2f}"
+            + (f"，{_happy_cat}这类钱，花得心甘情愿。" if _happy_cat else "，花得心甘情愿。")
+        )
+    if isinstance(painful, dict):
+        _sad_amount = _memoir_amount(painful.get("amount"))
+        _same_deal = (
+            isinstance(happiest, dict)
+            and happiest.get("merchant") == painful.get("merchant")
+            and _memoir_amount(happiest.get("amount")) == _sad_amount
+        )
+        if _same_deal:
+            pieces.append(
+                "最心疼的偏偏也是它——付款时手指比脑子快，快乐和肉疼一起到账。"
+            )
+        else:
+            pieces.append(
+                f"最心疼的是「{painful.get('merchant') or '某家店'}」的 "
+                f"¥{_sad_amount:.2f}，付款时手指比脑子快。"
+            )
+    if isinstance(top_merchant, dict):
+        try:
+            _visit_count = int(top_merchant.get("count") or 0)
+        except (TypeError, ValueError):
+            _visit_count = 0
+        pieces.append(
+            f"「{top_merchant.get('merchant') or '某家店'}」一个月去了 "
+            f"{_visit_count} 次，累计 ¥{_memoir_amount(top_merchant.get('total')):.2f}，"
+            "老板快认得我的脸了。"
+        )
+    pieces.append(
+        f"收入 ¥{income:.2f}，结余 ¥{net:.2f}；"
+        + ("账记明白了，心里就踏实。" if net >= 0 else "钱包扁了，但账记明白了。")
+    )
+
+    return {
+        "memoir": "".join(pieces),
+        "blessing": "下个月继续记账，花钱前多问自己一句：这笔钱，值不值得？",
+    }
+
+
 # Sidebar
 with st.sidebar:
     # ---- 积分头衔荣誉卡片（纯本地计算；017 未执行 / 读库失败只隐藏卡片）----
@@ -2744,6 +2852,147 @@ with tab_dash:
         mime="text/csv",
     )
 
+    # ---- 📖 本月消费回忆录（AI 灵魂写手：不点按钮绝不调 API）----
+    # 放在财务看板最底部（导出之后）：先看数据，再看故事，符合阅读顺序。
+    # 锚点读取失败 / 没有支出都只降级成一行 caption，绝不让整块红屏。
+    with st.expander("📖 翻阅本月的消费回忆录", expanded=False):
+        _memoir_anchors = None
+        try:
+            _memoir_anchors = db.build_memoir_anchors(df, current_month_str)
+        except Exception as _memoir_anchor_exc:
+            # 迁移没执行 / 脏数据等：只打日志，不把 traceback 漏到页面
+            print(
+                f"[memoir] 锚点提取失败："
+                f"{type(_memoir_anchor_exc).__name__}: {_memoir_anchor_exc}"
+            )
+            _memoir_anchors = None
+
+        if not isinstance(_memoir_anchors, dict):
+            st.caption("回忆录暂时读不出这个月的账单，稍后再来翻翻吧")
+        elif not _memoir_anchors.get("has_expense"):
+            st.caption("这个月还没有支出账单，先记几笔再来写回忆录吧")
+        else:
+            _memoir_cache_key = _memoir_anchor_key(_memoir_anchors)
+
+            # 锚点摘要：小号 caption，不用表格——回忆录是叙事，不是报表
+            _memoir_happiest = _memoir_anchors.get("happiest")
+            _memoir_painful = _memoir_anchors.get("painful")
+            _memoir_top = _memoir_anchors.get("top_merchant")
+            if isinstance(_memoir_happiest, dict):
+                st.caption(
+                    "🎈 最开心的一笔："
+                    f"{_memoir_happiest.get('merchant')} "
+                    f"¥{_memoir_amount(_memoir_happiest.get('amount')):.2f}"
+                    f"（{_memoir_happiest.get('date')} · "
+                    f"{_memoir_happiest.get('category')}）"
+                )
+            else:
+                st.caption("🎈 最开心的一笔：这个月没在娱乐 / 购物上花钱，克制得很。")
+            if isinstance(_memoir_painful, dict):
+                st.caption(
+                    "💔 最心疼的一笔："
+                    f"{_memoir_painful.get('merchant')} "
+                    f"¥{_memoir_amount(_memoir_painful.get('amount')):.2f}"
+                    f"（{_memoir_painful.get('date')}）"
+                )
+            else:
+                st.caption("💔 最心疼的一笔：还没出现，希望它一直别出现。")
+            if isinstance(_memoir_top, dict):
+                st.caption(
+                    "🏪 最高频商户："
+                    f"{_memoir_top.get('merchant')}，"
+                    f"{int(_memoir_top.get('count') or 0)} 笔共 "
+                    f"¥{_memoir_amount(_memoir_top.get('total')):.2f}"
+                )
+            else:
+                st.caption("🏪 最高频商户：暂无")
+            st.caption(
+                f"💰 本月结余：¥{_memoir_amount(_memoir_anchors.get('net')):.2f}"
+            )
+
+            # 不点按钮绝不触发 API：额度检查放在按钮回调里，页面刷新不扣额度
+            if st.button("✍️ 让 AI 写下这个月", key="memoir_write_btn"):
+                _memoir_saved = st.session_state.get("monthly_memoir")
+                _memoir_hit = (
+                    isinstance(_memoir_saved, dict)
+                    and _memoir_saved.get("key") == _memoir_cache_key
+                    and bool(str(_memoir_saved.get("memoir") or "").strip())
+                )
+                if _memoir_hit:
+                    # 同 key 已有成品：下方渲染直接复用，不重复调用、不扣额度
+                    pass
+                elif st.session_state.get("ai_daily_count", 0) >= 20:
+                    st.warning("今日免费额度已用完，请明天再来")
+                else:
+                    _memoir_fn = _get_monthly_memoir_fn()
+                    _memoir_text = ""
+                    _memoir_blessing = ""
+                    _memoir_failed = False
+                    if _memoir_fn is None:
+                        # 并行开发期后端还没上线：本地兜底。没有真的发请求，所以不扣额度。
+                        print(
+                            "[memoir] ai_agent.generate_monthly_memoir 尚未提供，"
+                            "使用本地兜底"
+                        )
+                        _memoir_failed = True
+                    else:
+                        # 只有在「确实会发起请求」时才 +1；异常发生在请求之后，所以也 +1
+                        st.session_state.ai_daily_count += 1
+                        try:
+                            with st.spinner("AI 正在回放这个月的账单…"):
+                                _memoir_result = _memoir_fn(
+                                    _memoir_anchors, get_deepseek_api_key()
+                                )
+                        except Exception as _memoir_exc:
+                            print(
+                                f"[memoir] 生成失败："
+                                f"{type(_memoir_exc).__name__}: {_memoir_exc}"
+                            )
+                            _memoir_failed = True
+                        else:
+                            if isinstance(_memoir_result, dict):
+                                _memoir_text = str(
+                                    _memoir_result.get("memoir") or ""
+                                ).strip()
+                                _memoir_blessing = str(
+                                    _memoir_result.get("blessing") or ""
+                                ).strip()
+                            if not _memoir_text:
+                                # 后端违约返回空文本 / 类型不对：同样本地兜底，页面不能空着
+                                print("[memoir] AI 返回空文本，使用本地兜底")
+                                _memoir_failed = True
+                    if _memoir_failed:
+                        _memoir_local = _memoir_fallback(_memoir_anchors)
+                        _memoir_text = _memoir_local["memoir"]
+                        _memoir_blessing = _memoir_local["blessing"]
+                    st.session_state["monthly_memoir"] = {
+                        "key": _memoir_cache_key,
+                        "memoir": _memoir_text,
+                        "blessing": _memoir_blessing,
+                        "fallback": bool(_memoir_failed),
+                    }
+
+            # 渲染独立于按钮：rerun 后只要 key 与当前锚点一致，就继续展示上次的回忆录；
+            # 账单变了（key 不同）刻意不渲染旧文，避免文案与数据对不上。
+            _memoir_saved = st.session_state.get("monthly_memoir")
+            if (
+                isinstance(_memoir_saved, dict)
+                and _memoir_saved.get("key") == _memoir_cache_key
+                and str(_memoir_saved.get("memoir") or "").strip()
+            ):
+                for _memoir_line in str(_memoir_saved["memoir"]).splitlines():
+                    if _memoir_line.strip():
+                        st.markdown("> " + _memoir_line.strip())
+                _memoir_blessing_text = str(
+                    _memoir_saved.get("blessing") or ""
+                ).strip()
+                _memoir_caption = "下月寄语：" + (
+                    _memoir_blessing_text or "愿你下个月花得明白、存得踏实。"
+                )
+                if _memoir_saved.get("fallback"):
+                    _memoir_caption += "（本地兜底）"
+                st.caption(_memoir_caption)
+
 with tab_tools:
     # ---- 手动记一笔 ----
     with st.container(border=True, key="card_manual"):
@@ -4228,6 +4477,22 @@ with tab_ai:
             except Exception:
                 _poster_app_url = ""
 
+            # 回忆录寄语：只读 Tab1 已缓存的成品，绝不为了海报再调 AI / 读库；
+            # 没生成过回忆录就传空字符串，poster 会整段不画（现有排版不变）。
+            _poster_memoir_blessing = ""
+            try:
+                _poster_memoir = st.session_state.get("monthly_memoir")
+                if isinstance(_poster_memoir, dict):
+                    _poster_memoir_blessing = str(
+                        _poster_memoir.get("blessing") or ""
+                    ).strip()
+            except Exception as _memoir_exc:
+                print(
+                    f"[poster] 读取回忆录寄语失败："
+                    f"{type(_memoir_exc).__name__}: {_memoir_exc}"
+                )
+                _poster_memoir_blessing = ""
+
             _poster_payload = {
                 "nickname": _poster_nickname,
                 "month": current_month_str,
@@ -4239,6 +4504,7 @@ with tab_ai:
                 "top_amount": _poster_top_amount,
                 "comment": _poster_comment,
                 "app_url": _poster_app_url,
+                "memoir_blessing": _poster_memoir_blessing,
             }
 
             if poster is None:

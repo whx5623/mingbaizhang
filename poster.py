@@ -46,6 +46,15 @@ _CONTENT_W = CANVAS_SIZE[0] - _MARGIN * 2
 # AI 点评卡片固定区域（高度固定，保证整张海报版式稳定）
 _AI_BOX = (72, 1000, 1008, 1480)
 
+# 回忆录寄语（Tab1 生成后随 payload 传进来）固定排在底部文案与落款之间：
+#   · 底部文案 y=1558（30px，实测墨迹到 y≈1594），标签从 1600 起才不叠字；
+#   · 二维码固定在 x∈[830,1002]、y∈[1630,1802]，所以正文右边界锁在 820；
+#   · 落款 y=1838，正文两行（26px）最远到 ≈1704，不会顶到落款。
+# 这些坐标只在「有寄语」时使用；空字符串时一行都不画，原有排版坐标保持原样。
+_MEMOIR_LABEL_Y = 1600
+_MEMOIR_BODY_Y = 1634
+_MEMOIR_MAX_WIDTH = 820 - _MARGIN  # 748：右手边给二维码留出安全区
+
 
 # ============================ 字体候选 ============================
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -329,6 +338,37 @@ def _draw_ai_card(
     return img
 
 
+def _draw_memoir_blessing(draw, text: str, regular_path: str) -> None:
+    """在底部文案与落款之间画「下月寄语」（最多 2 行；空文本直接不画）。
+
+    文本宽度硬锁 `_MEMOIR_MAX_WIDTH`（748px），是为了给右下角二维码（x≥830）
+    留出安全区：即使寄语很长也只会折行 / 截断，绝不压到码上。
+    """
+    text = _safe_text(text, "")
+    if not text:
+        return
+
+    label_font = _load_font(regular_path, 22)
+    draw.text((_MARGIN, _MEMOIR_LABEL_Y), "下月寄语", font=label_font, fill=_TEXT_DIM)
+
+    body_font = _load_font(regular_path, 26)
+    lines = _clip_lines(
+        draw,
+        _wrap_text(draw, text, body_font, _MEMOIR_MAX_WIDTH),
+        body_font,
+        _MEMOIR_MAX_WIDTH,
+        2,
+    )
+    line_h = _line_height(body_font, 1.4)
+    for offset, line in enumerate(lines):
+        draw.text(
+            (_MARGIN, _MEMOIR_BODY_Y + offset * line_h),
+            line,
+            font=body_font,
+            fill=(125, 211, 252),
+        )
+
+
 def _make_qr(app_url: str, size: int = 160):
     """生成二维码位图；qrcode 缺失或编码失败时返回 None（海报照常出，只是没码）。"""
     if not app_url:
@@ -426,6 +466,10 @@ def _normalize_payload(payload: dict) -> dict:
             "这个月辛苦了，继续坚持记账，下个月会更从容。",
         ),
         "app_url": _safe_text(payload.get("app_url"), ""),
+        # 回忆录寄语：允许为空（没生成回忆录 / 生成失败都传空），空时海报不画这一段。
+        # 先 `or ""` 再 _safe_text：_safe_text 会把 None 转成字符串 "None"，
+        # 那会被当成有效寄语录到海报上，所以缺失值必须在这里就归成 ""。
+        "memoir_blessing": _safe_text(payload.get("memoir_blessing") or "", ""),
     }
 
 
@@ -531,6 +575,10 @@ def _render(data: dict) -> bytes:
         fill=_TEXT_DIM,
     )
 
+    # ---- 本月回忆录的「下月寄语」（仅当 payload 带了非空寄语才画）----
+    # 宽度锁在二维码左侧安全区，所以放在二维码之前画也不会压码。
+    _draw_memoir_blessing(draw, data["memoir_blessing"], regular_path)
+
     # ---- 二维码（仅当 APP_URL 配置且 qrcode 可用）----
     has_qr = _draw_qr(img, data["app_url"], regular_path)
     draw = ImageDraw.Draw(img)
@@ -553,6 +601,9 @@ def build_poster(payload: dict) -> bytes:
 
     Args:
         payload: 见模块 docstring / 调用方 app.py；缺字段会用安全默认值补齐。
+            其中 ``memoir_blessing`` 是可选字段（Tab1 回忆录的「下月寄语」）：
+            非空时画在底部文案与落款之间（最多 2 行），空 / 缺省时整段不画，
+            其余排版坐标一行都不动。
 
     Returns:
         1080×1920 PNG 的 bytes。
