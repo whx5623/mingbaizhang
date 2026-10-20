@@ -2912,3 +2912,219 @@ def generate_debt_warning(stats: dict, api_key: str) -> str:
         content = content[:DEBT_WARNING_MAX_CHARS] + "…"
     logger.info("还款预警生成成功（月份=%s，字数=%d）", month, len(content))
     return content
+
+
+# ===========================================================================
+# 拿铁因子 · AI 灵魂拷问（deepseek-chat）
+# ---------------------------------------------------------------------------
+# 输入是 db.get_latte_factor() 的统计 + db.project_latte_compound() 的复利结果，
+# 输出一段约 50 字的「灵魂拷问」文案。设计边界：
+#   · 只做"文案生成"，不做统计、不做复利计算、不写库、不碰账单表；
+#   · 没有 key / 日均非必要消费 <= 0 时**一个请求都不发**（省一次网络往返，
+#     也避免让模型对着 0 硬编"你每天都在浪费钱"）；
+#   · 系统提示词逐字固定（产品口径，改一个字文案风格就跑偏）；
+#   · 日志只记统计月数、字数、状态码与异常类型，**绝不**记 api_key 或金额明细。
+# ===========================================================================
+
+# 系统提示词必须**逐字**保持（产品口径）。
+LATTE_ROAST_SYSTEM_PROMPT = "你是一个犀利又懂大学生的理财教练。根据我的日均非必要消费和复利计算结果，用 50 字左右写一段“灵魂拷问”：要具体到每天多少钱、多年后本可以拥有多少钱，并给一个扎心但真实的对比（例如一台顶配 MacBook Pro）。不要寒暄、不要分点、不要解释，直接输出一段话。"
+
+LATTE_ROAST_MODEL = "deepseek-chat"
+LATTE_ROAST_TEMPERATURE = 0.8   # 拷问要"人味"、要扎心，0.8 足够发散但不跑题
+LATTE_ROAST_MAX_TOKENS = 200    # 50 字 + 余量
+LATTE_ROAST_TIMEOUT = 20
+LATTE_ROAST_MAX_CHARS = 100     # 返回文本硬上限：超过截断到 100 字并补「…」
+
+
+class LatteRoastError(Exception):
+    """拿铁因子灵魂拷问生成失败。
+
+    code 取值：
+      no_api_key   未配置 DeepSeek API Key（**未发请求**）
+      empty_stats  stats 不是 dict / 日均非必要消费缺失或 <= 0（**未发请求**）
+      network      网络异常（超时 / 连接失败 / 其它请求层异常）
+      http         接口返回非 200（message 只带状态码，不带响应体）
+      parse        响应不是合法 JSON / choices/content 缺失或为空
+
+    message 为面向用户的中文提示，可直接展示。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"LatteRoastError(code={self.code!r}, message={self.message!r})"
+
+
+def _latte_amount(value):
+    """金额宽松转 float：None / bool / 非数字 / nan / inf → None（表示"没有这项数据"）。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(amount):
+        return None
+    return amount
+
+
+def _latte_int(value, default: int = 0) -> int:
+    """年限 / 月数转 int：非法 / 负数 → default（只用于文案，不值得为此报错）。"""
+    amount = _latte_amount(value)
+    if amount is None or amount < 0:
+        return default
+    return int(amount)
+
+
+def _format_latte_projection(projection) -> list[str]:
+    """各年限复利结果排成缩进条目；结构不对的条目直接跳过，绝不 KeyError。"""
+    lines = []
+    if isinstance(projection, (list, tuple)):
+        for item in projection:
+            if not isinstance(item, dict):
+                continue
+            years = _latte_int(item.get("years"))
+            value = _latte_amount(item.get("future_value"))
+            if years <= 0 or value is None:
+                continue
+            lines.append(f"  {years} 年后：{value:.2f} 元")
+    if not lines:
+        lines.append("  无")
+    return lines
+
+
+def _build_latte_roast_user_content(stats: dict) -> str:
+    """把拿铁因子统计 + 复利结果排成中文条目（金额一律两位小数、年化转百分比）。"""
+    daily_avg = _latte_amount(stats.get("daily_avg")) or 0.0
+    months = _latte_int(stats.get("months"))
+    top_category = str(stats.get("top_category") or "").strip() or "无"
+
+    annual_rate = _latte_amount(stats.get("annual_rate"))
+    rate_text = f"{annual_rate * 100:.1f}%" if annual_rate is not None else "未提供"
+
+    ten_year = _latte_amount(stats.get("ten_year_value"))
+    ten_year_text = f"{ten_year:.2f} 元" if ten_year is not None else "未提供"
+
+    lines = [
+        "这是我的非必要消费数据和复利测算结果，请按系统要求写一段灵魂拷问：",
+        f"日均非必要消费：{daily_avg:.2f} 元",
+        f"统计月数：{months} 个月",
+        f"Top 分类：{top_category}",
+        f"年化收益率：{rate_text}",
+        f"10 年后可拥有：{ten_year_text}",
+        "各年限复利结果：",
+        *_format_latte_projection(stats.get("projection")),
+    ]
+    return "\n".join(lines)
+
+
+def generate_latte_roast(stats: dict, api_key: str) -> str:
+    """根据拿铁因子统计 + 复利结果生成一段约 50 字的「灵魂拷问」，返回 strip 后文本。
+
+    stats 约定（缺失字段按"无 / 未提供 / 0"处理，绝不 KeyError）：
+        {"daily_avg": 15.0, "total": 1350.0, "months": 3,
+         "top_category": "奶茶咖啡", "annual_rate": 0.05,
+         "ten_year_value": 25000.0,
+         "projection": [{"years": 1, "future_value": ...}, ...]}
+
+    失败一律抛 LatteRoastError（中文 message，可直接上页面）：
+      · api_key 为空                            → no_api_key（且**不发请求**）；
+      · stats 不是 dict / daily_avg 缺失或 <= 0  → empty_stats（且**不发请求**）；
+      · 超时 / 连接失败 / 其它请求层异常          → network；
+      · 非 200                                  → http（只带状态码，不拼响应体）；
+      · 响应不是 JSON / content 缺失或为空        → parse。
+    返回文本超过 100 字时截断到 100 字并补「…」。
+    日志只记统计月数、字数、状态码与异常类型，**绝不**记 api_key 或金额明细。
+    """
+    # ① api_key：先查它，没有 key 时不该先花一次网络往返。
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise LatteRoastError(
+            "no_api_key",
+            "未配置 DEEPSEEK_API_KEY，拿铁因子拷问暂不可用",
+        )
+    api_key = api_key.strip()
+
+    # ② 数据前置校验：日均非必要消费 <= 0 时让模型硬编只会产出尴尬文案。
+    if not isinstance(stats, dict):
+        raise LatteRoastError(
+            "empty_stats",
+            "拿铁因子数据不完整，暂时无法生成拷问，请刷新后重试",
+        )
+    daily_avg = _latte_amount(stats.get("daily_avg"))
+    if daily_avg is None or daily_avg <= 0:
+        raise LatteRoastError(
+            "empty_stats",
+            "最近没有非必要消费记录，先记几笔再来看拿铁因子吧",
+        )
+    months = _latte_int(stats.get("months"))
+
+    user_content = _build_latte_roast_user_content(stats)
+    payload = {
+        "model": LATTE_ROAST_MODEL,
+        "messages": [
+            {"role": "system", "content": LATTE_ROAST_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": LATTE_ROAST_TEMPERATURE,
+        "max_tokens": LATTE_ROAST_MAX_TOKENS,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ③ 发请求：超时/连接失败翻译成用户能看懂的句子（不把异常对象漏到页面）。
+    try:
+        resp = requests.post(
+            DEEPSEEK_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=LATTE_ROAST_TIMEOUT,
+        )
+    except requests.Timeout:
+        logger.warning("拿铁因子拷问请求超时（统计月数=%s）", months)
+        raise LatteRoastError("network", "生成拿铁因子拷问超时，请稍后再试") from None
+    except requests.ConnectionError:
+        logger.warning("拿铁因子拷问请求连接失败（统计月数=%s）", months)
+        raise LatteRoastError("network", "网络连接失败，请检查网络") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：日志只记异常类型（确保不把 headers / key 带出去）。
+        logger.warning(
+            "拿铁因子拷问请求失败（统计月数=%s，异常=%s）", months, type(exc).__name__
+        )
+        raise LatteRoastError("network", "网络连接失败，请检查网络") from None
+
+    # ④ 非 200：只带状态码，不把响应体拼进 message（响应体可能含请求回显）。
+    if resp.status_code != 200:
+        logger.warning("拿铁因子拷问接口返回 HTTP %s（统计月数=%s）", resp.status_code, months)
+        raise LatteRoastError(
+            "http",
+            f"AI 服务返回异常（HTTP {resp.status_code}），请稍后重试",
+        )
+
+    # ⑤ 解析：非 JSON / 结构不符 / content 为空 → 同一条"没有有效拷问"。
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("拿铁因子拷问响应不是合法 JSON（统计月数=%s）", months)
+        raise LatteRoastError("parse", "AI 没有返回有效拷问，请重试") from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("拿铁因子拷问响应结构不符合预期（统计月数=%s）", months)
+        raise LatteRoastError("parse", "AI 没有返回有效拷问，请重试") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("拿铁因子拷问响应 content 为空（统计月数=%s）", months)
+        raise LatteRoastError("parse", "AI 没有返回有效拷问，请重试")
+
+    content = content.strip()
+    if len(content) > LATTE_ROAST_MAX_CHARS:
+        content = content[:LATTE_ROAST_MAX_CHARS] + "…"
+    logger.info("拿铁因子拷问生成成功（统计月数=%s，字数=%d）", months, len(content))
+    return content

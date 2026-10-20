@@ -5236,3 +5236,291 @@ def forecast_repayments(user_id, months_ahead: int = 3, lookback_months: int = 6
         "total_forecast": total_forecast,
         "matched_merchants": matched_merchants,
     }
+
+
+# ===========================================================================
+# 拿铁因子（非必要消费统计）+ 复利定投模拟
+# ---------------------------------------------------------------------------
+# 本段只**追加**：不改动上面任何既有函数、常量与取数口径。
+# 分工：
+#   · get_latte_factor(...)       只读 bills（依赖 012 的 category 列）；
+#                                  参数校验全部在开连接之前完成；
+#   · project_latte_compound(...) 纯函数，不碰 DB、不读全局状态。
+# 依赖的既有件（全部在文件上方已定义，这里不重新实现）：
+#   _normalize_bill_query_user_id / _normalize_forecast_today / _normalize_category_value
+#   / _as_decimal / _money_to_float / EXPENSE_TYPE / _CENT。
+# ===========================================================================
+
+# 非必要消费分类（与 BILL_CATEGORIES 里的三个值逐字一致；改这里即可改口径）。
+NON_ESSENTIAL_CATEGORIES = ("奶茶咖啡", "娱乐", "购物")
+LATTE_MONTHS_MIN = 1
+LATTE_MONTHS_MAX = 12
+LATTE_YEARS_MIN = 1
+LATTE_YEARS_MAX = 60
+LATTE_DAYS_PER_MONTH = 30  # 「每天 X 元」折算成月定投额：X × 30（产品口径，不摊 30.44）
+
+
+def _normalize_latte_months(months) -> int:
+    """统计窗口月数必须是 1~12 的 int（bool / float / 字符串一律拒绝，不静默截断）。
+
+    不静默转换的理由与 get_daily_expense_totals 同口径：``int(2.9)`` 截断成 2
+    会把"写错区间"伪装成"写对区间"；months=0 则会让窗口起点晚于今天。
+    """
+    if isinstance(months, bool) or not isinstance(months, int):
+        raise ValueError(f"months 必须是 1~{LATTE_MONTHS_MAX} 的整数：{months!r}")
+    if not LATTE_MONTHS_MIN <= months <= LATTE_MONTHS_MAX:
+        raise ValueError(f"months 必须是 1~{LATTE_MONTHS_MAX} 的整数：{months!r}")
+    return months
+
+
+def _latte_category_clause(params: dict) -> str:
+    """把 NON_ESSENTIAL_CATEGORIES 展开成逐个 OR 的 SQL 片段，值全部走绑定参数。
+
+    为什么不用字符串拼 IN：值必须参数绑定，注入面为零；为什么不用 expanding
+    bindparam：那要在模块顶部 import bindparam，而本段按约定只追加、不动既有 import。
+    返回的片段只由**常量元组的下标**生成（:latte_cat_0/1/2），不含任何调用方输入；
+    同时把三个分类值写进 params，调用方直接拿去 conn.execute(stmt, params)。
+    """
+    clauses = []
+    for index, category in enumerate(NON_ESSENTIAL_CATEGORIES):
+        key = f"latte_cat_{index}"
+        params[key] = category
+        clauses.append(f"b.category = :{key}")
+    return "(" + " OR ".join(clauses) + ")"
+
+
+def get_latte_factor(user_id, months: int = 3, today=None) -> dict:
+    """统计某用户近 months 个月的「拿铁因子」：**估算**每天花在非必需品上的平均金额。
+
+    「拿铁因子」= 那些每天不起眼、长期却会滚成大钱的非必要小额消费（一杯奶茶、
+    一次冲动购物、一场电影……）。本函数不做归因、不做预测，只回答一个问题：
+    "在统计窗口里，我平均每天有多少钱花在了 NON_ESSENTIAL_CATEGORIES 上"。
+
+    窗口口径（闭区间，左闭右闭）
+    --------------------------
+    · 起点 = 今天所在月往前推 months-1 个月的 1 号；终点 = 今天（含）。
+      例：today=2026-10-20、months=3 → 2026-08-01 ~ 2026-10-20；
+          months=1 → 2026-10-01 ~ 2026-10-20。
+    · 只统计 ``type = '支出'``，收入不计；``category`` 只认
+      NON_ESSENTIAL_CATEGORIES 三个值（NULL / "餐饮" / "其他" 全部不计）。
+    · days = 窗口内的**自然日天数（含今天）**，用 (end - start).days + 1 算；
+      daily_avg = total / days —— 分母是"窗口过了几天"，不是"记了几天账"，
+      没记账的日子一样摊薄均值，这符合"日均花在非必需品上多少钱"的直觉。
+
+    参数校验（都在**开连接之前**完成，非法入参不浪费一次连接）
+    --------------------------------------------------------
+    · user_id 复用 _normalize_bill_query_user_id（正整数，拒绝 bool / float）；
+    · months 必须是 1~12 的 int（bool / float / 字符串拒绝，不静默截断）；
+    · today 复用 _normalize_forecast_today（date / datetime / "YYYY-MM-DD"）。
+
+    返回（逐字固定，前端按 key 取，顺序无关）
+    ----------------------------------------
+        daily_avg  float  total / days，两位小数
+        total      float  命中金额合计，两位小数
+        days       int    窗口自然日天数（含今天）
+        months     int    回显校验后的统计月数
+        breakdown  list   [{"category": str, "amount": float}]，金额降序；
+                          同额按分类名升序，保证同一份数据每次输出完全一致
+
+    边界与异常
+    ----------
+    · 用户不存在 / 窗口内没有命中 → daily_avg=total=0.0、breakdown=[]，
+      **不抛异常**（"这个月没喝奶茶"是正常状态，不是错误）；
+    · 参数非法 → ValueError；连接 / DB 错误原样上抛（**不**伪装成"没花钱"：
+      真出故障时页面显示"你很省钱"比报错更危险）；
+    · 金额累加用 Decimal，最后统一 _money_to_float 定量两位小数（ROUND_HALF_UP）；
+      breakdown 各分类与 total 同源相加，展示值不会出现"分项之和比 total 多 1 分"；
+    · category 列依赖 migrations/012：012 未执行时 SQL 会报 undefined_column，
+      异常原样上抛（本函数区分不了"没分类"与"没迁移"，不静默返回 0）；
+    · 日志只记 user_id / 区间 / 命中分类数，**绝不**记金额明细。
+    """
+    uid = _normalize_bill_query_user_id(user_id)
+    window_months = _normalize_latte_months(months)
+    end = _normalize_forecast_today(today)
+
+    # 与 get_daily_expense_totals / detect_subscriptions 同一套「月份序号」算法：
+    # 跨年由 floor 除 / 模自然处理，不写 year == 1 分支。
+    month_index = (end.year * 12 + end.month - 1) - (window_months - 1)
+    start = date(month_index // 12, month_index % 12 + 1, 1)
+    days = (end - start).days + 1  # 闭区间自然日：2026-08-01 ~ 10-20 → 81 天
+
+    if engine is None:
+        init_db()
+
+    params = {
+        "uid": uid,
+        "expense": EXPENSE_TYPE,
+        "start": start,
+        "end": end,
+    }
+    stmt = text("\n".join([
+        "SELECT b.category AS category, SUM(b.amount) AS total",
+        "FROM public.bills AS b",
+        "WHERE b.user_id = :uid",
+        "  AND b.type = :expense",
+        "  AND b.date::date >= :start",
+        "  AND b.date::date <= :end",
+        f"  AND {_latte_category_clause(params)}",
+        "GROUP BY b.category",
+    ]))
+    with engine.connect() as conn:
+        rows = conn.execute(stmt, params).fetchall()
+
+    category_totals: dict[str, Decimal] = {}
+    for row in rows:
+        category = _normalize_category_value(row.category)
+        category_totals[category] = (
+            category_totals.get(category, Decimal("0")) + _as_decimal(row.total)
+        )
+
+    total_decimal = sum(category_totals.values(), Decimal("0"))
+    breakdown = [
+        {"category": category, "amount": _money_to_float(amount)}
+        for category, amount in category_totals.items()
+    ]
+    # 金额降序；同额按分类名升序 —— 保证同一份数据每次输出完全一致。
+    breakdown.sort(key=lambda item: (-item["amount"], item["category"]))
+
+    logging.getLogger(__name__).info(
+        "[db] get_latte_factor user_id=%s range=%s..%s months=%s days=%s categories=%s",
+        uid, start, end, window_months, days, len(breakdown),
+    )
+
+    return {
+        "daily_avg": _money_to_float(total_decimal / Decimal(days)),
+        "total": _money_to_float(total_decimal),
+        "days": days,
+        "months": window_months,
+        "breakdown": breakdown,
+    }
+
+
+def _normalize_latte_daily_amount(daily_amount) -> float:
+    """daily_amount 收敛成「有限、≥ 0」的 float；bool / 非数字 / nan / inf / 负数 → ValueError。
+
+    0 是合法值（"不喝奶茶"也要能算出一条全 0 的对照线），所以只挡 < 0。
+    bool 必须单独挡：True/False 是 int 子类，float(True) == 1.0 会把开关静默当成金额。
+    """
+    if isinstance(daily_amount, bool):
+        raise ValueError(f"daily_amount 非法：{daily_amount!r}（不是数字）")
+    try:
+        amount = float(daily_amount)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"daily_amount 非法：{daily_amount!r}（不是数字）") from exc
+    if not math.isfinite(amount):
+        raise ValueError(f"daily_amount 非法：{daily_amount!r}（必须是有限数字，不允许 nan/inf）")
+    if amount < 0:
+        raise ValueError(f"daily_amount 不能为负数：{daily_amount!r}")
+    return amount
+
+
+def _normalize_latte_rate(annual_rate) -> float:
+    """annual_rate 必须是 0~1（含两端）的有限数：0.05 = 5%，0 = 不计息。
+
+    上界 1（100%）不是为了鼓励，而是给"写错小数位"留出明确边界：
+    传 5 会被拒（应该是 0.05），而不是被当成 500% 算出一个离谱数字。
+    """
+    if isinstance(annual_rate, bool):
+        raise ValueError(f"annual_rate 非法：{annual_rate!r}（不是数字）")
+    try:
+        rate = float(annual_rate)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"annual_rate 非法：{annual_rate!r}（不是数字）") from exc
+    if not math.isfinite(rate) or not 0.0 <= rate <= 1.0:
+        raise ValueError(f"annual_rate 必须是 0~1 之间的有限数字：{annual_rate!r}")
+    return rate
+
+
+def _normalize_latte_years(years) -> list[int]:
+    """years 收敛成「去重、升序」的 1~60 int 列表；非法 / 空 → ValueError。
+
+    每一项都必须是真正的 int：3.0 会被静默截断成 3，把"写错类型"伪装成"写对"；
+    bool 是 int 子类，True 会被当成 1 年，同样拒绝。字符串按字符迭代会把 "13"
+    拆成 1 和 3，所以也直接拒绝。空列表没有可投影的年限，按调用方 bug 报错。
+    """
+    if isinstance(years, (str, bytes)) or years is None:
+        raise ValueError(f"years 必须是 1~{LATTE_YEARS_MAX} 的整数序列：{years!r}")
+    try:
+        items = list(years)
+    except TypeError as exc:
+        raise ValueError(
+            f"years 必须是 1~{LATTE_YEARS_MAX} 的整数序列：{years!r}"
+        ) from exc
+
+    cleaned: set[int] = set()
+    for item in items:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ValueError(
+                f"years 每一项必须是 1~{LATTE_YEARS_MAX} 的整数：{item!r}"
+            )
+        if not LATTE_YEARS_MIN <= item <= LATTE_YEARS_MAX:
+            raise ValueError(
+                f"years 每一项必须是 1~{LATTE_YEARS_MAX} 的整数：{item!r}"
+            )
+        cleaned.add(item)
+    if not cleaned:
+        raise ValueError("years 不能为空：至少给一个 1~60 的年限")
+    return sorted(cleaned)
+
+
+def project_latte_compound(daily_amount, annual_rate: float = 0.05,
+                           years=(1, 3, 5, 10)) -> list[dict]:
+    """把「每天的非必要消费」按月定投做复利模拟：纯函数，不碰 DB、不读全局状态。
+
+    「拿铁因子」的杀伤力不在当天，而在"这笔钱如果拿去定投，N 年后能变成多少"。
+    本函数给出**估算**（不是承诺收益），同一组入参永远得到同一结果，可直接单测。
+
+    模型（按月定投，月末投入）
+    ------------------------
+    1. monthly = daily_amount × 30（30 天/月是产品口径，不做 30.44 均摊）；
+    2. 月利率 r_m = (1 + annual_rate) ** (1/12) - 1 —— 用**有效年利率**折月，
+       所以 r_m 复利 12 次后恰好回到 (1 + annual_rate)，不会把 5% 年化算成 5% 月化；
+    3. 期数 N = years × 12；
+    4. future_value = monthly × (((1 + r_m) ** N - 1) / r_m)（普通年金，月末投入）；
+       r_m == 0（annual_rate == 0）时退化为 monthly × N，避免除零；
+    5. principal = monthly × N；interest = future_value - principal。
+
+    参数校验
+    --------
+    · daily_amount：有限且 ≥ 0 的数（bool / nan / inf / 负数 → ValueError；0 合法）；
+    · annual_rate：0~1（含两端）的有限数（bool → ValueError）；
+    · years：1~60 的 int 序列（bool / float / 字符串 / 空 → ValueError），
+      自动**去重 + 升序**，输出顺序与入参顺序无关。
+    · 极端超大 daily_amount 让结果溢出 float → ValueError（不返回 inf）。
+
+    返回（每项，金额全部两位小数，ROUND_HALF_UP）
+    -------------------------------------------
+        {"years": int, "monthly": float, "principal": float,
+         "future_value": float, "interest": float}
+    interest 由**已定量的** future_value - principal 得到，所以展示值自洽
+    （future_value - principal == interest，不会差 1 分钱）。
+    """
+    daily = _normalize_latte_daily_amount(daily_amount)
+    rate = _normalize_latte_rate(annual_rate)
+    horizons = _normalize_latte_years(years)
+
+    monthly = daily * LATTE_DAYS_PER_MONTH
+    monthly_rate = (1.0 + rate) ** (1.0 / 12.0) - 1.0
+
+    results: list[dict] = []
+    for horizon in horizons:
+        periods = horizon * 12
+        if monthly_rate == 0:
+            future_value = monthly * periods
+        else:
+            future_value = monthly * (((1.0 + monthly_rate) ** periods - 1) / monthly_rate)
+        principal = monthly * periods
+        if not (math.isfinite(future_value) and math.isfinite(principal)):
+            raise ValueError(
+                f"复利结果超出浮点范围，请检查 daily_amount：{daily_amount!r}"
+            )
+        fv = _money_to_float(future_value)
+        p = _money_to_float(principal)
+        results.append({
+            "years": horizon,
+            "monthly": _money_to_float(monthly),
+            "principal": p,
+            "future_value": fv,
+            "interest": _money_to_float(Decimal(str(fv)) - Decimal(str(p))),
+        })
+    return results

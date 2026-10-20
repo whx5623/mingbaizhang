@@ -43,6 +43,18 @@ except ImportError as _cal_import_exc:
         f"[calendar] 每日支出统计不可用："
         f"{type(_cal_import_exc).__name__}: {_cal_import_exc}"
     )
+# 「如果当初没剁手」后端由并行方提供（db.get_latte_factor / db.project_latte_compound）：
+# 尚未合入时先降级成 None；调用处优先走 db 模块属性（便于并行合入与测试打桩），
+# 缺失 / 返回异常都只在面板里给一行提示，绝不红屏。
+try:
+    from db import get_latte_factor, project_latte_compound
+except ImportError as _latte_import_exc:
+    get_latte_factor = None
+    project_latte_compound = None
+    print(
+        f"[latte] 拿铁因子后端不可用："
+        f"{type(_latte_import_exc).__name__}: {_latte_import_exc}"
+    )
 import db
 import requests
 import uuid
@@ -77,6 +89,10 @@ except ImportError as _poster_import_exc:
 
 class _ChartInsightFallbackError(Exception):
     """ai_agent.ChartInsightError 尚未合入时的占位异常（保证 except 子句可用）。"""
+
+
+class _LatteRoastFallbackError(Exception):
+    """ai_agent.LatteRoastError 尚未合入时的占位异常（保证 except 子句可用）。"""
 
 
 st.set_page_config(layout="wide")
@@ -669,6 +685,47 @@ def _get_debt_warning_fn():
         return None
     warning_fn = getattr(_ai_agent_mod, "generate_debt_warning", None)
     return warning_fn if callable(warning_fn) else None
+
+
+# ===== 如果当初没剁手：AI 灵魂拷问的进程级缓存 =====
+# 与图表洞察 / 还款预警同理：命中缓存直接复用、不调 API、不扣额度；
+# key = sha256(归一化 stats)，同一份拿铁因子数据在 rerun / 换会话时都能命中；
+# LatteRoastError 或其它异常的本地兜底结果也写缓存（fallback=True），
+# 避免反复打不可用的 API。
+@st.cache_resource(show_spinner=False)
+def _latte_roast_store() -> dict:
+    """返回进程级缓存：{sha256 key: {"text": str, "fallback": bool}}。"""
+    return {}
+
+
+def _latte_amount(value) -> float:
+    """把后端返回值归一成有限的 float：非法 / NaN / inf 一律按 0.0 处理。"""
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return amount if math.isfinite(amount) else 0.0
+
+
+def _latte_roast_key(stats: dict) -> str:
+    """把灵魂拷问的 stats 归一化成稳定 key（字段顺序 / 中文都不影响哈希）。"""
+    return hashlib.sha256(
+        json.dumps(stats, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _get_latte_roast_fn():
+    """按模块属性取 ai_agent.generate_latte_roast：并行开发期缺失 / 打桩都能感知。"""
+    try:
+        import ai_agent as _ai_agent_mod
+    except Exception as _ai_import_exc:  # pragma: no cover - 依赖缺失时只降级
+        print(
+            f"[latte] ai_agent 不可用："
+            f"{type(_ai_import_exc).__name__}: {_ai_import_exc}"
+        )
+        return None
+    roast_fn = getattr(_ai_agent_mod, "generate_latte_roast", None)
+    return roast_fn if callable(roast_fn) else None
 
 
 # Sidebar
@@ -2126,6 +2183,292 @@ with tab_dash:
                             f"{_cal_medal} **{_cal_day.month}月{_cal_day.day}日**："
                             f"花了 **{_cal_amount:.0f}** 元"
                         )
+
+    # ===== 如果当初没剁手：拿铁因子 + 复利对比 + AI 灵魂拷问 =====
+    # 后端由并行方提供（db.get_latte_factor / db.project_latte_compound /
+    # ai_agent.generate_latte_roast）：整块 try/except 降级，任何缺失 / 取数异常
+    # 都只在面板里给一行提示，绝不让 Tab1 红屏。
+    with st.expander("🛍️ 如果当初没剁手", expanded=False):
+        try:
+            _latte_today_fn = getattr(db, "_report_today", None)
+            try:
+                _latte_today = (
+                    _latte_today_fn() if callable(_latte_today_fn) else None
+                )
+            except Exception as _latte_today_exc:
+                print(
+                    f"[latte] 读取日报时钟失败："
+                    f"{type(_latte_today_exc).__name__}: {_latte_today_exc}"
+                )
+                _latte_today = None
+
+            # 优先取 db 模块属性：并行方稍后合入、或测试里 patch db.get_latte_factor 都能生效；
+            # 模块属性不存在时退回顶部 guarded import 绑定的名字。
+            _latte_factor_fn = getattr(db, "get_latte_factor", None)
+            if _latte_factor_fn is None:
+                _latte_factor_fn = get_latte_factor
+            if not callable(_latte_factor_fn):
+                raise RuntimeError("db.get_latte_factor 尚未提供")
+
+            _latte_stats = _latte_factor_fn(
+                st.session_state.user_id, months=3, today=_latte_today
+            )
+            if not isinstance(_latte_stats, dict) or not _latte_stats:
+                raise ValueError("get_latte_factor 返回空结果")
+
+            _latte_daily_avg = _latte_amount(_latte_stats.get("daily_avg"))
+            _latte_total = _latte_amount(_latte_stats.get("total"))
+
+            if _latte_daily_avg <= 0:
+                # 没有非必要消费：不画图、不调 AI，只给一句肯定
+                st.success("近 3 个月几乎没有非必要消费，这自律程度值得尊敬 🫡")
+            else:
+                if _latte_total <= 0:
+                    # 后端未给 total 时的保守兜底：近 3 个月约 90 天
+                    _latte_total = _latte_daily_avg * 90
+
+                _latte_breakdown = _latte_stats.get("breakdown")
+                _latte_top_category = "其他"
+                _latte_top_amount = 0.0
+                if isinstance(_latte_breakdown, list) and _latte_breakdown:
+                    _latte_first = _latte_breakdown[0]
+                    if isinstance(_latte_first, dict):
+                        _latte_top_category = (
+                            str(_latte_first.get("category") or "").strip()
+                            or "其他"
+                        )
+                        _latte_top_amount = _latte_amount(
+                            _latte_first.get("amount")
+                        )
+
+                _latte_metric1, _latte_metric2, _latte_metric3 = st.columns(3)
+                with _latte_metric1:
+                    st.metric("日均非必要消费", f"¥{_latte_daily_avg:,.0f}")
+                with _latte_metric2:
+                    st.metric("近 3 个月合计", f"¥{_latte_total:,.0f}")
+                with _latte_metric3:
+                    st.metric(
+                        "Top 分类",
+                        f"{_latte_top_category} ¥{_latte_top_amount:,.0f}",
+                    )
+
+                _latte_project_fn = getattr(db, "project_latte_compound", None)
+                if _latte_project_fn is None:
+                    _latte_project_fn = project_latte_compound
+                if not callable(_latte_project_fn):
+                    raise RuntimeError("db.project_latte_compound 尚未提供")
+
+                def _latte_clean_projection(rows, rate):
+                    """归一化复利结果：跳过脏行，数值统一成有限 float。"""
+                    clean = []
+                    for row in rows or []:
+                        if not isinstance(row, dict):
+                            continue
+                        clean.append(
+                            {
+                                "years": row.get("years"),
+                                "monthly": _latte_amount(row.get("monthly")),
+                                "principal": _latte_amount(
+                                    row.get("principal")
+                                ),
+                                "future_value": _latte_amount(
+                                    row.get("future_value")
+                                ),
+                                "interest": _latte_amount(row.get("interest")),
+                            }
+                        )
+                    if not clean:
+                        raise ValueError(
+                            f"project_latte_compound(annual_rate={rate}) 返回空结果"
+                        )
+                    return clean
+
+                _latte_p5 = _latte_clean_projection(
+                    _latte_project_fn(_latte_daily_avg, 0.05), 0.05
+                )
+                _latte_p8 = _latte_clean_projection(
+                    _latte_project_fn(_latte_daily_avg, 0.08), 0.08
+                )
+
+                _latte_years = [f"{item['years']} 年后" for item in _latte_p5]
+                _latte_option = {
+                    "tooltip": {"trigger": "axis"},
+                    "legend": {"data": ["年化 5%", "年化 8%"], "top": 0},
+                    "grid": {
+                        "left": "3%",
+                        "right": "4%",
+                        "bottom": "3%",
+                        "top": "16%",
+                        "containLabel": True,
+                    },
+                    "xAxis": {
+                        "type": "category",
+                        "data": _latte_years,
+                        "axisLabel": {"color": "#6B7280"},
+                        "axisLine": {"lineStyle": {"color": "#E5E7EB"}},
+                    },
+                    "yAxis": {
+                        "type": "value",
+                        "name": "元",
+                        "splitLine": {"lineStyle": {"color": "#F1F5F9"}},
+                    },
+                    "series": [
+                        {
+                            "name": "年化 5%",
+                            "type": "bar",
+                            "barGap": "10%",
+                            "barWidth": "28%",
+                            "itemStyle": {
+                                "borderRadius": [8, 8, 0, 0],
+                                "color": "#93C5FD",
+                            },
+                            "data": [
+                                item["future_value"] for item in _latte_p5
+                            ],
+                        },
+                        {
+                            "name": "年化 8%",
+                            "type": "bar",
+                            "barWidth": "28%",
+                            "itemStyle": {
+                                "borderRadius": [8, 8, 0, 0],
+                                "color": "#1E88E5",
+                            },
+                            "data": [
+                                item["future_value"] for item in _latte_p8
+                            ],
+                        },
+                    ],
+                }
+                # 用容器包裹，避免父级 flex/样式异常时图表塌陷；
+                # height 必须是字符串（streamlit-echarts 默认 "300px"），整数会得到 0 高度空白图。
+                try:
+                    with st.container():
+                        st_echarts(_latte_option, height="320px")
+                except Exception as _latte_chart_exc:
+                    print(
+                        f"[chart] 复利对比图渲染失败："
+                        f"{type(_latte_chart_exc).__name__}: {_latte_chart_exc}"
+                    )
+                    st.warning("复利对比图暂时无法渲染，请刷新页面重试")
+
+                _latte_monthly = _latte_daily_avg * 30
+                st.caption(
+                    f"按日均 ¥{_latte_daily_avg:,.0f} 每月定投"
+                    f"（¥{_latte_daily_avg:,.0f}×30 ≈ ¥{_latte_monthly:,.0f}），"
+                    f"复利按月计算；本金合计：10 年后 "
+                    f"¥{_latte_p5[-1]['principal']:,.0f}"
+                )
+                st.markdown(
+                    f"### 🔥 10 年后：¥{_latte_p5[-1]['future_value']:,.0f}"
+                    f"（年化 5%）/ ¥{_latte_p8[-1]['future_value']:,.0f}（年化 8%）"
+                )
+
+                # ---- AI 灵魂拷问：命中进程缓存不调 API、不扣额度 ----
+                _latte_ten_year = _latte_p5[-1]["future_value"]
+                _latte_roast_stats = {
+                    "daily_avg": _latte_daily_avg,
+                    "total": _latte_total,
+                    "months": 3,
+                    "top_category": _latte_top_category,
+                    "annual_rate": 0.05,
+                    "ten_year_value": _latte_ten_year,
+                    "projection": [
+                        {
+                            "years": item["years"],
+                            "future_value": item["future_value"],
+                        }
+                        for item in _latte_p5
+                    ],
+                }
+                _latte_cache_key = _latte_roast_key(_latte_roast_stats)
+                _latte_store = _latte_roast_store()
+                _latte_entry = _latte_store.get(_latte_cache_key)
+
+                if not (
+                    isinstance(_latte_entry, dict) and _latte_entry.get("text")
+                ):
+                    if st.session_state.get("ai_daily_count", 0) >= 20:
+                        # 额度用完：不调用、不写缓存（额度恢复后同一组数据仍可生成）
+                        st.caption("今日 AI 额度已用完，暂不生成灵魂拷问")
+                        _latte_entry = None
+                    else:
+                        _latte_fallback_text = (
+                            f"你每天在「{_latte_top_category}」上花 "
+                            f"¥{_latte_daily_avg:,.0f}，10 年后本可以拥有 "
+                            f"¥{_latte_ten_year:,.0f}；钱没消失，只是变成了你的快乐。"
+                        )
+                        _latte_roast_fn = _get_latte_roast_fn()
+                        if _latte_roast_fn is None:
+                            # 后端尚未合入：本地兜底并写缓存；不计额度，后端就绪后自动恢复
+                            print(
+                                "[latte] ai_agent.generate_latte_roast 不可用，"
+                                "使用本地兜底"
+                            )
+                            _latte_entry = {
+                                "text": _latte_fallback_text,
+                                "fallback": True,
+                            }
+                            _latte_store[_latte_cache_key] = _latte_entry
+                        else:
+                            try:
+                                with st.spinner("AI 正在算这笔账…"):
+                                    _latte_ai_text = _latte_roast_fn(
+                                        _latte_roast_stats,
+                                        get_deepseek_api_key(),
+                                    )
+                                if (
+                                    not isinstance(_latte_ai_text, str)
+                                    or not _latte_ai_text.strip()
+                                ):
+                                    raise ValueError(
+                                        "generate_latte_roast 返回空文本"
+                                    )
+                            except Exception as _latte_ai_exc:
+                                # LatteRoastError（未配 key / 网络 / 解析）与其它异常统一兜底：
+                                # 不红屏，写缓存（fallback=True）避免反复打不可用的 API，
+                                # 按「已尝试」+1 额度。
+                                print(
+                                    f"[latte] AI 灵魂拷问失败："
+                                    f"{type(_latte_ai_exc).__name__}: "
+                                    f"{_latte_ai_exc}"
+                                )
+                                _latte_entry = {
+                                    "text": _latte_fallback_text,
+                                    "fallback": True,
+                                }
+                                _latte_store[_latte_cache_key] = _latte_entry
+                                st.session_state.ai_daily_count = (
+                                    st.session_state.get("ai_daily_count", 0)
+                                    + 1
+                                )
+                            else:
+                                _latte_entry = {
+                                    "text": _latte_ai_text.strip(),
+                                    "fallback": False,
+                                }
+                                _latte_store[_latte_cache_key] = _latte_entry
+                                st.session_state.ai_daily_count = (
+                                    st.session_state.get("ai_daily_count", 0)
+                                    + 1
+                                )
+
+                if isinstance(_latte_entry, dict) and _latte_entry.get("text"):
+                    st.info(_latte_entry["text"])
+                    st.caption(
+                        "AI 灵魂拷问"
+                        + (
+                            "（本地兜底）"
+                            if _latte_entry.get("fallback")
+                            else ""
+                        )
+                    )
+        except Exception as _latte_exc:
+            print(
+                f"[latte] 机会成本分析失败："
+                f"{type(_latte_exc).__name__}: {_latte_exc}"
+            )
+            st.caption("机会成本分析暂不可用")
 
     # ===== AI 洞察：本月消费图表解读（玫瑰图下方、数据导出之前）=====
     # 统计口径与上方玫瑰图一致：本月 + 支出。无支出时只给引导，不显示按钮。
