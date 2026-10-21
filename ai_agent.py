@@ -5277,3 +5277,252 @@ def generate_asset_advice(stats: dict, api_key: str = "") -> str:
         content = content[:ASSET_ADVISOR_MAX_CHARS] + "…"
     logger.info("AI 资产管家生成成功（模型=%s，字数=%d）", ASSET_ADVISOR_MODEL, len(content))
     return content
+
+
+# ===========================================================================
+# AI 闲鱼文案（DeepSeek Chat：把一件资产的折旧事实写成一条能卖出去的闲鱼文案）
+# ---------------------------------------------------------------------------
+# 与「AI 资产管家」「情绪消费教练」同构：先校验（没 key、没资产数据都不发请求）
+# → 组 payload → 发请求 → 异常分层 → strip + 截断 → 脱敏日志。
+# 差异只在入参与返回：入参是 assets 表一行 + 折旧指标，返回一段纯字符串
+# （带 # 标签、带建议挂牌价的闲鱼文案），可直接贴到页面上。
+#   · 系统提示词逐字固定（产品口径，改一个字文案风格就跑偏）；
+#   · asset 缺失键一律按 0 / 空处理（字段可能随 db 版本增减，绝不 KeyError）；
+#   · 日志只记模型名、字数、状态码与异常类型，**绝不**记 api_key、金额或资产名。
+# ===========================================================================
+
+# 系统提示词逐字固定（产品口径）。
+XIANYU_SYSTEM_PROMPT = (
+    "你是一个闲鱼金牌卖家。请帮我写一段极有吸引力、适合大学生的二手出售文案"
+    "（带上必要的标签，如 #学生党自用 #99新）。文案要显得我当初买它是有品位的，"
+    "现在卖掉是因为我要专心学习（或者换新），并给出一个建议挂牌价。"
+)
+
+XIANYU_COPY_MODEL = "deepseek-chat"
+XIANYU_COPY_TEMPERATURE = 0.8   # 0.8：闲鱼文案要有人味、有钩子，但不能编造成色
+XIANYU_COPY_MAX_TOKENS = 500    # 200 字 + 标签 + 余量
+XIANYU_COPY_TIMEOUT = 20
+XIANYU_COPY_MAX_CHARS = 400     # 返回文本硬上限：超过截断到 400 字并补「…」
+
+
+class XianyuCopyError(Exception):
+    """AI 闲鱼文案生成失败。
+
+    code 取值：
+      no_api_key   未配置 DeepSeek API Key（**未发请求**）
+      empty_stats  asset 不是 dict / name 为空 / purchase_price <= 0（**未发请求**）
+      network      网络异常（超时 / 连接失败 / 其它请求层异常）
+      http         接口返回非 200（message 只带状态码，不带响应体）
+      parse        响应不是合法 JSON / choices/content 缺失或为空
+
+    message 为面向用户的中文提示，可直接展示。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"XianyuCopyError(code={self.code!r}, message={self.message!r})"
+
+
+def _xianyu_amount(value) -> float:
+    """asset 里的金额 / 比例宽松转 float：None / bool / 非数字 / nan / inf → 0.0。"""
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(number):
+        return 0.0
+    return number
+
+
+def _xianyu_text(value) -> str:
+    """名称 / 分类宽松转 str：None / bool → ""，其余 str() 后 strip。"""
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    try:
+        return str(value).strip()
+    except (TypeError, ValueError):
+        return ""
+
+
+def _xianyu_percent_text(value) -> str:
+    """比例展示口径：0.5724 → "57.2%"（入参是 0~1 的比例）。"""
+    ratio = _xianyu_amount(value)
+    if ratio <= 0:
+        return "0.0%"
+    return f"{ratio * 100:.1f}%"
+
+
+def _xianyu_months_text(value) -> str:
+    """已用时长展示口径：25.7 → "25.7 个月（约 2 年 1 个月）"。"""
+    months = _xianyu_amount(value)
+    if months <= 0:
+        return "不足 1 个月（刚入手）"
+    text = f"{months:.1f} 个月"
+    total = int(months)
+    if total >= 12:
+        years, rest = divmod(total, 12)
+        text += f"（约 {years} 年 {rest} 个月）" if rest else f"（约 {years} 年）"
+    return text
+
+
+def _build_xianyu_user_content(asset: dict) -> str:
+    """把一件资产的折旧事实排成中文条目（金额两位小数、比例 / 残值率转百分比）。"""
+    name = _xianyu_text(asset.get("name"))
+    category = _xianyu_text(asset.get("category")) or "未分类"
+    price = _xianyu_amount(asset.get("purchase_price"))
+    residual = _xianyu_amount(asset.get("residual"))
+    loss = _xianyu_amount(asset.get("monthly_loss"))
+    suggested = _xianyu_amount(asset.get("suggested_price"))
+
+    rate = _xianyu_amount(asset.get("residual_rate"))
+    if rate <= 0 and price > 0 and residual > 0:
+        # 老数据可能没有 residual_rate：用残值 / 原价兜底，避免文案里出现 0.0%。
+        rate = residual / price
+
+    if suggested > 0:
+        price_line = (
+            f"平台参考挂牌价：¥{suggested:.0f}"
+            f"（建议围绕 ¥{suggested:.0f} 挂牌，可按成色小幅上下浮动）"
+        )
+    else:
+        price_line = "平台参考挂牌价：暂无（这件已没有折旧参考，请按当前行情自行定价）"
+
+    lines = [
+        "这是我的二手闲置信息，请按系统要求写一段闲鱼出售文案：",
+        f"商品名称：{name}",
+        f"商品分类：{category}",
+        f"购入原价：¥{price:.2f} 元",
+        f"当前残值：¥{residual:.2f} 元（残值率 {_xianyu_percent_text(rate)}）",
+        f"已使用时长：{_xianyu_months_text(asset.get('elapsed_months'))}",
+        f"每月蒸发：¥{loss:.2f} 元",
+        price_line,
+        "文案要求：200 字以内；带 3-5 个以 # 开头的标签（如 #学生党自用 #99新）；"
+        "结尾给出一个明确的建议挂牌价；不要写「我是 AI」之类的话。",
+    ]
+    return "\n".join(lines)
+
+
+def generate_xianyu_copy(asset: dict, api_key: str = "") -> str:
+    """根据一件资产的折旧指标生成一段闲鱼二手出售文案，返回 strip 后文本。
+
+    asset 约定（assets 表一行 + 折旧指标，缺失键按 0 / 空处理，绝不 KeyError）：
+        {"id": 3, "name": "iPad Air 5", "category": "数码",
+         "purchase_price": 4999.0, "purchase_date": "2024-09-01",
+         "depreciation_rate": 0.2, "residual": 2861.34, "residual_rate": 0.5724,
+         "elapsed_months": 25.7, "monthly_loss": 83.32, "suggested_price": 2430.0}
+
+    失败一律抛 XianyuCopyError（中文 message，可直接上页面）：
+      · api_key 为空                                            → no_api_key（且**不发请求**）；
+      · asset 不是 dict / name 为空 / purchase_price <= 0        → empty_stats（且**不发请求**）；
+      · 超时 / 连接失败 / 其它请求层异常                          → network；
+      · 非 200                                                  → http（只带状态码，不拼响应体）；
+      · 响应不是 JSON / choices/content 缺失或为空                → parse。
+    返回文本超过 400 字时截断到 400 字并补「…」。
+    日志只记模型名、字数、状态码与异常类型，**绝不**记 api_key、金额或资产名。
+    """
+    # ① api_key：先查它，没有 key 时不该先花一次网络往返。
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise XianyuCopyError(
+            "no_api_key",
+            "未配置 DEEPSEEK_API_KEY，AI 闲鱼文案暂不可用",
+        )
+    api_key = api_key.strip()
+
+    # ② 数据前置校验：没有名称或原价时，模型只能编出一段卖不出去的废话。
+    if not isinstance(asset, dict):
+        raise XianyuCopyError(
+            "empty_stats",
+            "资产数据不完整，暂时无法生成闲鱼文案，请刷新后重试",
+        )
+    if not _xianyu_text(asset.get("name")):
+        raise XianyuCopyError(
+            "empty_stats",
+            "缺少资产名称，暂时无法生成闲鱼文案",
+        )
+    if _xianyu_amount(asset.get("purchase_price")) <= 0:
+        raise XianyuCopyError(
+            "empty_stats",
+            "这件资产还没有购入价，补齐后再生成闲鱼文案吧",
+        )
+
+    user_content = _build_xianyu_user_content(asset)
+    payload = {
+        "model": XIANYU_COPY_MODEL,
+        "messages": [
+            {"role": "system", "content": XIANYU_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": XIANYU_COPY_TEMPERATURE,
+        "max_tokens": XIANYU_COPY_MAX_TOKENS,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ③ 发请求：超时/连接失败翻译成用户能看懂的句子（不把异常对象漏到页面）。
+    try:
+        resp = requests.post(
+            DEEPSEEK_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=XIANYU_COPY_TIMEOUT,
+        )
+    except requests.Timeout:
+        logger.warning("AI 闲鱼文案请求超时（模型=%s）", XIANYU_COPY_MODEL)
+        raise XianyuCopyError("network", "生成闲鱼文案超时，请稍后再试") from None
+    except requests.ConnectionError:
+        logger.warning("AI 闲鱼文案请求连接失败（模型=%s）", XIANYU_COPY_MODEL)
+        raise XianyuCopyError("network", "网络连接失败，请检查网络") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：日志只记异常类型（确保不把 headers / key 带出去）。
+        logger.warning(
+            "AI 闲鱼文案请求失败（模型=%s，异常=%s）",
+            XIANYU_COPY_MODEL,
+            type(exc).__name__,
+        )
+        raise XianyuCopyError("network", "网络连接失败，请检查网络") from None
+
+    # ④ 非 200：只带状态码，不把响应体拼进 message（响应体可能含请求回显）。
+    if resp.status_code != 200:
+        logger.warning(
+            "AI 闲鱼文案接口返回 HTTP %s（模型=%s）",
+            resp.status_code,
+            XIANYU_COPY_MODEL,
+        )
+        raise XianyuCopyError(
+            "http",
+            f"AI 服务返回异常（HTTP {resp.status_code}），请稍后重试",
+        )
+
+    # ⑤ 解析：非 JSON / 结构不符 / content 为空 → 同一条"没有有效文案"。
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("AI 闲鱼文案响应不是合法 JSON（模型=%s）", XIANYU_COPY_MODEL)
+        raise XianyuCopyError("parse", "AI 没有返回有效文案，请重试") from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("AI 闲鱼文案响应结构不符合预期（模型=%s）", XIANYU_COPY_MODEL)
+        raise XianyuCopyError("parse", "AI 没有返回有效文案，请重试") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("AI 闲鱼文案响应 content 为空（模型=%s）", XIANYU_COPY_MODEL)
+        raise XianyuCopyError("parse", "AI 没有返回有效文案，请重试")
+
+    content = content.strip()
+    if len(content) > XIANYU_COPY_MAX_CHARS:
+        content = content[:XIANYU_COPY_MAX_CHARS] + "…"
+    logger.info("AI 闲鱼文案生成成功（模型=%s，字数=%d）", XIANYU_COPY_MODEL, len(content))
+    return content

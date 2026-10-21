@@ -385,6 +385,8 @@ def logout():
     st.session_state.pop("_title_level_seen", None) # 换人后不能沿用上一人的头衔等级（否则首屏可能误撒花/漏撒花）
     st.session_state.pop("mood_insight_cache", None) # AI 教练文案基于上一个人的情绪消费数据，换人必须失效
     st.session_state.pop("asset_advice_cache", None) # AI 资产管家文案含个人资产，换人同样必须失效
+    st.session_state.pop("xianyu_cache", None)      # 闲鱼文案含个人资产与挂牌价，换人必须失效
+    st.session_state.pop("idle_selected_id", None)  # 断舍离集市选中项属于上一个人的资产
     st.session_state["page"] = 0
     st.session_state["chat_history"] = []           # 换人登录不应看到上一个人的 AI 聊天记录
     st.cache_data.clear()
@@ -822,6 +824,20 @@ def _get_asset_advice_fn():
         return None
     advice_fn = getattr(_ai_agent_mod, "generate_asset_advice", None)
     return advice_fn if callable(advice_fn) else None
+
+
+def _get_xianyu_copy_fn():
+    """按模块属性取 ai_agent.generate_xianyu_copy：缺失 / 打桩都能感知。"""
+    try:
+        import ai_agent as _ai_agent_mod
+    except Exception as _ai_import_exc:  # pragma: no cover - 依赖缺失时只降级
+        print(
+            f"[idle] ai_agent 不可用："
+            f"{type(_ai_import_exc).__name__}: {_ai_import_exc}"
+        )
+        return None
+    copy_fn = getattr(_ai_agent_mod, "generate_xianyu_copy", None)
+    return copy_fn if callable(copy_fn) else None
 
 
 def _asset_rate_text(value):
@@ -3055,6 +3071,249 @@ with tab_dash:
                 st.info(
                     f"🎓 学长说：{str(_asset_advice_saved['text']).strip()}"
                 )
+
+    # ===== 🧺 断舍离集市：高危闲置资产的「回血」清单 =====
+    # db.get_idle_assets / ai_agent.generate_xianyu_copy 由并行方提供：
+    # 一律 getattr 取模块属性（缺失 / 抛错 / 返回非 dict 都只降级成一行 caption），
+    # 取不到数时整块内容用 if 包住，绝不 st.stop()、绝不让 Tab1 红屏。
+    with st.container(border=True, key="card_idle_market"):
+        st.subheader("🧺 断舍离集市")
+        st.caption(
+            "购入满 6 个月、年折旧 ≥15% 且还有残值的资产，会在这里排队等回血"
+            "（二手价按品类折扣估算）"
+        )
+
+        # 1) 取数：函数不可调用 / 返回非 dict / 抛错 → 只给一行提示，
+        #    下面的汇总、清单、评估面板全部不渲染（不是 st.stop，页面其它区块照常）。
+        _idle_fn = getattr(db, "get_idle_assets", None)
+        _idle_data = None
+        if callable(_idle_fn):
+            try:
+                _idle_data = _idle_fn(st.session_state.user_id)
+            except Exception as _idle_exc:
+                print(
+                    f"[idle] get_idle_assets 调用失败："
+                    f"{type(_idle_exc).__name__}: {_idle_exc}"
+                )
+                _idle_data = None
+
+        if not isinstance(_idle_data, dict):
+            st.caption("断舍离集市暂不可用，先添加资产或稍后再来")
+        else:
+            _idle_items = [
+                _idle_item
+                for _idle_item in (_idle_data.get("items") or [])
+                if isinstance(_idle_item, dict)
+            ]
+            if not _idle_items:
+                st.caption("暂时没有高危闲置，手里的东西都还挺值钱 🎉")
+            else:
+                # 2) 顶部汇总：优先用 db 算好的合计，缺失 / 脏值时退回逐件求和
+                _idle_total = _peer_number(_idle_data.get("monthly_loss_total"))
+                if _idle_total <= 0:
+                    _idle_total = sum(
+                        _peer_number(_idle_item.get("monthly_loss"))
+                        for _idle_item in _idle_items
+                    )
+                st.markdown(
+                    f"💸 **这些闲置每月合计蒸发 ¥{_idle_total:,.2f}**"
+                )
+                st.caption(
+                    f"共 {_peer_number(_idle_data.get('checked')):.0f} 件资产，"
+                    f"{len(_idle_items)} 件在排队等回血"
+                )
+
+                # 3) 逐件清单：名称 / 分类 / 高危标记 + 每月蒸发 + 原价与残值 + 评估按钮
+                for _idle_index, _idle_item in enumerate(_idle_items):
+                    _idle_item_id = _idle_item.get("id")
+                    if _idle_item_id is None:
+                        _idle_item_id = _idle_item.get("asset_id")
+                    _idle_key_id = (
+                        _idle_item_id
+                        if _idle_item_id is not None
+                        else f"idx{_idle_index}"
+                    )
+                    _idle_name = (
+                        str(_idle_item.get("name") or "").strip() or "未命名资产"
+                    )
+                    _idle_category = str(_idle_item.get("category") or "其他")
+                    _idle_level_tag = (
+                        "🔴 高危贬值"
+                        if str(_idle_item.get("idle_level") or "") == "high"
+                        else "🟡 贬值中"
+                    )
+                    _idle_loss = _peer_number(_idle_item.get("monthly_loss"))
+                    _idle_price = _peer_number(_idle_item.get("purchase_price"))
+                    _idle_residual = _peer_number(_idle_item.get("residual"))
+                    _idle_months = _peer_number(_idle_item.get("idle_months"))
+                    with st.container(border=True):
+                        st.markdown(
+                            f"**{_idle_name}** · {_idle_category} · {_idle_level_tag}"
+                        )
+                        st.markdown(f"💸 预计每月蒸发 ¥{_idle_loss:,.2f}")
+                        st.caption(
+                            f"原价 ¥{_idle_price:,.2f}"
+                            f" · 当前残值 ¥{_idle_residual:,.2f}"
+                            f"（残值率 {_asset_rate_text(_idle_item.get('residual_rate'))}）"
+                            f" · 已使用 {_idle_months:.1f} 个月"
+                        )
+                        if st.button(
+                            "🔍 评估二手残值",
+                            key=f"resale_btn_{_idle_key_id}",
+                        ):
+                            st.session_state["idle_selected_id"] = _idle_item_id
+                            st.rerun()
+
+                # 4) 评估面板：选中项可能已被删除 / 数据已变 → 匹配不到就只显示列表
+                _idle_selected_id = st.session_state.get("idle_selected_id")
+                _idle_selected = None
+                if _idle_selected_id is not None:
+                    for _idle_item in _idle_items:
+                        if _idle_selected_id in (
+                            _idle_item.get("id"),
+                            _idle_item.get("asset_id"),
+                        ):
+                            _idle_selected = _idle_item
+                            break
+                if _idle_selected is None:
+                    st.session_state.pop("idle_selected_id", None)
+                else:
+                    _idle_sel_name = (
+                        str(_idle_selected.get("name") or "").strip()
+                        or "未命名资产"
+                    )
+                    _idle_suggested = _peer_number(
+                        _idle_selected.get("suggested_price")
+                    )
+                    _idle_sel_residual = _peer_number(
+                        _idle_selected.get("residual")
+                    )
+                    _idle_factor = _peer_number(
+                        _idle_selected.get("resale_factor"), 0.85
+                    )
+                    # 缓存 key 只取影响文案的字段：同一件资产数据没变就复用，不再调 API
+                    try:
+                        _idle_copy_key = hashlib.sha256(
+                            json.dumps(
+                                {
+                                    "id": _idle_selected_id,
+                                    "name": _idle_selected.get("name"),
+                                    "category": _idle_selected.get("category"),
+                                    "purchase_price": _idle_selected.get("purchase_price"),
+                                    "purchase_date": _idle_selected.get("purchase_date"),
+                                    "depreciation_rate": _idle_selected.get("depreciation_rate"),
+                                    "monthly_loss": _idle_selected.get("monthly_loss"),
+                                    "residual": _idle_selected.get("residual"),
+                                    "suggested_price": _idle_selected.get("suggested_price"),
+                                },
+                                sort_keys=True,
+                                ensure_ascii=False,
+                                default=str,
+                            ).encode("utf-8", "ignore")
+                        ).hexdigest()
+                    except Exception as _idle_key_exc:
+                        print(
+                            f"[idle] 闲鱼文案缓存 key 计算失败："
+                            f"{type(_idle_key_exc).__name__}: {_idle_key_exc}"
+                        )
+                        _idle_copy_key = ""
+
+                    with st.container(border=True):
+                        st.markdown(f"#### 🏷️ {_idle_sel_name} 的二手评估")
+                        st.metric(
+                            "参考挂牌价",
+                            f"¥{_idle_suggested:,.0f}",
+                            delta=f"当前残值 ¥{_idle_sel_residual:,.0f}",
+                        )
+                        st.caption(
+                            f"按品类系数 {_idle_factor:.2f} 估算，仅供参考"
+                        )
+                        if st.button(
+                            "🧠 生成闲鱼文案",
+                            key=f"xianyu_btn_{_idle_selected_id}",
+                        ):
+                            _idle_saved = st.session_state.get("xianyu_cache")
+                            _idle_cached_text = ""
+                            if (
+                                isinstance(_idle_saved, dict)
+                                and _idle_saved.get("key") == _idle_copy_key
+                                and str(_idle_saved.get("text") or "").strip()
+                            ):
+                                _idle_cached_text = str(
+                                    _idle_saved["text"]
+                                ).strip()
+
+                            if _idle_cached_text:
+                                pass  # 同一份数据已生成过：直接展示下方缓存
+                            elif (
+                                st.session_state.get("ai_daily_count", 0) >= 20
+                            ):
+                                st.caption(
+                                    "今日免费额度已用完，明天再让学长帮你写吧"
+                                )
+                            else:
+                                _idle_xianyu_fn = _get_xianyu_copy_fn()
+                                if not callable(_idle_xianyu_fn):
+                                    st.caption(
+                                        "文案暂时生成失败：AI 闲鱼文案模块还没准备好"
+                                    )
+                                else:
+                                    try:
+                                        with st.spinner(
+                                            "学长正在帮你写闲鱼文案…"
+                                        ):
+                                            _idle_copy_text = _idle_xianyu_fn(
+                                                _idle_selected
+                                            )
+                                    except Exception as _idle_copy_exc:
+                                        # 失败只提示、不扣额度、不写缓存：下次点击可重试
+                                        print(
+                                            f"[idle] 闲鱼文案生成失败："
+                                            f"{type(_idle_copy_exc).__name__}: "
+                                            f"{_idle_copy_exc}"
+                                        )
+                                        st.caption(
+                                            f"文案暂时生成失败：{_idle_copy_exc}"
+                                        )
+                                    else:
+                                        _idle_copy_text = (
+                                            str(_idle_copy_text).strip()
+                                            if isinstance(_idle_copy_text, str)
+                                            else ""
+                                        )
+                                        if _idle_copy_text:
+                                            st.session_state["xianyu_cache"] = {
+                                                "key": _idle_copy_key,
+                                                "text": _idle_copy_text,
+                                            }
+                                            st.session_state.ai_daily_count = (
+                                                st.session_state.get(
+                                                    "ai_daily_count", 0
+                                                )
+                                                + 1
+                                            )
+                                            st.session_state.ai_last_count_date = (
+                                                date.today()
+                                            )
+                                        else:
+                                            st.caption(
+                                                "文案暂时生成失败：这次没有给出内容"
+                                            )
+
+                        # 缓存渲染独立于按钮：rerun 后同一件资产直接展示，不重复扣额度
+                        _idle_copy_saved = st.session_state.get("xianyu_cache")
+                        if (
+                            isinstance(_idle_copy_saved, dict)
+                            and _idle_copy_saved.get("key") == _idle_copy_key
+                            and str(_idle_copy_saved.get("text") or "").strip()
+                        ):
+                            st.code(
+                                str(_idle_copy_saved["text"]).strip(),
+                                language=None,
+                            )
+                            st.caption(
+                                "点代码块右上角的复制图标即可粘贴到闲鱼"
+                            )
 
     # ===== 同龄人财务基准雷达（匿名对比）=====
     # 数据全部来自并行方：我的指标 db.compute_radar_metrics / 得分 db.score_radar /

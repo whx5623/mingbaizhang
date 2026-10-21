@@ -7355,7 +7355,11 @@ def compute_asset_value(purchase_price, purchase_date, depreciation_rate,
 
     residual_rate = round(residual / price_float, 4) if price_float > 0 else 0.0
     annual_loss = _money_to_float(price * rate)
-    monthly_loss = _money_to_float(price * rate / Decimal(12))
+    # 已经折完的资产不再蒸发：否则页面会显示「已归零却还每月蒸发 ¥83」的自相矛盾数字
+    monthly_loss = (
+        0.0 if fully_depreciated
+        else _money_to_float(price * rate / Decimal(12))
+    )
     elapsed_months = round(float(years) * 12, 1)
     if rate > 0:
         # 通用式：(1/rate)*12 - elapsed_months（20% → 60 个月折完）。
@@ -7720,4 +7724,178 @@ def get_asset_overview(user_id, today=None) -> dict:
         "total_assets": total_assets,
         "asset_ratio": asset_ratio,
         "debt_ratio": debt_ratio,
+    }
+
+# ===========================================================================
+# 闲置资产断舍离 / 回血引擎（只读；不新建表、不写库）
+# ---------------------------------------------------------------------------
+# 判定口径（产品约定）：
+#   「高危贬值闲置」= 已用满 IDLE_MIN_MONTHS 个月（按整月+零头天，与折旧同一套）
+#                     + 年折旧率 >= IDLE_MIN_RATE
+#                     + 当前残值 > 0（已经折成 0 的没有"回血"空间，不列）
+#   两个阈值都可以从函数参数覆盖（答辩演示 / 以后调参不用改代码）。
+#
+#   为什么不做「很久没买相关配件」这条可选信号：assets 没有品类关键词，账单里
+#   的商户名（"京东"、"食堂"）无法稳定映射到具体资产，强做只会把"电动车"和
+#   "电动车充电器"混在一起，误判比不判更糟。本实现只用「时间 + 折旧率」，
+#   在 docstring 与页面 caption 里都写清楚口径，不假装更聪明。
+#
+# 回血估价（estimate_resale_value）：
+#   二手挂牌价 = 当前残值 × 品类系数（数码 0.85 / 生活 0.70 / 其他 0.60），
+#   再四舍五入到 10 元（闲鱼挂牌习惯），最低 10 元；
+#   系数是"平台折价"经验值，不是真实成交价 —— 页面必须写"估算/参考"。
+# ===========================================================================
+
+IDLE_MIN_MONTHS = 6
+IDLE_MIN_RATE = Decimal("0.15")     # 15%/年以下不算"疯狂贬值"
+IDLE_HIGH_RATE = Decimal("0.20")    # >=20% 标「高危」
+RESALE_FACTORS = {
+    "数码": Decimal("0.85"),
+    "生活": Decimal("0.70"),
+    "其他": Decimal("0.60"),
+}
+RESALE_MIN_PRICE = Decimal("10")
+
+
+def _resale_factor(category) -> Decimal:
+    """品类 → 二手折价系数；未知分类按「其他」。"""
+    return RESALE_FACTORS.get(normalize_asset_category(category), RESALE_FACTORS["其他"])
+
+
+def _round_to_ten(value: Decimal) -> Decimal:
+    """四舍五入到 10 元（闲鱼挂牌习惯）：2432 → 2430，2436 → 2440。
+
+    注意必须用 Decimal("1E1") 而不是 Decimal("10")：后者指数是 0，
+    quantize 会退化成「取整到元」（2432.139 → 2432），不是取整到十位。
+    """
+    return value.quantize(Decimal("1E1"), rounding=ROUND_HALF_UP)
+
+
+def estimate_resale_value(purchase_price, purchase_date, depreciation_rate,
+                          category="其他", today=None) -> dict:
+    """单件资产的「二手回血估价」（纯函数，不碰 DB）。
+
+    返回：price / purchase_date / depreciation_rate / category / residual /
+          residual_rate / elapsed_months / monthly_loss / fully_depreciated /
+          resale_factor / suggested_price
+
+    suggested_price = max(10, round10(残值 × 品类系数))；残值为 0 时给 0。
+    """
+    value = compute_asset_value(
+        purchase_price, purchase_date, depreciation_rate, today=today
+    )
+    factor = _resale_factor(category)
+    residual = _as_decimal(value["residual"])
+    if residual <= 0:
+        suggested = Decimal("0")
+    else:
+        suggested = max(RESALE_MIN_PRICE, _round_to_ten(residual * factor))
+    return {
+        "price": value["price"],
+        "purchase_date": value["purchase_date"],
+        "depreciation_rate": value["depreciation_rate"],
+        "category": normalize_asset_category(category),
+        "residual": value["residual"],
+        "residual_rate": value["residual_rate"],
+        "elapsed_months": value["elapsed_months"],
+        "monthly_loss": value["monthly_loss"],
+        "fully_depreciated": value["fully_depreciated"],
+        "resale_factor": float(factor),
+        "suggested_price": _money_to_float(suggested),
+    }
+
+
+def get_idle_assets(user_id, today=None, min_months: int = IDLE_MIN_MONTHS,
+                    min_rate=IDLE_MIN_RATE) -> dict:
+    """「断舍离集市」数据：哪些资产正在疯狂贬值、每月蒸发多少钱。
+
+    返回字段（键名固定）：
+      today / has_idle / count / checked / monthly_loss_total / min_months /
+      min_rate / items
+
+    items[k] = list_assets 的一行 + 以下字段：
+      idle_months / idle_level("high"/"medium") / monthly_loss / monthly_loss_ratio /
+      residual / residual_rate / fully_depreciated / resale_factor / suggested_price
+
+    规则：
+      · 只读 assets 表（assets_available False → 空结构，不抛）；
+      · 满 min_months 个月 + 年折旧率 >= min_rate + 残值 > 0 才进集市；
+      · idle_level：rate >= 20% → "high"，否则 "medium"（页面可据此换文案）；
+      · monthly_loss_ratio = 每月蒸发 / 当前残值（残值 0 → 0），用于「贬值速度」展示；
+      · 排序：每月蒸发降序 → 已用月数降序 → 名称升序（结果可复现）；
+      · monthly_loss_total = 各件每月蒸发之和（Decimal 累加，两位小数）；
+      · checked = 资产总数（页面可写「3 件资产里有 2 件在贬值」）。
+    """
+    uid = _normalize_bill_query_user_id(user_id)
+    current = _normalize_forecast_today(today)
+    months_threshold = IDLE_MIN_MONTHS if not isinstance(min_months, int) else max(1, min_months)
+    try:
+        rate_threshold = _as_decimal(min_rate)
+    except (InvalidOperation, TypeError, ValueError):
+        rate_threshold = IDLE_MIN_RATE
+    if rate_threshold < 0 or rate_threshold > 1:
+        rate_threshold = IDLE_MIN_RATE
+
+    if not assets_available():
+        return {
+            "today": current.isoformat(),
+            "has_idle": False,
+            "count": 0,
+            "checked": 0,
+            "monthly_loss_total": 0.0,
+            "min_months": months_threshold,
+            "min_rate": float(rate_threshold),
+            "items": [],
+        }
+
+    rows = list_assets(uid)
+    items: list[dict] = []
+    loss_total = Decimal("0")
+    for row in rows:
+        value = compute_asset_value(
+            row["purchase_price"], row["purchase_date"],
+            row["depreciation_rate"], today=current,
+        )
+        rate = _as_decimal(row["depreciation_rate"])
+        residual = _as_decimal(value["residual"])
+        if value["elapsed_months"] < months_threshold:
+            continue
+        if rate < rate_threshold:
+            continue
+        if residual <= 0:
+            continue
+        resale = estimate_resale_value(
+            row["purchase_price"], row["purchase_date"],
+            row["depreciation_rate"], category=row["category"], today=current,
+        )
+        monthly_loss = _as_decimal(value["monthly_loss"])
+        loss_total += monthly_loss
+        item = dict(row)
+        item.update({
+            "idle_months": value["elapsed_months"],
+            "idle_level": "high" if rate >= IDLE_HIGH_RATE else "medium",
+            "monthly_loss": value["monthly_loss"],
+            "monthly_loss_ratio": (
+                round(float(monthly_loss / residual), 4) if residual > 0 else 0.0
+            ),
+            "residual": value["residual"],
+            "residual_rate": value["residual_rate"],
+            "fully_depreciated": value["fully_depreciated"],
+            "resale_factor": resale["resale_factor"],
+            "suggested_price": resale["suggested_price"],
+        })
+        items.append(item)
+
+    items.sort(key=lambda item: (
+        -item["monthly_loss"], -item["idle_months"], item["name"]
+    ))
+    return {
+        "today": current.isoformat(),
+        "has_idle": bool(items),
+        "count": len(items),
+        "checked": len(rows),
+        "monthly_loss_total": _money_to_float(loss_total),
+        "min_months": months_threshold,
+        "min_rate": float(rate_threshold),
+        "items": items,
     }
