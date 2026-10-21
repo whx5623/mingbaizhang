@@ -120,6 +120,16 @@ except ImportError as _report_import_exc:
     report_pdf = None
     print(f"[report] PDF 报告模块不可用：{type(_report_import_exc).__name__}: {_report_import_exc}")
 
+
+# 跨 rerun / 同进程多会话的 PDF 缓存：key 用「日期 + 归一化 payload 的 sha256」，
+# 同一天同一份数据即使刷新页面、重开标签页也只排版一次；隔天或数据变了自动重排。
+# 放在模块级是为了让 st.cache_data 有稳定函数身份（定义在按钮分支里会每次新建）。
+@st.cache_data(show_spinner=False, max_entries=8)
+def _build_pdf_report_cached(day: str, payload_json: str) -> bytes:
+    if report_pdf is None:
+        raise RuntimeError("PDF 报告模块不可用")
+    return report_pdf.build_financial_report(json.loads(payload_json))
+
 # 情绪消费气象站气泡图（mood_chart.py 由并行方实现）：缺失只让气泡图降级成一行提示，
 # 高危提示与 AI 教练仍然可用，绝不红屏。调用处一律 getattr，便于测试打桩。
 try:
@@ -4995,6 +5005,129 @@ with tab_dash:
             # actions 交给报告模块用本地规则生成，前端不额外调 AI
             _pdf_ai["actions"] = []
 
+            # ---------- ⑪ assets：资产折旧（只读库 + 纯计算，绝不为此调 AI）----------
+            # db.get_asset_overview 由并行方提供：不可调用 / 抛错 / 返回非 dict 都只让
+            # 资产章节空着（print 一行日志），报告其余内容照常生成，绝不让整份报告失败。
+            # 裁剪口径：只取前 3 件；曲线逐点收敛（month 非空 + value 有限 float），
+            # 点数 < 2 画不出折线就整件跳过；金额一律走 _peer_number 收敛成有限 float。
+            _pdf_assets = []
+            try:
+                _pdf_asset_fn = getattr(db, "get_asset_overview", None)
+                if not callable(_pdf_asset_fn):
+                    raise RuntimeError("db.get_asset_overview 尚未提供")
+                _pdf_asset_stats = _pdf_asset_fn(st.session_state.user_id)
+                if not isinstance(_pdf_asset_stats, dict):
+                    raise ValueError("get_asset_overview 返回结构不合规")
+                _pdf_asset_rows = _pdf_asset_stats.get("assets")
+                if not isinstance(_pdf_asset_rows, list):
+                    _pdf_asset_rows = []
+                for _pdf_asset_row in _pdf_asset_rows[:3]:
+                    if not isinstance(_pdf_asset_row, dict):
+                        continue
+                    _pdf_asset_curve = []
+                    _pdf_curve_points = _pdf_asset_row.get("curve")
+                    if isinstance(_pdf_curve_points, list):
+                        for _pdf_point in _pdf_curve_points:
+                            if not isinstance(_pdf_point, dict):
+                                continue
+                            _pdf_point_month = str(
+                                _pdf_point.get("month") or ""
+                            ).strip()
+                            # 非法 / NaN / inf 的点直接丢，别让报告画出断点
+                            _pdf_point_value = _peer_number(
+                                _pdf_point.get("value"), None
+                            )
+                            if not _pdf_point_month or _pdf_point_value is None:
+                                continue
+                            _pdf_asset_curve.append(
+                                {
+                                    "month": _pdf_point_month,
+                                    "value": _pdf_point_value,
+                                }
+                            )
+                    if len(_pdf_asset_curve) < 2:
+                        continue
+                    _pdf_assets.append(
+                        {
+                            "name": str(_pdf_asset_row.get("name") or ""),
+                            "category": str(_pdf_asset_row.get("category") or ""),
+                            "purchase_price": _peer_number(
+                                _pdf_asset_row.get("purchase_price")
+                            ),
+                            "residual": _peer_number(
+                                _pdf_asset_row.get("residual")
+                            ),
+                            "depreciation_rate": _peer_number(
+                                _pdf_asset_row.get("depreciation_rate")
+                            ),
+                            "elapsed_months": _peer_number(
+                                _pdf_asset_row.get("elapsed_months")
+                            ),
+                            "curve": _pdf_asset_curve,
+                        }
+                    )
+            except Exception as _pdf_asset_exc:
+                print(
+                    f"[report] 资产折旧组装失败："
+                    f"{type(_pdf_asset_exc).__name__}: {_pdf_asset_exc}"
+                )
+                _pdf_assets = []
+
+            # ---------- ⑫ idle：闲鱼回血建议（只取前 3 件，字段同样裁剪 + 收敛）----------
+            # 与上面同款降级：取不到数就传空结构，报告模块按「无闲置」渲染。
+            _pdf_idle = {"count": 0, "monthly_loss_total": 0.0, "items": []}
+            try:
+                _pdf_idle_fn = getattr(db, "get_idle_assets", None)
+                if not callable(_pdf_idle_fn):
+                    raise RuntimeError("db.get_idle_assets 尚未提供")
+                _pdf_idle_stats = _pdf_idle_fn(st.session_state.user_id)
+                if not isinstance(_pdf_idle_stats, dict):
+                    raise ValueError("get_idle_assets 返回结构不合规")
+                try:
+                    _pdf_idle_count = int(_pdf_idle_stats.get("count") or 0)
+                except (TypeError, ValueError):
+                    _pdf_idle_count = 0
+                _pdf_idle_rows = _pdf_idle_stats.get("items")
+                if not isinstance(_pdf_idle_rows, list):
+                    _pdf_idle_rows = []
+                _pdf_idle_items = []
+                for _pdf_idle_row in _pdf_idle_rows[:3]:
+                    if not isinstance(_pdf_idle_row, dict):
+                        continue
+                    _pdf_idle_items.append(
+                        {
+                            "name": str(_pdf_idle_row.get("name") or ""),
+                            "category": str(
+                                _pdf_idle_row.get("category") or ""
+                            ),
+                            "monthly_loss": _peer_number(
+                                _pdf_idle_row.get("monthly_loss")
+                            ),
+                            "suggested_price": _peer_number(
+                                _pdf_idle_row.get("suggested_price")
+                            ),
+                            "idle_months": _peer_number(
+                                _pdf_idle_row.get("idle_months")
+                            ),
+                            "residual": _peer_number(
+                                _pdf_idle_row.get("residual")
+                            ),
+                        }
+                    )
+                _pdf_idle = {
+                    "count": _pdf_idle_count,
+                    "monthly_loss_total": _peer_number(
+                        _pdf_idle_stats.get("monthly_loss_total")
+                    ),
+                    "items": _pdf_idle_items,
+                }
+            except Exception as _pdf_idle_exc:
+                print(
+                    f"[report] 闲鱼回血组装失败："
+                    f"{type(_pdf_idle_exc).__name__}: {_pdf_idle_exc}"
+                )
+                _pdf_idle = {"count": 0, "monthly_loss_total": 0.0, "items": []}
+
             _pdf_payload = {
                 "user": _pdf_user,
                 "health": _pdf_health,
@@ -5006,12 +5139,16 @@ with tab_dash:
                 "latte": _pdf_latte,
                 "sandbox": _pdf_sandbox,
                 "ai": _pdf_ai,
+                # 新增两块：资产折旧曲线 + 闲鱼回血清单（均已裁剪成 JSON 可序列化）
+                "assets": _pdf_assets,
+                "idle": _pdf_idle,
             }
 
             # 缓存 key = sha256(归一化 payload + 今天的日期)：
             # 同一份数据同一天只生成一次；换数据 / 隔天都会得到新 key 重新生成。
             # 归一化时把 user.generated_at 抹成空串：它只是展示用的时间戳，
             # 若参与哈希，同一份数据隔一分钟点两次也会被判成「数据变了」而重复排版。
+            _pdf_payload_json = ""
             try:
                 _pdf_key_payload = json.loads(
                     json.dumps(_pdf_payload, ensure_ascii=False, default=str)
@@ -5049,7 +5186,13 @@ with tab_dash:
                 _pdf_bytes = bytes(_pdf_cached["bytes"])
             else:
                 try:
-                    _pdf_bytes = _pdf_build_fn(_pdf_payload)
+                    # 进程级缓存：同一天同一份数据跨 rerun / 跨标签页都只排版一次
+                    _pdf_cache_payload = _pdf_payload_json or json.dumps(
+                        _pdf_payload, sort_keys=True, ensure_ascii=False, default=str
+                    )
+                    _pdf_bytes = _build_pdf_report_cached(
+                        date.today().isoformat(), _pdf_cache_payload
+                    )
                 except Exception as _pdf_build_exc:
                     print(
                         f"[report] 生成失败："
@@ -5072,6 +5215,10 @@ with tab_dash:
                         }
             if _pdf_bytes:
                 st.success("报告已生成，可在下方下载")
+
+    # 按钮下方固定说明报告新增的数据源：纯文案，不触发任何取数 / 排版 / AI 调用
+    if callable(_pdf_build_fn):
+        st.caption("含资产折旧与闲鱼回血建议")
 
     # 下载区独立于按钮：rerun 后只要缓存还在（且仍是本月）就继续展示，不用重新点
     _pdf_saved = st.session_state.get("pdf_report_cache")

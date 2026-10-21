@@ -6,7 +6,7 @@
 · 输出固定 3 页 A4（1240×1754 @150dpi）：P1 核心概览 / P2 消费透视 / P3 AI 诊断与建议；
 · 只吃 app.py 组装好的 payload dict，所有字段可选：缺字段按 0 / 空处理并画占位文案，
   任何输入（含 ``{}``）都**不抛异常**，页面不会因为报告而红屏；
-· 图表全部用 Pillow 自绘（玫瑰图 / 日历热力图 / 结余折线），不依赖 matplotlib、kaleido；
+· 图表全部用 Pillow 自绘（玫瑰图 / 资产折旧曲线 / 结余折线），不依赖 matplotlib、kaleido；
 · 中文字体直接复用 poster.py 的解析与排版工具（本机微软雅黑、云端 Noto，不硬编码路径）；
 · 商务蓝白配色 + 「明白账」斜向水印 + 页眉 wordmark + 页脚页码与免责声明。
 
@@ -588,6 +588,211 @@ def _draw_heatmap(draw, calendar: dict, box) -> None:
     draw.text((left + 34 + 5 * 30 + 4, legend_y), "多", font=_font(13), fill=_MUTED)
 
 
+# ---- 资产折旧曲线（P2 右侧卡片） ----
+
+_ASSET_LINE_COLORS = (_BLUE, _GREEN, _ORANGE)  # #1D4ED8 / #16A34A / #D97706
+_ASSET_MAX_LINES = 3
+_ASSET_EMPTY_HINT = (
+    "还没有资产，去「我的财务大盘」添加一件，这里就会画出它未来 3 年的身价"
+)
+
+
+def _safe_draw(func, *args, **kwargs) -> bool:
+    """页面内部兜底：任何一段绘图失败都只丢这一块，不影响整页。"""
+    try:
+        func(*args, **kwargs)
+        return True
+    except Exception as exc:  # noqa: BLE001 - 单块绘图失败不能拖垮整页
+        print(f"[report] 绘图降级：{type(exc).__name__}: {exc}")
+        return False
+
+
+def _months_label(month: str) -> str:
+    """'2026-10' → '26-10'（X 轴只标 YY-MM）。"""
+    text = _safe_text(month, "")
+    parts = text.split("-")
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+        return f"{parts[0][-2:]}-{parts[1].zfill(2)}"
+    return text[:5]
+
+
+def _normalize_assets(raw) -> list:
+    """把 payload['assets'] 归一成可直接绘制的曲线列表；脏数据一律跳过。
+
+    每项：``{"name", "color", "points": [(month, value), ...], "residual", "rate"}``；
+    只保留「曲线至少 2 个点」的资产，最多 3 件。
+    """
+    assets: list = []
+    if not isinstance(raw, (list, tuple)):
+        return assets
+    for entry in raw:
+        if len(assets) >= _ASSET_MAX_LINES:
+            break
+        if not isinstance(entry, dict):
+            continue
+        curve = entry.get("curve")
+        if not isinstance(curve, (list, tuple)):
+            continue
+        points = []
+        for point in curve:
+            if not isinstance(point, dict):
+                continue
+            month = _safe_text(point.get("month"), "")
+            if not month:
+                continue
+            points.append((month, _safe_float(point.get("value"))))
+        if len(points) < 2:
+            continue
+        name = (_safe_text(entry.get("name"), "") or "未命名资产")[:12]
+        rate = max(0.0, min(1.0, _safe_float(entry.get("depreciation_rate"))))
+        assets.append(
+            {
+                "name": name,
+                "color": _ASSET_LINE_COLORS[len(assets) % len(_ASSET_LINE_COLORS)],
+                "points": points,
+                "residual": _safe_float(entry.get("residual"), points[-1][1]),
+                "rate": rate,
+            }
+        )
+    return assets
+
+
+def _catmull_rom(points: list, samples: int = 8) -> list:
+    """Catmull-Rom 采样，把折线画成平滑曲线（点少于 3 个时原样返回）。"""
+    if len(points) < 3:
+        return list(points)
+    out: list = []
+    count = len(points)
+    for index in range(count - 1):
+        p0 = points[max(0, index - 1)]
+        p1 = points[index]
+        p2 = points[index + 1]
+        p3 = points[min(count - 1, index + 2)]
+        for step in range(samples):
+            t = step / float(samples)
+            t2, t3 = t * t, t * t * t
+            x = 0.5 * (
+                2 * p1[0]
+                + (-p0[0] + p2[0]) * t
+                + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2
+                + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3
+            )
+            y = 0.5 * (
+                2 * p1[1]
+                + (-p0[1] + p2[1]) * t
+                + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2
+                + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3
+            )
+            out.append((x, y))
+    out.append(points[-1])
+    return out
+
+
+def _draw_depreciation_chart(draw, assets: list, box) -> None:
+    """资产折旧曲线：最多 3 条残值曲线 + 0 起点 Y 轴 + 卡片底部图例。"""
+    left, top, right, bottom = (int(value) for value in box)
+    drawable = [
+        item
+        for item in (assets if isinstance(assets, list) else [])
+        if isinstance(item, dict) and len(item.get("points") or []) >= 2
+    ]
+
+    if not drawable:
+        font = _font(16)
+        width = max(80, right - left - 56)
+        lines = _clip_lines(
+            draw, _wrap_text(draw, _ASSET_EMPTY_HINT, font, width), font, width, 4
+        )
+        step = _line_height(font, 1.55)
+        y = (top + bottom - step * len(lines)) // 2 + step // 2
+        for line in lines:
+            draw.text(((left + right) // 2, y), line, font=font, fill=_MUTED, anchor="mm")
+            y += step
+        return
+
+    plot_left, plot_right = left + 64, right - 6
+    plot_top, plot_bottom = top + 8, bottom - 104
+    longest = max(drawable, key=lambda item: len(item["points"]))
+    point_count = max(2, len(longest["points"]))
+
+    all_values = [value for item in drawable for _, value in item["points"]]
+    vmax = max(all_values + [0.0])
+    if vmax <= 0:
+        vmax = 1000.0
+    vmax *= 1.08
+
+    def to_xy(index: int, value: float) -> tuple:
+        x = plot_left + (plot_right - plot_left) * (index / max(1, point_count - 1))
+        y = plot_bottom - (plot_bottom - plot_top) * (value / vmax)
+        return x, y
+
+    # Y 轴：4 条网格线，最低一条就是 0 起点
+    grid_font = _font(11)
+    for grid in range(4):
+        value = vmax * grid / 3.0
+        y = to_xy(0, value)[1]
+        draw.line(
+            (plot_left, y, plot_right, y),
+            fill=_BORDER if grid == 0 else (232, 238, 246),
+            width=1,
+        )
+        label = f"{value / 10000:,.1f}万" if value >= 10000 else f"{value:,.0f}"
+        draw.text((plot_left - 10, y), label, font=grid_font, fill=_MUTED, anchor="rm")
+
+    # X 轴：等距取 7 个刻度（每 6 个月一个 YY-MM）
+    want = 7
+    if point_count <= want:
+        indices = list(range(point_count))
+    else:
+        ratio = (point_count - 1) / float(want - 1)
+        indices = sorted({int(round(i * ratio)) for i in range(want)})
+    for index in indices:
+        x = to_xy(index, 0.0)[0]
+        draw.text(
+            (x, plot_bottom + 15),
+            _months_label(longest["points"][index][0]),
+            font=grid_font,
+            fill=_MUTED,
+            anchor="mm",
+        )
+
+    # 曲线 + 端点圆点
+    for item in drawable:
+        points = [to_xy(index, value) for index, (_, value) in enumerate(item["points"])]
+        smooth = _catmull_rom(points)
+        if len(smooth) >= 2:
+            draw.line(smooth, fill=item["color"], width=3, joint="curve")
+        for x, y in (points[0], points[-1]):
+            draw.ellipse(
+                (x - 5, y - 5, x + 5, y + 5),
+                fill=item["color"],
+                outline=(255, 255, 255),
+                width=2,
+            )
+
+    # 图例（卡片底部）：名称 · 当前 ¥x · 年折旧 y%
+    legend_font = _font(12)
+    legend_width = right - left - 34
+    legend_y = bottom - 78
+    for item in drawable:
+        draw.rounded_rectangle(
+            (left + 4, legend_y + 4, left + 20, legend_y + 15), radius=3, fill=item["color"]
+        )
+        text = (
+            f"{item['name']} · 当前 {_money(item['residual'])} · "
+            f"年折旧 {item['rate'] * 100:g}%"
+        )
+        lines = _clip_lines(
+            draw,
+            _wrap_text(draw, text, legend_font, legend_width),
+            legend_font,
+            legend_width,
+            1,
+        )
+        draw.text((left + 26, legend_y), lines[0], font=legend_font, fill=_TEXT)
+        legend_y += 25
+
+
 def _page2(payload: dict) -> Image.Image:
     img, month_label = _page_shell(payload, 2)
     draw = ImageDraw.Draw(img)
@@ -608,16 +813,9 @@ def _page2(payload: dict) -> Image.Image:
         if isinstance(item, dict)
     ][:5]
 
-    calendar = payload.get("calendar") if isinstance(payload.get("calendar"), dict) else {}
-    year = int(_safe_float(calendar.get("year"), _dt.date.today().year))
-    month = int(_safe_float(calendar.get("month"), _dt.date.today().month))
-    days_raw = calendar.get("days") if isinstance(calendar.get("days"), dict) else {}
-    active_days = sum(
-        1 for value in days_raw.values() if _safe_float(value) > 0
-    )
-    max_day = max([_safe_float(v) for v in days_raw.values()] + [0.0])
+    assets = _normalize_assets(payload.get("assets"))
 
-    _section(draw, "消费透视", "钱都花在哪儿了：分类结构、每日节奏与大额商户。")
+    _section(draw, "消费透视", "钱都花在哪儿了：分类结构、资产折旧与大额商户。")
 
     # ---- 玫瑰图 ----
     _card(draw, (84, 300, 700, 900))
@@ -638,23 +836,18 @@ def _page2(payload: dict) -> Image.Image:
             text = f"{item['name'][:5]} {_money(item['amount'])} · {share:.0f}%"
             draw.text((lx + 20, ly), text, font=_font(14), fill=_TEXT)
 
-    # ---- 日历热力图 ----
+    # ---- 资产折旧曲线 ----
     _card(draw, (724, 300, 1156, 900))
-    draw.text((748, 320), "消费日历 · 每日支出", font=_font(19, True), fill=_NAVY)
-    draw.text(
-        (1132, 324),
-        f"{year}年{month}月",
-        font=_font(14),
-        fill=_MUTED,
-        anchor="ra",
-    )
-    _draw_heatmap(draw, {"year": year, "month": month, "days": days_raw}, (724, 340, 1156, 850))
-    draw.text(
-        (748, 862),
-        f"本月有 {active_days} 天记账，最高单日 {_money(max_day)}",
-        font=_font(14),
-        fill=_MUTED,
-    )
+    draw.text((748, 320), "资产折旧 · 未来 36 个月", font=_font(19, True), fill=_NAVY)
+    draw.text((1132, 324), "按直线法估算", font=_font(13), fill=_MUTED, anchor="ra")
+    if not _safe_draw(_draw_depreciation_chart, draw, assets, (740, 350, 1140, 888)):
+        draw.text(
+            (940, 620),
+            "资产曲线暂时画不出来",
+            font=_font(15),
+            fill=_MUTED,
+            anchor="mm",
+        )
 
     # ---- Top 商户 ----
     _card(draw, (84, 930, 1156, 1470))
@@ -794,6 +987,152 @@ def _draw_line_chart(draw, sandbox: dict, box) -> None:
         legend_x += 110
 
 
+# ---- 闲鱼回血建议（P3 新增卡片） ----
+
+_IDLE_MAX_ROWS = 3
+_IDLE_EMPTY_TEXT = "暂时没有高危闲置，手里的东西都还挺值钱。"
+_IDLE_NOTE = "二手价按品类系数估算，仅供参考"
+
+
+def _idle_advice(months) -> tuple:
+    """按已闲置月数给建议：≥24 越拖越亏 / ≥12 可以出了 / 其他先观察。"""
+    value = _safe_float(months)
+    if value >= 24:
+        return "挂闲鱼，越拖越亏", _WARN
+    if value >= 12:
+        return "可以出了", _ORANGE
+    return "观察一下", _MUTED
+
+
+def _normalize_idle(raw) -> dict:
+    """把 payload['idle'] 归一成 {count, monthly_loss_total, items}；脏数据不抛。"""
+    data = raw if isinstance(raw, dict) else {}
+    raw_items = data.get("items")
+    raw_items = raw_items if isinstance(raw_items, (list, tuple)) else []
+    items: list = []
+    for entry in raw_items:
+        if len(items) >= _IDLE_MAX_ROWS:
+            break
+        if not isinstance(entry, dict):
+            continue
+        name = _safe_text(entry.get("name"), "")
+        if not name:
+            continue
+        items.append(
+            {
+                "name": name[:14],
+                "category": (_safe_text(entry.get("category"), "") or "其他")[:4],
+                "monthly_loss": _safe_float(entry.get("monthly_loss")),
+                "suggested_price": _safe_float(entry.get("suggested_price")),
+                "idle_months": _safe_float(entry.get("idle_months")),
+                "residual": _safe_float(entry.get("residual")),
+            }
+        )
+    count = max(int(_safe_float(data.get("count"), len(items))), len(items))
+    default_total = sum(item["monthly_loss"] for item in items)
+    total = _safe_float(data.get("monthly_loss_total"), default_total)
+    if total <= 0 and default_total > 0:
+        total = default_total
+    return {"count": count, "monthly_loss_total": total, "items": items}
+
+
+def _idle_conclusion(idle: dict) -> str:
+    """卡片底部结论：先出每月蒸发最大的那件，再给合计。"""
+    items = idle.get("items") or []
+    if not items:
+        return _IDLE_EMPTY_TEXT
+    top = max(items, key=lambda item: item["monthly_loss"])
+    text = (
+        f"先出 {top['name']}：每月蒸发 {_money(top['monthly_loss'])}，"
+        f"参考挂牌 {_money(top['suggested_price'])}"
+    )
+    total = _safe_float(idle.get("monthly_loss_total"))
+    if int(_safe_float(idle.get("count"))) > 1 and total > 0:
+        return text + f"；{int(_safe_float(idle.get('count')))} 件合计每月省 {_money(total)}。"
+    return text + "。"
+
+
+def _draw_idle_card(draw, idle, box) -> None:
+    """「闲鱼回血建议」卡片：右上角总量、最多 3 行明细、底部结论 + 免责小字。"""
+    left, top, right, bottom = (int(value) for value in box)
+    items = idle.get("items") or []
+    count = int(_safe_float(idle.get("count"))) if items else 0
+    total = max(0.0, _safe_float(idle.get("monthly_loss_total"))) if items else 0.0
+
+    draw.text((left + 26, top + 20), "闲鱼回血建议", font=_font(19, True), fill=_NAVY)
+    draw.text(
+        (right - 24, top + 24),
+        f"高危闲置 {count} 件 · 每月蒸发 {_money(total)}",
+        font=_font(13),
+        fill=_WARN if count > 0 else _MUTED,
+        anchor="ra",
+    )
+
+    if not items:
+        draw.text(
+            ((left + right) // 2, (top + bottom) // 2 - 14),
+            _IDLE_EMPTY_TEXT,
+            font=_font(17),
+            fill=_GREEN,
+            anchor="mm",
+        )
+        draw.text(
+            (right - 24, bottom - 26),
+            _IDLE_NOTE,
+            font=_font(12),
+            fill=(148, 163, 184),
+            anchor="ra",
+        )
+        return
+
+    row_y = top + 64
+    for item in items:
+        draw.text(
+            (left + 26, row_y),
+            f"{item['name']}（{item['category']}）",
+            font=_font(16),
+            fill=_TEXT,
+        )
+        draw.text(
+            (left + 430, row_y + 2),
+            f"· 每月蒸发 {_money(item['monthly_loss'])}",
+            font=_font(14),
+            fill=_WARN,
+        )
+        draw.text(
+            (left + 730, row_y + 2),
+            f"参考挂牌 {_money(item['suggested_price'])}",
+            font=_font(14),
+            fill=_NAVY,
+        )
+        advice, color = _idle_advice(item["idle_months"])
+        draw.text(
+            (right - 24, row_y + 1), advice, font=_font(14, True), fill=color, anchor="ra"
+        )
+        draw.line(
+            (left + 26, row_y + 30, right - 24, row_y + 30), fill=(238, 243, 249), width=1
+        )
+        row_y += 36
+
+    draw.line((left + 26, bottom - 74, right - 24, bottom - 74), fill=_BORDER, width=1)
+    _bullet_lines(
+        draw,
+        _idle_conclusion(idle),
+        _font(14),
+        left + 26,
+        bottom - 64,
+        right - left - 52,
+        max_lines=2,
+    )
+    draw.text(
+        (right - 24, bottom - 26),
+        _IDLE_NOTE,
+        font=_font(12),
+        fill=(148, 163, 184),
+        anchor="ra",
+    )
+
+
 def _page3(payload: dict) -> Image.Image:
     img, month_label = _page_shell(payload, 3)
     draw = ImageDraw.Draw(img)
@@ -801,6 +1140,7 @@ def _page3(payload: dict) -> Image.Image:
     ai = payload.get("ai") if isinstance(payload.get("ai"), dict) else {}
     latte = payload.get("latte") if isinstance(payload.get("latte"), dict) else {}
     sandbox = payload.get("sandbox") if isinstance(payload.get("sandbox"), dict) else {}
+    idle = _normalize_idle(payload.get("idle"))
 
     daily = max(0.0, _safe_float(latte.get("daily")))
     monthly = max(0.0, _safe_float(latte.get("monthly"), daily * 30))
@@ -808,69 +1148,78 @@ def _page3(payload: dict) -> Image.Image:
     ten_year = max(0.0, _safe_float(latte.get("ten_year"), yearly * 10))
     top_item = _safe_text(latte.get("top_item"), "") or "非必要小额消费"
 
-    _section(draw, "AI 深度诊断", "一页纸说清楚：问题、机会成本、未来推演与下月行动。")
+    _section(draw, "AI 深度诊断", "一页纸说清楚：问题、机会成本、闲置回血与下月行动。")
 
-    # ---- 灵魂拷问 ----
+    # ---- 灵魂拷问（高度 200） ----
     soul = _safe_text(ai.get("soul"), "")
     if not soul:
         soul = (
             f"如果每天少花 {_money(daily)} 在{top_item}上，一年就是 {_money(yearly)}"
             f"——这笔钱，够你认真考虑一次说走就走的旅行了。"
         )
-    card = (84, 300, 1156, 540)
-    _card(draw, card, fill=(248, 251, 255))
-    draw.rectangle((84, 300, 90, 540), fill=_BLUE)
-    draw.text((120, 322), "AI 灵魂拷问", font=_font(18, True), fill=_BLUE)
-    _bullet_lines(draw, soul, _font(20), 120, 360, 980, max_lines=4, fill=_NAVY)
+    _card(draw, (84, 300, 1156, 500), fill=(248, 251, 255))
+    draw.rectangle((84, 300, 90, 500), fill=_BLUE)
+    draw.text((120, 320), "AI 灵魂拷问", font=_font(18, True), fill=_BLUE)
+    _bullet_lines(draw, soul, _font(19), 120, 356, 980, max_lines=3, fill=_NAVY)
 
-    # AI 诊断（有就放到卡片底部一行，没有就整行省略）
+    # AI 诊断（有就放卡片底部一行，没有就整行省略）
     diagnosis = _safe_text(ai.get("diagnosis"), "")
     if diagnosis:
         diag_text = f"顾问诊断：{diagnosis}"
         diag_lines = _clip_lines(
-            draw, _wrap_text(draw, diag_text, _font(15), 980), _font(15), 980, 1
+            draw, _wrap_text(draw, diag_text, _font(14), 980), _font(14), 980, 1
         )
-        draw.text((120, 500), diag_lines[0], font=_font(15), fill=_MUTED)
+        draw.text((120, 466), diag_lines[0], font=_font(14), fill=_MUTED)
 
-    # ---- 拿铁因子 ----
-    card = (84, 570, 1156, 810)
-    _card(draw, card)
-    draw.text((110, 592), "拿铁因子 · 机会成本", font=_font(19, True), fill=_NAVY)
+    # ---- 拿铁因子（压成一条窄卡） ----
+    _card(draw, (84, 520, 1156, 650))
+    draw.text((110, 536), "拿铁因子 · 机会成本", font=_font(18, True), fill=_NAVY)
+    draw.text(
+        (1132, 540),
+        "按年化 5% 估算，非承诺收益",
+        font=_font(12),
+        fill=_MUTED,
+        anchor="ra",
+    )
     numbers = [
         ("日均", _money(daily)),
         ("月均", _money(monthly)),
         ("年均", _money(yearly)),
         ("10 年复利", _money(ten_year)),
     ]
-    box_w = 236
+    box_w = 232
     gap = 18
     x = 110
     for label, value in numbers:
         draw.rounded_rectangle(
-            (x, 630, x + box_w, 750), radius=14, fill=_BG, outline=_BORDER, width=1
+            (x, 570, x + box_w, 630), radius=12, fill=_BG, outline=_BORDER, width=1
         )
-        draw.text((x + 16, 650), label, font=_font(14), fill=_MUTED)
-        draw.text((x + 16, 684), value, font=_font(22, True), fill=_NAVY)
+        draw.text((x + 14, 578), label, font=_font(12), fill=_MUTED)
+        draw.text((x + 14, 596), value, font=_font(19, True), fill=_NAVY)
         x += box_w + gap
-    draw.text(
-        (110, 768),
-        "按年化 5% 估算，非承诺收益；减少非必要小额消费，长期差距会很明显。",
-        font=_font(13),
-        fill=_MUTED,
-    )
 
-    # ---- 6 个月预测 ----
-    card = (84, 840, 1156, 1290)
-    _card(draw, card)
-    draw.text((110, 862), "未来 6 个月结余预测", font=_font(19, True), fill=_NAVY)
+    # ---- 闲鱼回血建议 ----
+    _card(draw, (84, 670, 1156, 930))
+    if not _safe_draw(_draw_idle_card, draw, idle, (84, 670, 1156, 930)):
+        draw.text(
+            (620, 800),
+            "闲置估算暂时不可用",
+            font=_font(15),
+            fill=_MUTED,
+            anchor="mm",
+        )
+
+    # ---- 6 个月预测（高度 340） ----
+    _card(draw, (84, 950, 1156, 1290))
+    draw.text((110, 972), "未来 6 个月结余预测", font=_font(19, True), fill=_NAVY)
     draw.text(
-        (1132, 866),
+        (1132, 976),
         "基于本月收支节奏推演",
         font=_font(13),
         fill=_MUTED,
         anchor="ra",
     )
-    _draw_line_chart(draw, sandbox, (100, 900, 1140, 1268))
+    _draw_line_chart(draw, sandbox, (100, 1000, 1140, 1258))
 
     # ---- 3 条行动建议 ----
     actions = ai.get("actions") if isinstance(ai.get("actions"), list) else []
@@ -878,11 +1227,18 @@ def _page3(payload: dict) -> Image.Image:
     if not actions:
         metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
         milk = max(0.0, _safe_float(metrics.get("milk_tea_share")))
-        expense = max(0.0, _safe_float((payload.get("balance") or {}).get("expense")))
+        balance = payload.get("balance") if isinstance(payload.get("balance"), dict) else {}
+        expense = max(0.0, _safe_float(balance.get("expense")))
         saving = _safe_float(metrics.get("saving_rate"))
         if milk > 0 and expense > 0:
             actions.append(
                 f"把奶茶咖啡砍掉一半，按本月占比估算每月约省 {_money(expense * milk / 2)}。"
+            )
+        if idle["items"]:
+            top = max(idle["items"], key=lambda item: item["monthly_loss"])
+            actions.append(
+                f"把闲置的 {top['name']} 挂上闲鱼，参考挂牌 {_money(top['suggested_price'])}，"
+                f"每月少蒸发 {_money(top['monthly_loss'])}。"
             )
         if saving < 0.2:
             actions.append("生活费到账当天先转 10% 到单独存钱罐，剩下的再安排开销。")
@@ -892,8 +1248,8 @@ def _page3(payload: dict) -> Image.Image:
             actions.append("每周日花 5 分钟对一遍账，把「想不起来」的支出标出来。")
         actions = actions[:3]
 
-    draw.text((84, 1320), "下月 3 条具体行动", font=_font(19, True), fill=_NAVY)
-    y = 1360
+    draw.text((84, 1310), "下月 3 条具体行动", font=_font(19, True), fill=_NAVY)
+    y = 1348
     for index, action in enumerate(actions[:3], start=1):
         draw.rounded_rectangle((84, y, 1156, y + 78), radius=14, fill=_CARD, outline=_BORDER, width=1)
         draw.ellipse((104, y + 19, 144, y + 59), fill=_BLUE)
