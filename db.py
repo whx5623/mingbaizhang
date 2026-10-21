@@ -7039,3 +7039,685 @@ def radar_available() -> bool:
     get_peer_benchmark 再靠异常分支降级。函数本身不抛错（探测失败按 False 处理）。
     """
     return bool(_bills_category_supported())
+
+
+# ===========================================================================
+# 个人资产负债表 / 数码资产折旧仪（migrations/020_assets.sql）
+# ---------------------------------------------------------------------------
+# 本段只**追加**，不改动上面任何既有函数、常量与取数口径。
+#
+# 分工：
+#   · assets_available / _warn_asset_once    探测 public.assets 是否存在（020 是否执行）；
+#   · 纯计算（不碰库）：normalize_asset_category / compute_asset_value / compute_asset_curve；
+#   · 读写资产台账：add_asset / delete_asset / list_assets / get_asset_overview。
+#
+# 折旧口径（本功能的正确性核心）：
+#   · 直线法，按**天**折算年数，但先按「整月 + 不足一月的零头天」拆开：
+#       满一个自然年必须恰好折旧掉一个 rate（6000 元、20% → 一年后 4800.00，
+#       而不是 4800.82 —— 纯 days/365.25 会因闰年差 0.08% 漂移）；
+#   · 365.25 天/年只用于折算「不足一月」的零头天，跨闰年稳定；
+#   · 一律 Decimal 计算，最后经 _money_to_float 定量两位（ROUND_HALF_UP）。
+#
+# 降级约定（020 未执行时）：
+#   · assets_available() → False（进程内缓存 + 只告警一次，照抄 _bills_mood_supported）；
+#   · 读接口返回空结构（[] / 全 0 的 overview），绝不红屏；
+#   · 写接口 add_asset 抛 AssetTableMissing（中文 message 可直接展示给用户），
+#     delete_asset 返回 False。
+# ===========================================================================
+
+ASSET_CATEGORIES = ("数码", "生活", "其他")
+ASSET_FALLBACK_CATEGORY = "其他"
+ASSET_DEFAULT_DEPRECIATION = 0.20
+ASSET_NAME_MAX_LEN = 100
+ASSET_CURVE_MONTHS = 36
+ASSET_CURVE_MONTHS_MIN = 1
+ASSET_CURVE_MONTHS_MAX = 120
+
+# NUMERIC(5,4)：年折旧率最多 4 位小数（12.5% / 20% / 33.33% 都够表达）。
+ASSET_RATE_QUANT = Decimal("0.0001")
+# 一年按 365.25 天折算（只作用于「不足一月」的零头，见 _asset_elapsed_years）。
+ASSET_DAYS_PER_YEAR = Decimal("365.25")
+
+ASSET_TABLE_MISSING_MESSAGE = (
+    "资产台账功能未启用：请先执行 migrations/020_assets.sql"
+)
+ASSET_LIABILITY_NOTE = "按近 6 个月还款记录外推未来 6 个月待还（估算）"
+ASSET_LIABILITY_UNAVAILABLE_NOTE = "暂无法估算负债"
+
+# public.assets 是否存在的进程级缓存：None = 还没探测过；True/False = 探测结果。
+# 与 _BILLS_MOOD_SUPPORT 同一套取舍：只缓存**探测成功**的结果，探测失败
+# （库暂时不可用）不缓存，否则一次抖动就会让整个进程永久降级。
+_ASSETS_TABLE_SUPPORT = None
+# 告警只打一次：资产页每轮 rerun 都会调 assets_available，
+# 020 未执行时逐次 print 会刷屏。
+_ASSET_WARNED = False
+
+
+class AssetTableMissing(Exception):
+    """020_assets.sql 未执行（public.assets 不存在）。
+
+    message 是**可直接展示**的中文提示（页面捕获后 st.warning 即可，不红屏）。
+    """
+
+
+def _warn_asset_once(message: str) -> None:
+    """[assets] 告警只打一次（进程内）：页面每轮 rerun 都会调资产接口，不能刷屏。"""
+    global _ASSET_WARNED
+    if _ASSET_WARNED:
+        return
+    _ASSET_WARNED = True
+    print(f"[assets] {message}")
+
+
+def assets_available() -> bool:
+    """探测 public.assets 是否存在（迁移 020 是否已执行），结果进程内缓存。
+
+    与 _bills_mood_supported() 同一套模式：
+      · 探测成功才写缓存（True/False），探测失败（库暂时不可用）不缓存、下次再探；
+      · 020 未执行只告警一次，调用方据此走降级分支（读空 / 写抛 AssetTableMissing）。
+    本函数**不抛异常**：探测失败按 False 处理（宁可显示"暂不可用"，也不红屏）。
+    """
+    global _ASSETS_TABLE_SUPPORT
+    if _ASSETS_TABLE_SUPPORT is not None:
+        return _ASSETS_TABLE_SUPPORT
+    if engine is None:
+        # 正常入口 app.py 会先 init_db()；这里兜底，避免脚本里直接调 add_asset 时
+        # 把"引擎没建"误判成"表不存在"并永久缓存。
+        try:
+            init_db()
+        except Exception:
+            _warn_asset_once(
+                "探测 public.assets 前初始化数据库失败，本次按「表不存在」处理"
+            )
+            return False
+    try:
+        with engine.connect() as conn:
+            exists = bool(conn.execute(
+                text("SELECT to_regclass('public.assets')")
+            ).scalar())
+    except Exception:
+        # 探测失败 ≠ 表不存在：不写缓存，下次再探（写库本身也会失败并照常抛出）。
+        _warn_asset_once("探测 public.assets 失败，本次按「表不存在」处理")
+        return False
+    _ASSETS_TABLE_SUPPORT = exists
+    if not exists:
+        _warn_asset_once(
+            "public.assets 不存在（migrations/020_assets.sql 未执行）："
+            "资产台账暂不可用，请执行 020 迁移后重启应用"
+        )
+    return exists
+
+
+def normalize_asset_category(value) -> str:
+    """把任意传入值收敛成 ASSET_CATEGORIES 里的原值；认不出就返回 "其他"。
+
+    · 合法值（数码 / 生活 / 其他）原样返回；
+    · None / "" / 纯空白 / NaN / 非法字符串 → "其他"；
+    · **绝不抛异常**：分类来自页面控件 / AI 输出，脏值最多落成"其他"，
+      不能让一次分类写错把整笔资产写入打回去。
+    """
+    try:
+        if isinstance(value, str):
+            text = value.strip()
+        else:
+            if value is None:
+                return ASSET_FALLBACK_CATEGORY
+            try:
+                if pd.isna(value):  # NaN / NaT / pd.NA
+                    return ASSET_FALLBACK_CATEGORY
+            except (TypeError, ValueError):
+                pass
+            text = str(value).strip()
+        return text if text in ASSET_CATEGORIES else ASSET_FALLBACK_CATEGORY
+    except Exception:
+        return ASSET_FALLBACK_CATEGORY
+
+
+def _normalize_asset_date(value, label: str) -> date:
+    """购入日期 / today 收敛成 datetime.date：date / datetime / "YYYY-MM-DD"，其余 ValueError。
+
+    datetime 是 date 的子类，必须先取 .date()：否则带时分秒的值与 date 比较 /
+    相减会按"不足 24h 就少一天"截断，elapsed_days 少 1。
+    非法字符串（2026/10/21、2026-13-40、2026-02-30）与非法类型都抛中文 ValueError。
+    """
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if _ISO_DATE_PATTERN.fullmatch(text):
+            try:
+                return datetime.strptime(text, "%Y-%m-%d").date()
+            except ValueError:
+                pass  # 格式对但日子不存在（2026-02-30）→ 落到下面统一报错
+    raise ValueError(f"{label}必须是 datetime.date 或 YYYY-MM-DD 字符串：{value!r}")
+
+
+def _normalize_asset_price(value) -> Decimal:
+    """购入价收敛成两位小数的 Decimal：有限、>= 0、<= MAX_ABS_AMOUNT。
+
+    拒绝 bool（True 会被 float 成 1.0，把"开关"静默当成金额）；
+    nan / inf 一律拒绝（会顺着残值把页面变成 "nan 元"）；
+    0 是合法值（赠品 / 已报废但留档），残值恒 0。
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"购入价非法：{value!r}（不是数字）")
+    try:
+        price = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"购入价非法：{value!r}（不是数字）") from exc
+    if not price.is_finite():
+        raise ValueError(f"购入价非法：{value!r}（必须是有限数字，不允许 nan/inf）")
+    if price < 0:
+        raise ValueError(f"购入价不能为负数：{value!r}")
+    try:
+        price = price.quantize(_CENT, rounding=ROUND_HALF_UP)
+    except InvalidOperation as exc:
+        raise ValueError(f"购入价超出上限 {MAX_ABS_AMOUNT}：{value!r}") from exc
+    if price < 0:
+        raise ValueError(f"购入价不能为负数：{value!r}")
+    if price > Decimal(str(MAX_ABS_AMOUNT)):
+        raise ValueError(f"购入价超出上限 {MAX_ABS_AMOUNT}：{value!r}")
+    return price
+
+
+def _normalize_asset_rate(value) -> Decimal:
+    """年折旧率收敛成 0~1 的 Decimal（4 位小数）：20% 必须传 0.2。
+
+    >1 或 <0 抛 ValueError，**不做 20 → 0.2 的自动换算**：把 20 当 20% 还是
+    2000% 无法从值本身判断，静默换算一旦猜错，残值会瞬间变成 0 且用户毫无察觉。
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"折旧率非法：{value!r}（必须是 0~1 的小数，20% 请传 0.2）")
+    try:
+        rate = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"折旧率非法：{value!r}（必须是 0~1 的小数，20% 请传 0.2）"
+        ) from exc
+    if not rate.is_finite():
+        raise ValueError(f"折旧率非法：{value!r}（必须是有限数字，不允许 nan/inf）")
+    if rate < 0 or rate > 1:
+        raise ValueError(
+            f"折旧率必须在 0~1 之间（20% 请传 0.2，不允许把 20 当 20%）：{value!r}"
+        )
+    try:
+        rate = rate.quantize(ASSET_RATE_QUANT, rounding=ROUND_HALF_UP)
+    except InvalidOperation as exc:
+        raise ValueError(f"折旧率非法：{value!r}") from exc
+    if rate < 0 or rate > 1:  # 量化后重新校验（0.99999 → 1.0000 属合法边界）
+        raise ValueError(
+            f"折旧率必须在 0~1 之间（20% 请传 0.2）：{value!r}"
+        )
+    return rate
+
+
+def _asset_month_length(year: int, month: int) -> int:
+    """某年某月的天数：用「下月 1 日 - 本月 1 日」算，天然覆盖 2 月 / 闰年 / 大小月。"""
+    if month == 12:
+        next_first = date(year + 1, 1, 1)
+    else:
+        next_first = date(year, month + 1, 1)
+    return (next_first - date(year, month, 1)).days
+
+
+def _asset_add_months(day: date, months: int) -> date:
+    """把 day 平移 months 个自然月，保持"同日"；目标月没有该日则 clamp 到月末。
+
+    例：2024-01-31 + 1 月 → 2024-02-29；2024-02-29 + 12 月 → 2025-02-28。
+    与 _liability_month_shift 同一套「月份序号」算法，跨年天然正确。
+    """
+    index = day.year * 12 + day.month - 1 + int(months)
+    year, month = index // 12, index % 12 + 1
+    return date(year, month, min(day.day, _asset_month_length(year, month)))
+
+
+def _asset_shift_month(day: date, months: int) -> str:
+    """自然月键 "YYYY-MM"（零填充 → 字典序 == 时间序），从 day 所在月平移 months。"""
+    index = day.year * 12 + day.month - 1 + int(months)
+    return f"{index // 12:04d}-{index % 12 + 1:02d}"
+
+
+def _asset_elapsed_years(purchase_date: date, today: date) -> Decimal:
+    """购入至今的「年数」= 整月数/12 + 不足一月的零头天/365.25。
+
+    为什么不用纯 days/365.25：365.25 与自然年有 0.08% 的差，6000 元、20% 的资产
+    满一年会算出 4800.82 而不是 4800.00 —— 用户一眼就能看出"满一年没扣够 20%"。
+    先按自然月对齐（同日 / 月末 clamp），零头天才按 365.25 折算，于是：
+      · 满 1 年恰好 1.0 年 → 恰好折旧掉一个 rate；
+      · 跨闰年稳定（不因 366 天多折一天）；
+      · 预购（today <= purchase_date）→ 0，残值 = 原价。
+
+    返回 Decimal（后续金额运算全程 Decimal，不做 float 累加）。
+    """
+    if today <= purchase_date:
+        return Decimal("0")
+    months = (
+        (today.year - purchase_date.year) * 12
+        + (today.month - purchase_date.month)
+    )
+    anchor = _asset_add_months(purchase_date, months)
+    if anchor > today:  # 还没到当月同日（例如 1/31 购入、2/28 的今天）
+        months -= 1
+        anchor = _asset_add_months(purchase_date, months)
+    whole_years = Decimal(months) / Decimal(12)
+    remainder_days = Decimal((today - anchor).days)
+    return whole_years + remainder_days / ASSET_DAYS_PER_YEAR
+
+
+def _asset_residual(price: Decimal, rate: Decimal, years: Decimal) -> tuple[float, bool]:
+    """按「原价 × max(0, 1 - rate*years)」算残值，返回 (两位小数 float, 是否已归零)。
+
+    fully_depreciated 的判据是折旧因子 <= 0（rate*years >= 1），
+    与"残值恰好为 0"区分开：price=0 时残值恒 0，但它不是"折完了"。
+    """
+    factor = Decimal("1") - rate * years
+    fully = factor <= 0
+    if factor < 0:
+        factor = Decimal("0")
+    return _money_to_float(price * factor), fully
+
+
+def _normalize_asset_curve_months(months) -> int:
+    """曲线月数收敛到 1~120：非法（非 int / bool / 越界）→ 默认 36（只读展示，不抛）。"""
+    if isinstance(months, bool) or not isinstance(months, int):
+        return ASSET_CURVE_MONTHS
+    if months < ASSET_CURVE_MONTHS_MIN or months > ASSET_CURVE_MONTHS_MAX:
+        return ASSET_CURVE_MONTHS
+    return months
+
+
+def compute_asset_value(purchase_price, purchase_date, depreciation_rate,
+                        today=None) -> dict:
+    """单件资产的当前残值与折旧指标（纯函数，不碰 DB）。
+
+    参数校验（非法一律 ValueError）：
+      · purchase_price：有限、>= 0（0 合法），Decimal 定量两位；
+      · purchase_date：date / datetime / "YYYY-MM-DD"；
+      · depreciation_rate：0~1 的小数（20% 传 0.2），>1 / <0 拒绝；
+      · today：同上，默认 date.today()。
+
+    返回字段（键名固定，页面/图表直接取）：
+      price / purchase_date / depreciation_rate / elapsed_days / elapsed_years /
+      elapsed_months / residual / residual_rate / monthly_loss / annual_loss /
+      fully_depreciated / months_remaining
+    """
+    price = _normalize_asset_price(purchase_price)
+    rate = _normalize_asset_rate(depreciation_rate)
+    purchase = _normalize_asset_date(purchase_date, "购入日期")
+    current = _normalize_forecast_today(today)
+
+    elapsed_days = max(0, (current - purchase).days)
+    years = _asset_elapsed_years(purchase, current)
+    residual, fully_depreciated = _asset_residual(price, rate, years)
+    price_float = _money_to_float(price)
+
+    residual_rate = round(residual / price_float, 4) if price_float > 0 else 0.0
+    annual_loss = _money_to_float(price * rate)
+    monthly_loss = _money_to_float(price * rate / Decimal(12))
+    elapsed_months = round(float(years) * 12, 1)
+    if rate > 0:
+        # 通用式：(1/rate)*12 - elapsed_months（20% → 60 个月折完）。
+        months_remaining = max(
+            0.0, round(float(Decimal(12) / rate) - elapsed_months, 1)
+        )
+    else:
+        months_remaining = None  # 不折旧 → 没有"折完"的时间点
+
+    return {
+        "price": price_float,
+        "purchase_date": purchase.isoformat(),
+        "depreciation_rate": float(rate),
+        "elapsed_days": elapsed_days,
+        "elapsed_years": round(float(years), 4),
+        "elapsed_months": elapsed_months,
+        "residual": residual,
+        "residual_rate": residual_rate,
+        "monthly_loss": monthly_loss,
+        "annual_loss": annual_loss,
+        "fully_depreciated": bool(fully_depreciated),
+        "months_remaining": months_remaining,
+    }
+
+
+def compute_asset_curve(purchase_price, purchase_date, depreciation_rate,
+                        months=36, today=None) -> list[dict]:
+    """未来 months 个月的残值曲线（**纯函数**，不碰 DB）。
+
+    返回 **months+1** 个点（含今天这个月）：第 k 个点 = 今天往后 k 个自然月，
+    month 用「月份序号」平移（2026-12 之后是 2027-01，跨年正确），
+    value 的折算口径是 elapsed_years + k/12（与 compute_asset_value 同一套）。
+    months 收敛到 1~120，非法用 36。
+    """
+    price = _normalize_asset_price(purchase_price)
+    rate = _normalize_asset_rate(depreciation_rate)
+    purchase = _normalize_asset_date(purchase_date, "购入日期")
+    current = _normalize_forecast_today(today)
+    count = _normalize_asset_curve_months(months)
+
+    years = _asset_elapsed_years(purchase, current)
+    points = []
+    for offset in range(count + 1):
+        point_years = years + Decimal(offset) / Decimal(12)
+        value, _ = _asset_residual(price, rate, point_years)
+        points.append({
+            "month": _asset_shift_month(current, offset),
+            "value": value,
+        })
+    return points
+
+
+def _asset_row_to_dict(row) -> dict:
+    """把 public.assets 的一行转成给页面/图表用的 dict（键名与类型固定）。
+
+    · purchase_date 统一成 "YYYY-MM-DD" 字符串（DATE 列原样，datetime 先取 .date()）；
+    · 金额走 _money_to_float（Decimal + ROUND_HALF_UP，两位小数）；
+    · category 再归一一次：历史脏值最多显示成"其他"，不让页面 KeyError。
+    """
+    mapping = row._mapping
+    purchased = mapping["purchase_date"]
+    if isinstance(purchased, datetime):
+        purchased = purchased.date()
+    purchase_text = (
+        purchased.isoformat() if isinstance(purchased, date) else str(purchased)
+    )
+    return {
+        "id": int(mapping["id"]),
+        "name": str(mapping["name"] or ""),
+        "category": normalize_asset_category(mapping["category"]),
+        "purchase_price": _money_to_float(mapping["purchase_price"]),
+        "purchase_date": purchase_text,
+        "depreciation_rate": float(_as_decimal(mapping["depreciation_rate"])),
+    }
+
+
+def add_asset(user_id, name, category, purchase_price, purchase_date,
+              depreciation_rate=ASSET_DEFAULT_DEPRECIATION) -> int:
+    """新增一件资产，返回新 id；020 未执行抛 AssetTableMissing。
+
+    参数校验**全部在开连接之前**完成：
+      · user_id 复用 _normalize_bill_query_user_id（正整数，拒绝 bool/float）；
+      · name：strip 后 1~100 个字符（与 020 的 assets_name_len CHECK 同口径）；
+      · category：normalize_asset_category（脏值 → "其他"，绝不抛）；
+      · purchase_price / depreciation_rate / purchase_date：见各自 normalize 函数。
+    """
+    uid = _normalize_bill_query_user_id(user_id)
+    if not isinstance(name, str):
+        raise ValueError(f"资产名称必须是字符串：{name!r}")
+    cleaned_name = name.strip()
+    if not 1 <= len(cleaned_name) <= ASSET_NAME_MAX_LEN:
+        raise ValueError(
+            f"资产名称必须是 1~{ASSET_NAME_MAX_LEN} 个字符：{name!r}"
+        )
+    category_value = normalize_asset_category(category)
+    price = _normalize_asset_price(purchase_price)
+    rate = _normalize_asset_rate(depreciation_rate)
+    purchased = _normalize_asset_date(purchase_date, "购入日期")
+
+    if not assets_available():
+        raise AssetTableMissing(ASSET_TABLE_MISSING_MESSAGE)
+
+    global _ASSETS_TABLE_SUPPORT
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("""
+                    INSERT INTO public.assets
+                        (user_id, name, category, purchase_price,
+                         purchase_date, depreciation_rate)
+                    VALUES
+                        (:uid, :name, :category, :price, :purchased, :rate)
+                    RETURNING id
+                """),
+                {
+                    "uid": uid,
+                    "name": cleaned_name,
+                    "category": category_value,
+                    "price": price,
+                    "purchased": purchased,
+                    "rate": rate,
+                },
+            ).fetchone()
+            conn.commit()
+    except SQLAlchemyError as exc:
+        # 探测通过但 INSERT 撞 42P01（表刚被回滚 / 别的进程删了）→ 同样翻译成
+        # AssetTableMissing，并同步缓存，后续调用直接走降级分支。
+        if _is_undefined_table(exc):
+            _ASSETS_TABLE_SUPPORT = False
+            _warn_asset_once(
+                "写入资产时 public.assets 不存在（020 未执行或被回滚）：资产台账暂不可用"
+            )
+            raise AssetTableMissing(ASSET_TABLE_MISSING_MESSAGE) from exc
+        raise
+    if row is None:
+        raise RuntimeError("资产写入失败：数据库没有返回新 id")
+    return int(row[0])
+
+
+def _normalize_asset_id(asset_id) -> int:
+    """asset_id 必须是正整数（拒绝 bool / float / 0 / 负数），非法抛中文 ValueError。"""
+    if isinstance(asset_id, bool) or not isinstance(asset_id, (int, str)):
+        raise ValueError(f"asset_id 必须是正整数：{asset_id!r}")
+    try:
+        aid = int(asset_id.strip()) if isinstance(asset_id, str) else int(asset_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"asset_id 必须是正整数：{asset_id!r}") from exc
+    if aid <= 0:
+        raise ValueError(f"asset_id 必须是正整数：{asset_id!r}")
+    return aid
+
+
+def delete_asset(user_id, asset_id) -> bool:
+    """删除某用户名下的一件资产：rowcount > 0 才算删成功。
+
+    DELETE 语句恒带 `AND user_id = :uid` —— 不存在"只按 id 删除"的入口，
+    跨用户删除在 SQL 层面就不可能发生。020 未执行 / 删除异常 → False（不抛）。
+    """
+    uid = _normalize_bill_query_user_id(user_id)
+    aid = _normalize_asset_id(asset_id)
+
+    if not assets_available():
+        return False
+
+    global _ASSETS_TABLE_SUPPORT
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(
+                text("""
+                    DELETE FROM public.assets
+                    WHERE id = :aid AND user_id = :uid
+                """),
+                {"aid": aid, "uid": uid},
+            )
+            conn.commit()
+            return bool(result.rowcount and result.rowcount > 0)
+    except SQLAlchemyError as exc:
+        if _is_undefined_table(exc):
+            _ASSETS_TABLE_SUPPORT = False
+            _warn_asset_once(
+                "删除资产时 public.assets 不存在（020 未执行或被回滚）：资产台账暂不可用"
+            )
+        else:
+            _warn_asset_once("删除资产失败（库不可写 / 连接异常），本次按「未删除」处理")
+        return False
+
+
+def list_assets(user_id) -> list[dict]:
+    """某用户的全部资产（purchase_date DESC, id DESC）。空表 / 异常 / 020 未执行 → []。
+
+    读取侧刻意**不抛**：资产页是展示模块，库暂时不可用时显示"暂无资产"比红屏好；
+    写接口才有 AssetTableMissing 的强契约。
+    """
+    uid = _normalize_bill_query_user_id(user_id)
+    if not assets_available():
+        return []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT id, name, category, purchase_price,
+                           purchase_date, depreciation_rate
+                    FROM public.assets
+                    WHERE user_id = :uid
+                    ORDER BY purchase_date DESC, id DESC
+                """),
+                {"uid": uid},
+            ).fetchall()
+    except SQLAlchemyError:
+        _warn_asset_once("读取资产台账失败（库不可用 / 表结构异常），本次返回空列表")
+        return []
+    return [_asset_row_to_dict(row) for row in rows]
+
+
+def _empty_asset_overview(today: date) -> dict:
+    """降级 / 空数据时返回的完整结构：键名与正常返回一致，调用方无需写分支。"""
+    return {
+        "today": today.isoformat(),
+        "has_assets": False,
+        "cash_balance": 0.0,
+        "assets": [],
+        "assets_cost": 0.0,
+        "assets_residual": 0.0,
+        "liabilities": 0.0,
+        "monthly_payment": 0.0,
+        "liability_note": ASSET_LIABILITY_NOTE,
+        "net_worth": 0.0,
+        "total_assets": 0.0,
+        "asset_ratio": 0.0,
+        "debt_ratio": 0.0,
+    }
+
+
+def _cash_balance(user_id: int) -> Decimal:
+    """全历史现金结余 = 收入合计 - 支出合计（单条 SQL 聚合，Decimal）。
+
+    先 `amount::numeric(12,2)` 再 SUM：bills.amount 是 FLOAT，直接 SUM 会带
+    二进制浮点尾差（123.45000000000001）；先转 numeric 让库内聚合就是精确十进制。
+    查询失败 → 0 并告警（资产页不该因为账单表异常整体红屏）。
+    """
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("""
+                    SELECT
+                        COALESCE(SUM(
+                            CASE WHEN b.type = :income
+                                 THEN b.amount::numeric(12, 2) ELSE 0 END
+                        ), 0)
+                        - COALESCE(SUM(
+                            CASE WHEN b.type = :expense
+                                 THEN b.amount::numeric(12, 2) ELSE 0 END
+                        ), 0) AS cash_balance
+                    FROM public.bills AS b
+                    WHERE b.user_id = :uid
+                """),
+                {"uid": user_id, "income": INCOME_TYPE, "expense": EXPENSE_TYPE},
+            ).fetchone()
+    except SQLAlchemyError:
+        _warn_asset_once("计算现金结余失败（bills 不可读），本次按 0 处理")
+        return Decimal("0")
+    if row is None:
+        return Decimal("0")
+    return _as_decimal(row[0])
+
+
+def get_asset_overview(user_id, today=None) -> dict:
+    """个人资产负债表总览：现金 + 资产残值 - 待还负债 = 净资产。
+
+    返回字段（键名固定）：
+      today / has_assets / cash_balance / assets / assets_cost / assets_residual /
+      liabilities / monthly_payment / liability_note / net_worth / total_assets /
+      asset_ratio / debt_ratio
+
+    口径：
+      · cash_balance：全历史 收入合计 - 支出合计（SQL 单条聚合，Decimal）；
+      · assets：list_assets 的每行 + residual / residual_rate / monthly_loss /
+        elapsed_months / fully_depreciated / curve（37 个点，app 的折线图直接用）；
+      · liabilities / monthly_payment：**估算**，复用
+        forecast_repayments(months_ahead=6, lookback_months=6) 的
+        total_forecast / monthly_avg；该函数缺失或抛错 → 0 / 0 + 换提示，
+        **绝不因此抛错**；
+      · net_worth = cash_balance + assets_residual - liabilities；
+      · total_assets = cash_balance + assets_residual；
+      · asset_ratio = assets_residual / total_assets（无资产 / 分母 <= 0 → 0）；
+      · debt_ratio = liabilities / total_assets（同上）。
+
+    020 未执行 → _empty_asset_overview（全 0、assets=[]、has_assets False），不抛。
+    """
+    uid = _normalize_bill_query_user_id(user_id)
+    current = _normalize_forecast_today(today)
+
+    if not assets_available():
+        return _empty_asset_overview(current)
+
+    cash_balance = _money_to_float(_cash_balance(uid))
+
+    # ---- 资产明细：每件都带 37 个点的残值曲线 ----
+    assets: list[dict] = []
+    cost_total = Decimal("0")
+    residual_total = Decimal("0")
+    for row in list_assets(uid):
+        price = _as_decimal(row["purchase_price"])
+        rate = _as_decimal(row["depreciation_rate"])
+        purchased = _normalize_asset_date(row["purchase_date"], "购入日期")
+        value = compute_asset_value(price, purchased, rate, today=current)
+        curve = compute_asset_curve(
+            price, purchased, rate, months=ASSET_CURVE_MONTHS, today=current
+        )
+        cost_total += price
+        residual_total += _as_decimal(value["residual"])
+        item = dict(row)
+        item.update({
+            "residual": value["residual"],
+            "residual_rate": value["residual_rate"],
+            "monthly_loss": value["monthly_loss"],
+            "elapsed_months": value["elapsed_months"],
+            "fully_depreciated": value["fully_depreciated"],
+            "curve": curve,
+        })
+        assets.append(item)
+
+    assets_cost = _money_to_float(cost_total)
+    assets_residual = _money_to_float(residual_total)
+
+    # ---- 负债估算：forecast_repayments 不可用/抛错都只降级，不阻断资产负债表 ----
+    try:
+        forecast = forecast_repayments(
+            uid, months_ahead=6, lookback_months=6, today=current
+        )
+        liabilities = _money_to_float(forecast.get("total_forecast", 0))
+        monthly_payment = _money_to_float(forecast.get("monthly_avg", 0))
+        liability_note = ASSET_LIABILITY_NOTE
+    except Exception:
+        liabilities = 0.0
+        monthly_payment = 0.0
+        liability_note = ASSET_LIABILITY_UNAVAILABLE_NOTE
+        _warn_asset_once("负债估算失败（forecast_repayments 不可用），本次按 0 处理")
+
+    total_assets = _money_to_float(
+        Decimal(str(cash_balance)) + Decimal(str(assets_residual))
+    )
+    net_worth = _money_to_float(
+        Decimal(str(cash_balance))
+        + Decimal(str(assets_residual))
+        - Decimal(str(liabilities))
+    )
+    asset_ratio = round(assets_residual / total_assets, 4) if total_assets > 0 else 0.0
+    debt_ratio = round(liabilities / total_assets, 4) if total_assets > 0 else 0.0
+
+    return {
+        "today": current.isoformat(),
+        "has_assets": bool(assets),
+        "cash_balance": cash_balance,
+        "assets": assets,
+        "assets_cost": assets_cost,
+        "assets_residual": assets_residual,
+        "liabilities": liabilities,
+        "monthly_payment": monthly_payment,
+        "liability_note": liability_note,
+        "net_worth": net_worth,
+        "total_assets": total_assets,
+        "asset_ratio": asset_ratio,
+        "debt_ratio": debt_ratio,
+    }

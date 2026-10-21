@@ -131,6 +131,17 @@ except ImportError as _mood_chart_import_exc:
         f"{type(_mood_chart_import_exc).__name__}: {_mood_chart_import_exc}"
     )
 
+# 「我的财务大盘」两张 ECharts 图（asset_chart.py 由并行方实现，纯函数拼 option）：
+# 缺失只让图表降级成一行「图表组件暂不可用」，指标、清单、添加/删除表单照常可用。
+try:
+    import asset_chart
+except ImportError as _asset_chart_import_exc:
+    asset_chart = None
+    print(
+        f"[asset] 资产图表模块不可用："
+        f"{type(_asset_chart_import_exc).__name__}: {_asset_chart_import_exc}"
+    )
+
 
 class _ChartInsightFallbackError(Exception):
     """ai_agent.ChartInsightError 尚未合入时的占位异常（保证 except 子句可用）。"""
@@ -373,6 +384,7 @@ def logout():
     st.session_state.pop("health_comment", None)    # AI 锐评同样基于本月财务数据，换人后必须失效
     st.session_state.pop("_title_level_seen", None) # 换人后不能沿用上一人的头衔等级（否则首屏可能误撒花/漏撒花）
     st.session_state.pop("mood_insight_cache", None) # AI 教练文案基于上一个人的情绪消费数据，换人必须失效
+    st.session_state.pop("asset_advice_cache", None) # AI 资产管家文案含个人资产，换人同样必须失效
     st.session_state["page"] = 0
     st.session_state["chat_history"] = []           # 换人登录不应看到上一个人的 AI 聊天记录
     st.cache_data.clear()
@@ -794,6 +806,34 @@ def _get_peer_roast_fn():
         return None
     roast_fn = getattr(_ai_agent_mod, "generate_peer_roast", None)
     return roast_fn if callable(roast_fn) else None
+
+
+# ===== 我的财务大盘：AI 资产管家的取用与残值率格式化 =====
+# 与上面几个 AI 入口完全同构：按模块属性取，并行开发期缺失 / 测试打桩都能感知。
+def _get_asset_advice_fn():
+    """按模块属性取 ai_agent.generate_asset_advice：缺失 / 打桩都能感知。"""
+    try:
+        import ai_agent as _ai_agent_mod
+    except Exception as _ai_import_exc:  # pragma: no cover - 依赖缺失时只降级
+        print(
+            f"[asset] ai_agent 不可用："
+            f"{type(_ai_import_exc).__name__}: {_ai_import_exc}"
+        )
+        return None
+    advice_fn = getattr(_ai_agent_mod, "generate_asset_advice", None)
+    return advice_fn if callable(advice_fn) else None
+
+
+def _asset_rate_text(value):
+    """残值率 → 百分比文案。
+
+    db 口径与 asset_chart 的 depreciation_rate 一致，是 0~1 的小数比例，
+    这里乘 100 展示；脏值 / 越界值不猜，原样格式化，绝不抛异常。
+    """
+    rate = _peer_number(value)
+    if 0.0 <= rate <= 1.0:
+        rate *= 100.0
+    return f"{rate:.1f}%"
 
 
 def _peer_number(value, default=0.0):
@@ -2681,6 +2721,340 @@ with tab_dash:
             except Exception as _rose_exc:
                 print(f"[chart] 玫瑰图渲染失败：{type(_rose_exc).__name__}: {_rose_exc}")
                 st.warning("玫瑰图暂时无法渲染，请刷新页面重试")
+
+    # ===== 💼 我的财务大盘：现金 + 资产残值 − 待还负债 =====
+    # db.get_asset_overview / add_asset / delete_asset 由并行方提供：
+    # 一律 getattr 取模块属性（缺失 / 抛错 / 返回非 dict 都只降级成一行 caption），
+    # 取不到数时整块内容用 if 包住，绝不 st.stop()、绝不让 Tab1 红屏。
+    with st.container(border=True, key="card_asset_dashboard"):
+        st.subheader("💼 我的财务大盘")
+        st.caption(
+            "现金 + 资产残值 − 待还负债 = 你现在真正拥有的钱（资产按直线法折旧）"
+        )
+
+        # 1) 取数：函数不可调用 / 返回非 dict / 抛错 → 只给一行提示，
+        #    下面的指标、图表、清单、表单全部不渲染（不是 st.stop，页面其它区块照常）。
+        _asset_overview_fn = getattr(db, "get_asset_overview", None)
+        _asset_overview = None
+        if callable(_asset_overview_fn):
+            try:
+                _asset_overview = _asset_overview_fn(st.session_state.user_id)
+            except Exception as _asset_overview_exc:
+                print(
+                    f"[asset] get_asset_overview 调用失败："
+                    f"{type(_asset_overview_exc).__name__}: {_asset_overview_exc}"
+                )
+                _asset_overview = None
+
+        if not isinstance(_asset_overview, dict):
+            st.caption("资产大盘暂不可用，先记几笔账或稍后再来")
+        else:
+            # 脏值统一收敛成有限 float（复用 _peer_number，口径与雷达 / 拿铁因子一致）
+            _asset_net = _peer_number(_asset_overview.get("net_worth"))
+            _asset_cash = _peer_number(_asset_overview.get("cash_balance"))
+            _asset_residual = _peer_number(_asset_overview.get("assets_residual"))
+            _asset_liab = _peer_number(_asset_overview.get("liabilities"))
+
+            st.metric(
+                "当前净资产",
+                f"¥{_asset_net:,.2f}",
+                delta=(
+                    f"现金 ¥{_asset_cash:,.0f} · 资产 ¥{_asset_residual:,.0f}"
+                    f" · 负债 ¥{_asset_liab:,.0f}"
+                ),
+            )
+            _asset_col_cash, _asset_col_residual, _asset_col_liab = st.columns(3)
+            with _asset_col_cash:
+                st.metric("现金结余", f"¥{_asset_cash:,.2f}")
+            with _asset_col_residual:
+                st.metric("资产残值", f"¥{_asset_residual:,.2f}")
+            with _asset_col_liab:
+                st.metric("待还负债", f"¥{_asset_liab:,.2f}", delta="估算")
+
+            # 2) 资产负债对比柱状图：option 纯函数在 asset_chart.py，缺失 / 抛错只降级提示
+            _asset_balance_option = None
+            _asset_balance_builder = (
+                getattr(asset_chart, "build_balance_option", None)
+                if asset_chart is not None
+                else None
+            )
+            if callable(_asset_balance_builder):
+                try:
+                    _asset_balance_option = _asset_balance_builder(
+                        _asset_overview,
+                        today_label=str(_asset_overview.get("today") or ""),
+                    )
+                except Exception as _asset_balance_exc:
+                    print(
+                        f"[asset] 资产负债图构造失败："
+                        f"{type(_asset_balance_exc).__name__}: {_asset_balance_exc}"
+                    )
+                    _asset_balance_option = None
+            if isinstance(_asset_balance_option, dict):
+                st_echarts(
+                    _asset_balance_option, height="300px", key="asset_balance"
+                )
+            else:
+                st.caption("图表组件暂不可用")
+
+            # 3) 资产清单：只保留 dict 项；缺字段按 0 / 未命名 / 其他兜底
+            _asset_records = [
+                _asset_item
+                for _asset_item in (_asset_overview.get("assets") or [])
+                if isinstance(_asset_item, dict)
+            ]
+            _asset_names = [
+                (str(_asset_item.get("name") or "").strip() or "未命名资产")
+                for _asset_item in _asset_records
+            ]
+            if _asset_records:
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "名称": _asset_name,
+                                "分类": str(_asset_item.get("category") or "其他"),
+                                "购入价": (
+                                    f"¥{_peer_number(_asset_item.get('purchase_price')):,.2f}"
+                                ),
+                                "当前残值": (
+                                    f"¥{_peer_number(_asset_item.get('residual')):,.2f}"
+                                ),
+                                "残值率": _asset_rate_text(
+                                    _asset_item.get("residual_rate")
+                                ),
+                                "每月蒸发": (
+                                    f"¥{_peer_number(_asset_item.get('monthly_loss')):,.2f}"
+                                ),
+                            }
+                            for _asset_name, _asset_item in zip(
+                                _asset_names, _asset_records
+                            )
+                        ]
+                    ),
+                    hide_index=True,
+                    width="stretch",
+                )
+            else:
+                st.caption("还没有资产，展开下面「➕ 添加资产」记一台")
+
+            # 4) 单件资产折旧曲线：选中项直接喂给 asset_chart 的纯函数
+            if _asset_records:
+                _asset_curve_label = st.selectbox(
+                    "想看哪件资产的折旧曲线？",
+                    _asset_names,
+                    key="asset_curve_select",
+                )
+                try:
+                    _asset_curve_index = _asset_names.index(_asset_curve_label)
+                except ValueError:
+                    _asset_curve_index = 0
+                _asset_curve_option = None
+                _asset_curve_builder = (
+                    getattr(asset_chart, "build_depreciation_option", None)
+                    if asset_chart is not None
+                    else None
+                )
+                if callable(_asset_curve_builder):
+                    try:
+                        _asset_curve_option = _asset_curve_builder(
+                            _asset_records[_asset_curve_index]
+                        )
+                    except Exception as _asset_curve_exc:
+                        print(
+                            f"[asset] 折旧曲线构造失败："
+                            f"{type(_asset_curve_exc).__name__}: {_asset_curve_exc}"
+                        )
+                        _asset_curve_option = None
+                if isinstance(_asset_curve_option, dict):
+                    st_echarts(
+                        _asset_curve_option, height="320px", key="asset_curve"
+                    )
+                else:
+                    st.caption("图表组件暂不可用")
+
+            # 5) 添加 / 删除：写库后统一 flash + 清缓存 + rerun，与项目其它写操作一致
+            with st.expander("➕ 添加资产 / 管理", expanded=False):
+                _asset_categories = (
+                    tuple(getattr(db, "ASSET_CATEGORIES", ()) or ())
+                    or ("数码", "生活", "其他")
+                )
+                with st.form("asset_add_form"):
+                    _asset_name_input = st.text_input(
+                        "资产名称", max_chars=100, placeholder="例如：iPad Air 5"
+                    )
+                    _asset_cat_input = st.selectbox("分类", list(_asset_categories))
+                    _asset_price_input = st.number_input(
+                        "购入价（元）",
+                        min_value=0.0,
+                        step=100.0,
+                        format="%.2f",
+                    )
+                    _asset_date_input = st.date_input("购入日期", value=date.today())
+                    _asset_rate_input = st.number_input(
+                        "年折旧率（%）",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=20.0,
+                        step=1.0,
+                        help="数码一般 20%~30%，生活用品 10%",
+                    )
+                    _asset_add_submitted = st.form_submit_button("保存这台资产")
+
+                if _asset_add_submitted:
+                    _asset_add_fn = getattr(db, "add_asset", None)
+                    _asset_date_value = _asset_date_input or date.today()
+                    _asset_clean_name = str(_asset_name_input or "").strip()
+                    if not callable(_asset_add_fn):
+                        st.caption("添加资产暂不可用，先记几笔账或稍后再来")
+                    elif not _asset_clean_name:
+                        st.warning("请填写资产名称")
+                    elif float(_asset_price_input) <= 0:
+                        st.warning("购入价必须大于 0")
+                    elif _asset_date_value > date.today():
+                        st.warning("购入日期不能晚于今天")
+                    else:
+                        try:
+                            _asset_add_fn(
+                                st.session_state.user_id,
+                                _asset_clean_name,
+                                _asset_cat_input,
+                                float(_asset_price_input),
+                                _asset_date_value.strftime("%Y-%m-%d"),
+                                float(_asset_rate_input) / 100.0,
+                            )
+                            st.session_state["flash"] = {
+                                "level": "success",
+                                "msg": (
+                                    f"已添加资产：{_asset_clean_name} "
+                                    f"¥{float(_asset_price_input):,.2f}"
+                                ),
+                            }
+                            st.cache_data.clear()
+                            st.rerun()
+                        except Exception as _asset_add_exc:
+                            print(
+                                f"[asset] 添加资产失败："
+                                f"{type(_asset_add_exc).__name__}: {_asset_add_exc}"
+                            )
+                            st.error(f"添加失败：{_asset_add_exc}")
+
+                # 删除：必须先勾选确认，避免误点把资产直接删掉
+                _asset_delete_fn = getattr(db, "delete_asset", None)
+                if callable(_asset_delete_fn) and _asset_names:
+                    _asset_delete_label = st.selectbox(
+                        "要删除哪件资产？", _asset_names, key="asset_delete_select"
+                    )
+                    try:
+                        _asset_delete_index = _asset_names.index(_asset_delete_label)
+                    except ValueError:
+                        _asset_delete_index = 0
+                    _asset_delete_confirm = st.checkbox(
+                        "我确认要删除", key="asset_delete_confirm"
+                    )
+                    if st.button("删除选中资产", key="asset_delete_btn"):
+                        if not _asset_delete_confirm:
+                            st.warning("先勾选「我确认要删除」")
+                        else:
+                            _asset_delete_target = _asset_records[_asset_delete_index]
+                            _asset_delete_id = _asset_delete_target.get("asset_id")
+                            if _asset_delete_id is None:
+                                _asset_delete_id = _asset_delete_target.get("id")
+                            if _asset_delete_id is None:
+                                st.caption("无法定位要删除的资产，请刷新后重试")
+                            else:
+                                try:
+                                    _asset_delete_fn(
+                                        st.session_state.user_id, _asset_delete_id
+                                    )
+                                    st.session_state["flash"] = {
+                                        "level": "success",
+                                        "msg": f"已删除资产：{_asset_delete_label}",
+                                    }
+                                    st.cache_data.clear()
+                                    st.rerun()
+                                except Exception as _asset_delete_exc:
+                                    print(
+                                        f"[asset] 删除资产失败："
+                                        f"{type(_asset_delete_exc).__name__}: {_asset_delete_exc}"
+                                    )
+                                    st.error(f"删除失败：{_asset_delete_exc}")
+
+            # 6) AI 资产管家：额度口径与页面其它 AI 区块一致（每日 20 次）；
+            #    同一份 overview 命中 session 缓存 → 不重复调用、不重复扣额度。
+            try:
+                _asset_advice_key = hashlib.sha256(
+                    json.dumps(
+                        _asset_overview,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                        default=str,
+                    ).encode("utf-8", "ignore")
+                ).hexdigest()
+            except Exception as _asset_key_exc:
+                print(
+                    f"[asset] 资产数据归一化失败："
+                    f"{type(_asset_key_exc).__name__}: {_asset_key_exc}"
+                )
+                _asset_advice_key = ""
+
+            if st.button("🧠 让学长看看我的资产", key="asset_advisor_btn"):
+                _asset_saved = st.session_state.get("asset_advice_cache")
+                _asset_cached_text = ""
+                if (
+                    isinstance(_asset_saved, dict)
+                    and _asset_saved.get("key") == _asset_advice_key
+                    and str(_asset_saved.get("text") or "").strip()
+                ):
+                    _asset_cached_text = str(_asset_saved["text"]).strip()
+
+                if _asset_cached_text:
+                    pass  # 同一份资产已生成过：直接展示下方缓存，不再调用 API
+                elif st.session_state.get("ai_daily_count", 0) >= 20:
+                    st.caption("今日免费额度已用完，明天再让学长看吧")
+                else:
+                    _asset_advice_fn = _get_asset_advice_fn()
+                    if not callable(_asset_advice_fn):
+                        st.caption("学长暂时没空：AI 资产管家模块还没准备好")
+                    else:
+                        try:
+                            with st.spinner("学长正在翻你的资产清单…"):
+                                _asset_advice_text = _asset_advice_fn(_asset_overview)
+                        except Exception as _asset_advice_exc:
+                            # 失败只提示、不扣额度、不写缓存：下次点击可重试
+                            print(
+                                f"[asset] AI 资产管家调用失败："
+                                f"{type(_asset_advice_exc).__name__}: {_asset_advice_exc}"
+                            )
+                            st.caption(f"学长暂时没空：{_asset_advice_exc}")
+                        else:
+                            _asset_advice_text = (
+                                str(_asset_advice_text).strip()
+                                if isinstance(_asset_advice_text, str)
+                                else ""
+                            )
+                            if _asset_advice_text:
+                                st.session_state["asset_advice_cache"] = {
+                                    "key": _asset_advice_key,
+                                    "text": _asset_advice_text,
+                                }
+                                st.session_state.ai_daily_count = (
+                                    st.session_state.get("ai_daily_count", 0) + 1
+                                )
+                                st.session_state.ai_last_count_date = date.today()
+                            else:
+                                st.caption("学长暂时没空：这次没有给出内容")
+
+            # 缓存渲染独立于按钮：rerun 后只要资产数据没变（key 相同）就继续展示
+            _asset_advice_saved = st.session_state.get("asset_advice_cache")
+            if (
+                isinstance(_asset_advice_saved, dict)
+                and _asset_advice_saved.get("key") == _asset_advice_key
+                and str(_asset_advice_saved.get("text") or "").strip()
+            ):
+                st.info(
+                    f"🎓 学长说：{str(_asset_advice_saved['text']).strip()}"
+                )
 
     # ===== 同龄人财务基准雷达（匿名对比）=====
     # 数据全部来自并行方：我的指标 db.compute_radar_metrics / 得分 db.score_radar /

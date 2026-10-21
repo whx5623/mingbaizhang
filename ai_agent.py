@@ -5002,3 +5002,278 @@ def generate_mood_insight(stats: dict, api_key: str = "") -> str:
         content = content[:MOOD_INSIGHT_MAX_CHARS] + "…"
     logger.info("情绪消费洞察生成成功（模型=%s，字数=%d）", MOOD_INSIGHT_MODEL, len(content))
     return content
+
+
+# ===========================================================================
+# AI 资产管家（DeepSeek Chat：把「资产负债体检」写成一句评价 + 1~2 条处置建议）
+# ---------------------------------------------------------------------------
+# 与「情绪消费教练」同构：先校验（没 key、没数据都不发请求）→ 组 payload
+# → 发请求 → 异常分层 → strip + 截断 → 脱敏日志。
+# 差异只在入参与返回：入参是 db.get_asset_overview 的资产负债表 stats，
+# 返回一段纯字符串（先评价、再点名资产该卖/该留），可直接贴到页面上。
+#   · 系统提示词逐字固定（产品口径，改一个字文案风格就跑偏）；
+#   · stats 缺失键一律按 0 / 空处理（字段可能随 db 版本增减）；
+#   · 日志只记模型名、字数、状态码与异常类型，**绝不**记 api_key 或金额明细。
+# ===========================================================================
+
+# 系统提示词逐字固定（产品口径）。
+ASSET_ADVISOR_SYSTEM_PROMPT = (
+    "你是一个懂数码和理财的学长。请评价我的资产负债情况。"
+    "如果我的资产一直在贬值，或者负债过高，请给出处置建议"
+    "（比如：‘你的 iPad 已经闲置很久且在疯狂贬值，建议立刻去闲鱼回血’）。"
+)
+
+ASSET_ADVISOR_MODEL = "deepseek-chat"
+ASSET_ADVISOR_TEMPERATURE = 0.7   # 0.7：要像学长给建议，敢点名但不飘成段子
+ASSET_ADVISOR_MAX_TOKENS = 300    # 120 字 + 余量
+ASSET_ADVISOR_TIMEOUT = 20
+ASSET_ADVISOR_MAX_CHARS = 180     # 返回文本硬上限：超过截断到 180 字并补「…」
+
+
+class AssetAdviceError(Exception):
+    """AI 资产管家建议生成失败。
+
+    code 取值：
+      no_api_key   未配置 DeepSeek API Key（**未发请求**）
+      empty_stats  stats 不是 dict / assets 无有效条目且负债 <= 0（**未发请求**）
+      network      网络异常（超时 / 连接失败 / 其它请求层异常）
+      http         接口返回非 200（message 只带状态码，不带响应体）
+      parse        响应不是合法 JSON / choices/content 缺失或为空
+
+    message 为面向用户的中文提示，可直接展示。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"AssetAdviceError(code={self.code!r}, message={self.message!r})"
+
+
+def _asset_advice_amount(value) -> float:
+    """stats 里的金额宽松转 float：None / bool / 非数字 / nan / inf → 0.0。"""
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(number):
+        return 0.0
+    return number
+
+
+def _asset_advice_int(value, default: int = 0) -> int:
+    """已用月数转 int：非法 / 负数 → default（只用于文案，不值得为此报错）。"""
+    if isinstance(value, bool):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(number) or number < 0:
+        return default
+    return int(number)
+
+
+def _asset_advice_text(value) -> str:
+    """名称 / 分类宽松转 str：None / bool → ""，其余 str() 后 strip。"""
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    try:
+        return str(value).strip()
+    except (TypeError, ValueError):
+        return ""
+
+
+def _asset_advice_percent_text(value) -> str:
+    """比例展示口径：0.64 → "64.0%"（入参是 0~1 的比例）。"""
+    ratio = _asset_advice_amount(value)
+    if ratio <= 0:
+        return "0.0%"
+    return f"{ratio * 100:.1f}%"
+
+
+def _asset_advice_entries(stats: dict) -> list[dict]:
+    """把 stats["assets"] 收敛成有效条目；不是 list 或没有名称的项直接跳过。"""
+    assets = stats.get("assets")
+    if not isinstance(assets, (list, tuple)):
+        return []
+    entries = []
+    for item in assets:
+        if not isinstance(item, dict):
+            continue
+        if not _asset_advice_text(item.get("name")):
+            continue
+        entries.append(item)
+    return entries
+
+
+def _build_asset_advice_user_content(stats: dict, entries: list[dict]) -> str:
+    """把资产负债统计排成中文条目（金额两位小数、比例 / 残值率转百分比）。"""
+    cash = _asset_advice_amount(stats.get("cash_balance"))
+    cost = _asset_advice_amount(stats.get("assets_cost"))
+    residual = _asset_advice_amount(stats.get("assets_residual"))
+    liabilities = _asset_advice_amount(stats.get("liabilities"))
+    monthly_payment = _asset_advice_amount(stats.get("monthly_payment"))
+    net_worth = _asset_advice_amount(stats.get("net_worth"))
+
+    lines = [
+        "这是我的资产负债情况，请按系统要求评价并给出处置建议：",
+        f"现金结余：{cash:.2f} 元",
+        f"资产原值合计：{cost:.2f} 元",
+        f"资产残值合计：{residual:.2f} 元",
+        f"待还负债：{liabilities:.2f} 元（估算）",
+        f"月供：{monthly_payment:.2f} 元",
+        f"净资产：{net_worth:.2f} 元",
+        f"资产占比：{_asset_advice_percent_text(stats.get('asset_ratio'))}，"
+        f"负债率：{_asset_advice_percent_text(stats.get('debt_ratio'))}",
+        "资产明细：",
+    ]
+    for index, item in enumerate(entries, start=1):
+        name = _asset_advice_text(item.get("name"))
+        category = _asset_advice_text(item.get("category")) or "未分类"
+        price = _asset_advice_amount(item.get("purchase_price"))
+        residual_value = _asset_advice_amount(item.get("residual"))
+        months = _asset_advice_int(item.get("elapsed_months"))
+        loss = _asset_advice_amount(item.get("monthly_loss"))
+        line = (
+            f"  {index}. {name}（{category}）：购入价 {price:.2f} 元，"
+            f"当前残值 {residual_value:.2f} 元，"
+            f"残值率 {_asset_advice_percent_text(item.get('residual_rate'))}，"
+            f"已用 {months} 个月，每月蒸发 {loss:.2f} 元"
+        )
+        if item.get("fully_depreciated"):
+            line += "，已折旧完"
+        lines.append(line)
+    if not entries:
+        lines.append("  无（当前只有负债，没有资产记录）")
+
+    lines.append(
+        "请先用一句话评价，再给 1-2 条具体处置建议（点名哪件资产该卖/该留、"
+        "负债怎么降），总字数 120 字以内。"
+    )
+    return "\n".join(lines)
+
+
+def generate_asset_advice(stats: dict, api_key: str = "") -> str:
+    """根据资产负债表统计生成一句评价 + 1~2 条处置建议，返回 strip 后文本。
+
+    stats 约定（来自 db.get_asset_overview，缺失键按 0 / 空处理，绝不 KeyError）：
+        {"today": "2026-10-21", "has_assets": True,
+         "cash_balance": 1200.0, "assets_cost": 9998.0, "assets_residual": 6500.0,
+         "liabilities": 1200.0, "monthly_payment": 200.0,
+         "net_worth": 6500.0, "asset_ratio": 0.84, "debt_ratio": 0.16,
+         "assets": [{"name": "iPad Air 5", "category": "数码",
+                     "purchase_price": 4999.0, "residual": 3200.0,
+                     "residual_rate": 0.64, "monthly_loss": 83.32,
+                     "elapsed_months": 12.0, "fully_depreciated": False}, ...]}
+
+    失败一律抛 AssetAdviceError（中文 message，可直接上页面）：
+      · api_key 为空                                → no_api_key（且**不发请求**）；
+      · stats 不是 dict / 无有效资产且负债 <= 0       → empty_stats（且**不发请求**）；
+      · 超时 / 连接失败 / 其它请求层异常              → network；
+      · 非 200                                      → http（只带状态码，不拼响应体）；
+      · 响应不是 JSON / content 缺失或为空            → parse。
+    返回文本超过 180 字时截断到 180 字并补「…」。
+    日志只记模型名、字数、状态码与异常类型，**绝不**记 api_key 或金额明细。
+    """
+    # ① api_key：先查它，没有 key 时不该先花一次网络往返。
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise AssetAdviceError(
+            "no_api_key",
+            "未配置 DEEPSEEK_API_KEY，AI 资产管家暂不可用",
+        )
+    api_key = api_key.strip()
+
+    # ② 数据前置校验：既没有资产也没有负债时，让模型硬编只会产出空话。
+    if not isinstance(stats, dict):
+        raise AssetAdviceError(
+            "empty_stats",
+            "资产负债数据不完整，暂时无法生成建议，请刷新后重试",
+        )
+    entries = _asset_advice_entries(stats)
+    liabilities = _asset_advice_amount(stats.get("liabilities"))
+    if not entries and liabilities <= 0:
+        raise AssetAdviceError(
+            "empty_stats",
+            "还没有资产或负债记录，先添加资产或负债再来看看吧",
+        )
+
+    user_content = _build_asset_advice_user_content(stats, entries)
+    payload = {
+        "model": ASSET_ADVISOR_MODEL,
+        "messages": [
+            {"role": "system", "content": ASSET_ADVISOR_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": ASSET_ADVISOR_TEMPERATURE,
+        "max_tokens": ASSET_ADVISOR_MAX_TOKENS,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ③ 发请求：超时/连接失败翻译成用户能看懂的句子（不把异常对象漏到页面）。
+    try:
+        resp = requests.post(
+            DEEPSEEK_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=ASSET_ADVISOR_TIMEOUT,
+        )
+    except requests.Timeout:
+        logger.warning("AI 资产管家请求超时（模型=%s）", ASSET_ADVISOR_MODEL)
+        raise AssetAdviceError("network", "生成资产建议超时，请稍后再试") from None
+    except requests.ConnectionError:
+        logger.warning("AI 资产管家请求连接失败（模型=%s）", ASSET_ADVISOR_MODEL)
+        raise AssetAdviceError("network", "网络连接失败，请检查网络") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：日志只记异常类型（确保不把 headers / key 带出去）。
+        logger.warning(
+            "AI 资产管家请求失败（模型=%s，异常=%s）",
+            ASSET_ADVISOR_MODEL,
+            type(exc).__name__,
+        )
+        raise AssetAdviceError("network", "网络连接失败，请检查网络") from None
+
+    # ④ 非 200：只带状态码，不把响应体拼进 message（响应体可能含请求回显）。
+    if resp.status_code != 200:
+        logger.warning(
+            "AI 资产管家接口返回 HTTP %s（模型=%s）",
+            resp.status_code,
+            ASSET_ADVISOR_MODEL,
+        )
+        raise AssetAdviceError(
+            "http",
+            f"AI 服务返回异常（HTTP {resp.status_code}），请稍后重试",
+        )
+
+    # ⑤ 解析：非 JSON / 结构不符 / content 为空 → 同一条"没有有效建议"。
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("AI 资产管家响应不是合法 JSON（模型=%s）", ASSET_ADVISOR_MODEL)
+        raise AssetAdviceError("parse", "AI 没有返回有效建议，请重试") from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("AI 资产管家响应结构不符合预期（模型=%s）", ASSET_ADVISOR_MODEL)
+        raise AssetAdviceError("parse", "AI 没有返回有效建议，请重试") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("AI 资产管家响应 content 为空（模型=%s）", ASSET_ADVISOR_MODEL)
+        raise AssetAdviceError("parse", "AI 没有返回有效建议，请重试")
+
+    content = content.strip()
+    if len(content) > ASSET_ADVISOR_MAX_CHARS:
+        content = content[:ASSET_ADVISOR_MAX_CHARS] + "…"
+    logger.info("AI 资产管家生成成功（模型=%s，字数=%d）", ASSET_ADVISOR_MODEL, len(content))
+    return content
