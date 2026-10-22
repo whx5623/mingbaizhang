@@ -129,7 +129,13 @@ h3 {
     border: 1px solid var(--mbz-border);
     border-radius: 12px;
     box-shadow: var(--mbz-shadow-card);
-    padding: 12px 16px;
+    padding: 16px 18px;
+    /* 统一四张核心指标卡的高度与内部对齐：数值纵向居中，避免长短标签把卡片撑得参差 */
+    min-height: 108px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 2px;
     transition: box-shadow .18s ease, transform .18s ease;
 }
 
@@ -145,6 +151,9 @@ h3 {
     font-size: .85rem;
     font-weight: 500;
     letter-spacing: .01em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 /* 数值：加大 + 700 字重（1.65 的 stMetricValue 内层还有一层 markdown，字号需落在容器上） */
@@ -490,6 +499,73 @@ hr {
 [data-testid="stCaptionContainer"] p {
     color: var(--mbz-text-muted);
     font-size: .82rem;
+}
+
+/* ---------- 15. 移动端适配：窄屏不挤压、不横向溢出 ---------- */
+@media (max-width: 640px) {
+    /* 页面留白收窄，把宽度让给图表与指标 */
+    .block-container,
+    [data-testid="stMainBlockContainer"] {
+        padding-left: .9rem !important;
+        padding-right: .9rem !important;
+    }
+
+    /* 指标卡：四张卡在手机上两列一行，高度收紧但保持等高 */
+    [data-testid="stMetric"] {
+        min-height: 92px;
+        padding: 12px 14px;
+    }
+
+    [data-testid="stMetricValue"] {
+        font-size: 1.25rem;
+    }
+
+    [data-testid="stMetricLabel"] p {
+        font-size: .78rem;
+    }
+
+    /* 列在窄屏改为两列自适应，避免四列被压成一条细线 */
+    [data-testid="stHorizontalBlock"] {
+        flex-wrap: wrap;
+    }
+
+    [data-testid="column"] {
+        flex: 1 1 calc(50% - .5rem) !important;
+        min-width: calc(50% - .5rem) !important;
+        width: auto !important;
+    }
+
+    /* Tab 头横向可滚，不换行撑破页面 */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: .25rem;
+        overflow-x: auto;
+        scrollbar-width: none;
+    }
+
+    .stTabs [data-baseweb="tab"] {
+        padding: .35rem .55rem;
+        font-size: .82rem;
+        white-space: nowrap;
+    }
+
+    /* 图表、iframe、图片一律不超过容器宽度 */
+    iframe,
+    .stEcharts,
+    [data-testid="stVegaLiteChart"],
+    [data-testid="stArrowVegaLiteChart"] {
+        max-width: 100% !important;
+        width: 100% !important;
+    }
+
+    [data-testid="stImage"] img {
+        max-width: 100%;
+        height: auto;
+    }
+
+    [data-testid="stExpander"],
+    [data-testid="stExpander"] details {
+        max-width: 100%;
+    }
 }
 """
 
