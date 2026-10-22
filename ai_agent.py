@@ -5526,3 +5526,383 @@ def generate_xianyu_copy(asset: dict, api_key: str = "") -> str:
         content = content[:XIANYU_COPY_MAX_CHARS] + "…"
     logger.info("AI 闲鱼文案生成成功（模型=%s，字数=%d）", XIANYU_COPY_MODEL, len(content))
     return content
+
+
+# ===========================================================================
+# AI 宏观数据分析师（DeepSeek Chat：把「我的数据 vs 全站均值」写成一段震撼点评）
+# ---------------------------------------------------------------------------
+# 与「同龄人点评 / AI 资产管家」同构：先校验（没 key、没数据都不发请求）
+# → 组 payload → 发请求 → 异常分层 → strip + 截断 → 脱敏日志。
+# 差异只在入参与返回：入参是 db.get_macro_stats 的整包返回（global / me / delta），
+# 返回一段纯字符串（震撼点评），可直接贴到页面上。
+#   · 系统提示词逐字固定（产品口径，改一个字文案风格就跑偏）；
+#   · 数值宽松转 float（缺失 / 脏数据按 0 处理，绝不 KeyError）；
+#   · delta 有就用 app.py 算好的差值，没有就现场相减 / 相除兜底；
+#   · 日志只记 code / 异常类型 / 字数，**绝不**记 api_key、金额、商户名或 user_id。
+# ===========================================================================
+
+# 系统提示词逐字固定（产品口径）。
+MACRO_ANALYST_SYSTEM_PROMPT = (
+    "你是一个宏观数据分析师。根据我的数据与全站均值的对比，给我一段震撼的点评。"
+    "比如：'你的恩格尔系数仅为 20%，远低于全站平均的 45%，说明你很少吃食堂；"
+    "而你的奶茶消费是平均值的 3 倍，恭喜你，你就是全校最受奶茶店欢迎的人！'"
+)
+
+MACRO_INSIGHT_MODEL = "deepseek-chat"
+MACRO_INSIGHT_TEMPERATURE = 0.85  # 0.85：点评要"震撼"、要有梗，但不能飘成段子
+MACRO_INSIGHT_MAX_TOKENS = 500    # 一段 200 字点评 + 余量
+MACRO_INSIGHT_TIMEOUT = 20
+MACRO_INSIGHT_MAX_CHARS = 500     # 返回文本硬上限：超过截断到 500 字并补「…」
+MACRO_INSIGHT_MIN_CHARS = 20      # 返回文本硬下限：短于 20 字的"点评"视为无效
+
+
+class MacroInsightError(Exception):
+    """AI 宏观洞察生成失败。
+
+    code 取值：
+      no_api_key   未配置 DeepSeek API Key（**未发请求**）
+      empty_stats  stats 不是 dict / 为空 / has_data 为假 /
+                   me 或 global 不是 dict（**未发请求**）
+      network      网络异常（超时 / 连接失败 / 其它请求层异常）
+      http         接口返回非 200（message 只带状态码，不带响应体）
+      parse        响应不是合法 JSON / choices/content 缺失或为空 / 正文过短
+
+    message 为面向用户的中文提示，可直接展示。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"MacroInsightError(code={self.code!r}, message={self.message!r})"
+
+
+def _macro_insight_amount(value) -> float:
+    """stats 里的金额 / 比率宽松转 float：None / bool / 非数字 / nan / inf → 0.0。"""
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(number):
+        return 0.0
+    return number
+
+
+def _macro_insight_count(value) -> int:
+    """样本人数 / 笔数转 int：None / bool / 非数字 / nan / inf / 负数 → 0。"""
+    if isinstance(value, bool):
+        return 0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(number) or number <= 0:
+        return 0
+    return int(number)
+
+
+def _macro_insight_text(value) -> str:
+    """月份 / 商户名宽松转 str：None / bool → ""，其余 str() 后 strip。"""
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    try:
+        return str(value).strip()
+    except (TypeError, ValueError):
+        return ""
+
+
+def _macro_insight_mapping(value) -> dict[str, float]:
+    """把 category_shares 收敛成 {分类名: 比例}；不是 dict → {}（绝不 KeyError）。"""
+    result: dict[str, float] = {}
+    if not isinstance(value, dict):
+        return result
+    for key, item in value.items():
+        name = _macro_insight_text(key)
+        if not name:
+            continue
+        result[name] = _macro_insight_amount(item)
+    return result
+
+
+def _macro_insight_percent_text(value) -> str:
+    """比例展示口径：0.44 → "44.0%"（入参是 0~1 的比例）。"""
+    return f"{_macro_insight_amount(value) * 100:.1f}%"
+
+
+def _macro_insight_signed_amount(value) -> str:
+    """金额差值：带正负号、两位小数（1444.64 → "+1444.64"）。"""
+    return f"{_macro_insight_amount(value):+.2f}"
+
+
+def _macro_insight_signed_points(value) -> str:
+    """比率差值：比例 → 百分点，带正负号、一位小数（-0.06 → "-6.0"）。"""
+    return f"{_macro_insight_amount(value) * 100:+.1f}"
+
+
+def _macro_insight_ratio_text(value) -> str:
+    """倍数展示口径：1.85 → "1.85 倍"。"""
+    return f"{_macro_insight_amount(value):.2f} 倍"
+
+
+def _build_macro_insight_user_content(stats: dict) -> str:
+    """把 global / me / delta 排成纯文本分点（金额两位小数、比率转百分比一位小数）。
+
+    只放对比结论需要的数字：月份、样本人数、支出/收入/恩格尔/结余率/笔数、
+    分类占比、全站 Top3 热门商户。**绝不**把 me.user_id 之类的主键写进 prompt。
+    """
+    month_label = (
+        _macro_insight_text(stats.get("month_label"))
+        or _macro_insight_text(stats.get("month"))
+        or "本月"
+    )
+    user_count = _macro_insight_count(stats.get("user_count"))
+    low_sample = _coerce_bool(stats.get("low_sample"), default=False)
+
+    global_stats = stats.get("global") if isinstance(stats.get("global"), dict) else {}
+    me = stats.get("me") if isinstance(stats.get("me"), dict) else {}
+    delta = stats.get("delta") if isinstance(stats.get("delta"), dict) else {}
+
+    # ---- 支出：差值优先用 app.py 算好的 delta，缺了才现场相减 / 相除兜底 ----
+    my_expense = _macro_insight_amount(me.get("expense"))
+    peer_expense = _macro_insight_amount(global_stats.get("avg_expense"))
+    expense_delta = (
+        _macro_insight_amount(delta.get("expense"))
+        if "expense" in delta
+        else my_expense - peer_expense
+    )
+    expense_ratio = (
+        _macro_insight_amount(delta.get("expense_ratio"))
+        if "expense_ratio" in delta
+        else (my_expense / peer_expense if peer_expense > 0 else 0.0)
+    )
+    my_income = _macro_insight_amount(me.get("income"))
+    peer_income = _macro_insight_amount(global_stats.get("avg_income"))
+    income_delta = (
+        _macro_insight_amount(delta.get("income"))
+        if "income" in delta
+        else my_income - peer_income
+    )
+    my_engel = _macro_insight_amount(me.get("engel"))
+    peer_engel = _macro_insight_amount(global_stats.get("avg_engel"))
+    engel_delta = (
+        _macro_insight_amount(delta.get("engel"))
+        if "engel" in delta
+        else my_engel - peer_engel
+    )
+    my_saving = _macro_insight_amount(me.get("saving_rate"))
+    peer_saving = _macro_insight_amount(global_stats.get("avg_saving_rate"))
+    saving_delta = (
+        _macro_insight_amount(delta.get("saving_rate"))
+        if "saving_rate" in delta
+        else my_saving - peer_saving
+    )
+    my_bills = _macro_insight_count(me.get("bill_count"))
+    peer_bills = _macro_insight_count(global_stats.get("avg_bill_count"))
+
+    lines = [
+        "这是我的本月账本与全站均值的对比，请按系统要求写一段震撼的点评：",
+        f"月份：{month_label}（全站样本 {user_count} 位同学）",
+    ]
+    if low_sample:
+        lines.append(
+            f"样本提示：全站仅有 {user_count} 位同学的数据，样本偏少，结论仅供参考"
+        )
+    lines.append(
+        f"我的支出：{my_expense:.2f} 元；全站均值：{peer_expense:.2f} 元；"
+        f"差值 {_macro_insight_signed_amount(expense_delta)} 元"
+        f"（我的支出是全站均值的 {_macro_insight_ratio_text(expense_ratio)}）"
+    )
+    lines.append(
+        f"我的收入：{my_income:.2f} 元；全站均值：{peer_income:.2f} 元；"
+        f"差值 {_macro_insight_signed_amount(income_delta)} 元"
+    )
+    lines.append(
+        f"我的恩格尔系数：{_macro_insight_percent_text(my_engel)}；"
+        f"全站均值：{_macro_insight_percent_text(peer_engel)}；"
+        f"差值 {_macro_insight_signed_points(engel_delta)} 个百分点"
+    )
+    lines.append(
+        f"我的结余率：{_macro_insight_percent_text(my_saving)}；"
+        f"全站均值：{_macro_insight_percent_text(peer_saving)}；"
+        f"差值 {_macro_insight_signed_points(saving_delta)} 个百分点"
+    )
+    lines.append(
+        f"我的月账单笔数：{my_bills} 笔；全站均值：{peer_bills} 笔；"
+        f"差值 {my_bills - peer_bills:+d} 笔"
+    )
+
+    # 分类占比：以「我的分类」为主，再补只出现在全站里的分类（缺的一侧按 0% 展示）。
+    my_shares = _macro_insight_mapping(me.get("category_shares"))
+    peer_shares = _macro_insight_mapping(global_stats.get("category_shares"))
+    share_names = list(my_shares) + [name for name in peer_shares if name not in my_shares]
+    if share_names:
+        items = [
+            f"{name} 我 {_macro_insight_percent_text(my_shares.get(name))} / "
+            f"全站 {_macro_insight_percent_text(peer_shares.get(name))}"
+            for name in share_names
+        ]
+        lines.append("分类占比：" + "；".join(items))
+    else:
+        lines.append("分类占比：无")
+
+    # 全站 Top3 热门商户：结构不对的条目直接跳过（宁可少列一个，也不要 KeyError）。
+    merchant_lines = []
+    top_merchants = global_stats.get("top_merchants")
+    if isinstance(top_merchants, (list, tuple)):
+        for item in top_merchants[:3]:
+            if not isinstance(item, dict):
+                continue
+            name = _macro_insight_text(item.get("name")) or "未知商户"
+            merchant_lines.append(
+                f"  {len(merchant_lines) + 1}. {name}"
+                f"（{_macro_insight_count(item.get('users'))} 位同学，"
+                f"{_macro_insight_count(item.get('count'))} 笔，"
+                f"{_macro_insight_amount(item.get('amount')):.2f} 元）"
+            )
+    if merchant_lines:
+        lines.append("全站 Top3 热门商户：")
+        lines.extend(merchant_lines)
+    else:
+        lines.append("全站 Top3 热门商户：无")
+
+    lines.append(
+        "输出要求：一段震撼的点评，150-250 字；直接说，不要分点、不要解释、不要复述全部数字；"
+        "可以拿食堂、奶茶、外卖这类场景开涮，但不要编造数据。"
+    )
+    return "\n".join(lines)
+
+
+def generate_macro_insight(stats: dict, api_key: str = "") -> str:
+    """根据「我的数据 vs 全站均值」生成一段震撼点评，返回 strip 后文本。
+
+    stats 约定（来自 db.get_macro_stats，缺失键按 0 / 空处理，绝不 KeyError）：
+        {"month": "2026-10", "month_label": "2026年10月",
+         "user_count": 3, "low_sample": True, "has_data": True,
+         "global": {"avg_expense": 200.0, "avg_income": 350.0, "avg_engel": 0.5,
+                    "avg_saving_rate": 0.25, "avg_bill_count": 3.0,
+                    "category_shares": {"餐饮": 0.5, "购物": 0.3},
+                    "top_merchants": [{"name": "食堂", "users": 3, "count": 3,
+                                       "amount": 300.0}]},
+         "me": {"user_id": 123, "has_data": True, "expense": 2679.2, "income": 3000.0,
+                "engel": 0.44, "saving_rate": 0.11, "bill_count": 10,
+                "category_shares": {"餐饮": 0.4, "奶茶咖啡": 0.2},
+                "top_merchant": {"name": "食堂", "count": 4, "amount": 300.0}},
+         "delta": {"expense": 1444.64, "expense_ratio": 1.85,
+                   "engel": -0.06, "saving_rate": -0.14}}
+
+    失败一律抛 MacroInsightError（中文 message，可直接上页面）：
+      · api_key 为空（strip 后）                                → no_api_key（且**不发请求**）；
+      · stats 不是 dict / 为空 / has_data 为假 / me 或 global 不是 dict
+                                                             → empty_stats（且**不发请求**）；
+      · 超时 / 连接失败 / 其它请求层异常                          → network；
+      · 非 200                                                 → http（只带状态码，不拼响应体）；
+      · 响应不是 JSON / 结构不符 / content 为空 / 正文短于 20 字    → parse。
+    返回前 strip；超过 500 字截断到 500 字并补「…」；**绝不**把 user_id 写进 prompt。
+    日志只记 code、异常类型与字数，**绝不**记 api_key、金额或商户名。
+    """
+    # ① api_key：先查它，没有 key 时不该先花一次网络往返。
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise MacroInsightError(
+            "no_api_key",
+            "未配置 DeepSeek API Key，暂时无法生成宏观洞察",
+        )
+    api_key = api_key.strip()
+
+    # ② 数据前置校验：没数据时模型只能编，宁可提示"数据不够"也不发请求。
+    if not isinstance(stats, dict) or not stats:
+        raise MacroInsightError("empty_stats", "还没有足够的数据生成宏观洞察")
+    if not _coerce_bool(stats.get("has_data"), default=False):
+        raise MacroInsightError("empty_stats", "还没有足够的数据生成宏观洞察")
+    if not isinstance(stats.get("global"), dict) or not isinstance(stats.get("me"), dict):
+        raise MacroInsightError("empty_stats", "还没有足够的数据生成宏观洞察")
+
+    month_label = (
+        _macro_insight_text(stats.get("month_label"))
+        or _macro_insight_text(stats.get("month"))
+        or "本月"
+    )
+    user_content = _build_macro_insight_user_content(stats)
+    payload = {
+        "model": MACRO_INSIGHT_MODEL,
+        "messages": [
+            {"role": "system", "content": MACRO_ANALYST_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": MACRO_INSIGHT_TEMPERATURE,
+        "max_tokens": MACRO_INSIGHT_MAX_TOKENS,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ③ 发请求：超时/连接失败翻译成用户能看懂的句子（不把异常对象漏到页面）。
+    try:
+        resp = requests.post(
+            DEEPSEEK_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=MACRO_INSIGHT_TIMEOUT,
+        )
+    except requests.Timeout:
+        logger.warning("宏观洞察生成失败（code=network，异常=Timeout）")
+        raise MacroInsightError(
+            "network",
+            "宏观洞察生成失败：网络超时，请稍后重试",
+        ) from None
+    except requests.ConnectionError:
+        logger.warning("宏观洞察生成失败（code=network，异常=ConnectionError）")
+        raise MacroInsightError("network", "宏观洞察生成失败：网络连接失败") from None
+    except requests.RequestException as exc:
+        # SSL/代理/URL 等其余请求层异常：日志只记异常类型（确保不把 headers / key 带出去）。
+        logger.warning("宏观洞察生成失败（code=network，异常=%s）", type(exc).__name__)
+        raise MacroInsightError("network", "宏观洞察生成失败：网络连接失败") from None
+
+    # ④ 非 200：只带状态码，不把响应体拼进 message（响应体可能含请求回显）。
+    if resp.status_code != 200:
+        logger.warning("宏观洞察生成失败（code=http，HTTP=%s）", resp.status_code)
+        raise MacroInsightError(
+            "http",
+            f"宏观洞察生成失败：服务返回 {resp.status_code}",
+        )
+
+    # ⑤ 解析：非 JSON / 结构不符 / content 为空 → parse。
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        logger.warning("宏观洞察生成失败（code=parse，异常=JSONDecode）")
+        raise MacroInsightError(
+            "parse",
+            "宏观洞察生成失败：模型返回内容无法解析",
+        ) from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("宏观洞察生成失败（code=parse，异常=结构不符）")
+        raise MacroInsightError(
+            "parse",
+            "宏观洞察生成失败：模型返回内容无法解析",
+        ) from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("宏观洞察生成失败（code=parse，异常=content 为空）")
+        raise MacroInsightError("parse", "宏观洞察生成失败：模型没有返回内容")
+
+    content = content.strip()
+    # ⑥ 截断 / 兜底：超过 500 字截断补「…」；短于 20 字说明模型只回了句废话，按 parse 处理。
+    if len(content) > MACRO_INSIGHT_MAX_CHARS:
+        content = content[:MACRO_INSIGHT_MAX_CHARS] + "…"
+    if len(content) < MACRO_INSIGHT_MIN_CHARS:
+        logger.warning("宏观洞察生成失败（code=parse，异常=正文过短，字数=%d）", len(content))
+        raise MacroInsightError("parse", "宏观洞察生成失败：模型返回内容过短，请重试")
+
+    logger.info("宏观洞察生成成功（月份=%s，字数=%d）", month_label, len(content))
+    return content

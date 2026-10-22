@@ -62,6 +62,7 @@ import json
 import math
 import calendar
 import hashlib
+import html
 import inspect
 import os
 import tomllib
@@ -150,6 +151,17 @@ except ImportError as _asset_chart_import_exc:
     print(
         f"[asset] 资产图表模块不可用："
         f"{type(_asset_chart_import_exc).__name__}: {_asset_chart_import_exc}"
+    )
+
+# 全息数据大屏的图表 / HTML 拼装模块（macro_chart.py）：纯函数、不联网、不读库。
+# 与上面几个并行模块同样先降级——缺失时大屏只显示一行提示，绝不红屏。
+try:
+    import macro_chart
+except ImportError as _macro_chart_import_exc:
+    macro_chart = None
+    print(
+        f"[macro] 全息大屏图表模块不可用："
+        f"{type(_macro_chart_import_exc).__name__}: {_macro_chart_import_exc}"
     )
 
 
@@ -397,6 +409,8 @@ def logout():
     st.session_state.pop("asset_advice_cache", None) # AI 资产管家文案含个人资产，换人同样必须失效
     st.session_state.pop("xianyu_cache", None)      # 闲鱼文案含个人资产与挂牌价，换人必须失效
     st.session_state.pop("idle_selected_id", None)  # 断舍离集市选中项属于上一个人的资产
+    st.session_state.pop("macro_dashboard_open", None)  # 全屏看板状态属于当前会话，换人必须关闭
+    st.session_state.pop("macro_ai_cache", None)      # 宏观洞察基于全站匿名聚合，换人同样必须失效
     st.session_state["page"] = 0
     st.session_state["chat_history"] = []           # 换人登录不应看到上一个人的 AI 聊天记录
     st.cache_data.clear()
@@ -848,6 +862,49 @@ def _get_xianyu_copy_fn():
         return None
     copy_fn = getattr(_ai_agent_mod, "generate_xianyu_copy", None)
     return copy_fn if callable(copy_fn) else None
+
+
+# ===== 全息数据大屏：宏观统计 / AI 宏观洞察的取用与展示格式化 =====
+# 与上面几个 AI 入口完全同构：按模块属性取，并行开发期缺失 / 测试打桩都能感知。
+def _get_macro_stats_fn():
+    """按模块属性取 db.get_macro_stats：缺失 / 打桩都能感知（返回 None 由调用方降级）。"""
+    return getattr(db, "get_macro_stats", None)
+
+
+def _get_macro_insight_fn():
+    """按模块属性取 ai_agent.generate_macro_insight：缺失 / 打桩都能感知。"""
+    try:
+        import ai_agent as _ai_agent_mod
+    except Exception as _ai_import_exc:  # pragma: no cover - 依赖缺失时只降级
+        print(
+            f"[macro] ai_agent 不可用："
+            f"{type(_ai_import_exc).__name__}: {_ai_import_exc}"
+        )
+        return None
+    insight_fn = getattr(_ai_agent_mod, "generate_macro_insight", None)
+    return insight_fn if callable(insight_fn) else None
+
+
+def _macro_fmt_value(value, unit):
+    """KPI 数值文案：元 2 位小数、百分数 1 位、笔数去掉无意义的小数尾巴。"""
+    number = _peer_number(value)
+    if unit == "元":
+        return f"¥{number:,.2f}"
+    if unit == "%":
+        return f"{number:.1f}%"
+    text = f"{number:.1f}".rstrip("0").rstrip(".")
+    return f"{text or '0'} 笔" if unit == "笔" else (text or "0")
+
+
+def _macro_fmt_delta(value, unit):
+    """差值文案：始终带正负号，单位与数值口径保持一致。"""
+    number = _peer_number(value)
+    if unit == "元":
+        return f"{number:+,.2f} 元"
+    if unit == "%":
+        return f"{number:+.1f}%"
+    text = f"{number:+.1f}".rstrip("0").rstrip(".")
+    return f"{text or '+0'} 笔" if unit == "笔" else (text or "+0")
 
 
 def _asset_rate_text(value):
@@ -1751,6 +1808,11 @@ else:
 tab_dash, tab_tools, tab_ai = st.tabs(["📊 财务看板", "💡 实用工具", "🤖 AI 管家"])
 
 with tab_dash:
+    # ===== 全息数据大屏入口：点开后才渲染 fixed 覆盖层，默认不影响原页面 =====
+    if st.button("🚀 进入全息数据大屏", key="macro_open_btn", type="primary"):
+        st.session_state["macro_dashboard_open"] = True
+        st.rerun()
+
     # ===== 财务健康分仪表盘（放在最顶部，最醒目的位置）=====
     # 计算失败只降级成一行提示，绝不影响下方的指标卡 / 图表 / 导出
     try:
@@ -1861,6 +1923,328 @@ with tab_dash:
                             "text": comment_text,
                         }
                         st.info(comment_text)
+
+    # ===== 全息数据大屏：fixed 全屏覆盖层（默认关闭，不影响原有页面）=====
+    # 取数 / 图表 / AI 全部防御式处理：任何后端缺失或异常都只降级成一行 caption，
+    # 头部与「退出大屏」按钮始终可用，绝不 st.stop()、绝不红屏。
+    if st.session_state.get("macro_dashboard_open"):
+        st.markdown(
+            """
+            <style>
+            .st-key-macro_dashboard { position: fixed; inset: 0; z-index: 1000000; overflow-y: auto; background: radial-gradient(circle at 50% 0%, #0B1B33 0%, #050810 55%, #000 100%); padding: 26px 44px 40px; }
+            body:has(.st-key-macro_dashboard) [data-testid="stSidebar"], body:has(.st-key-macro_dashboard) [data-testid="stHeader"] { display: none; }
+            .st-key-macro_dashboard > div { max-width: 1400px; margin: 0 auto; }
+            .macro-kpi-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 4px 0 10px; }
+            .macro-kpi-card { background: linear-gradient(160deg, rgba(22,38,64,.92), rgba(8,14,26,.94)); border: 1px solid rgba(34,211,238,.22); border-radius: 14px; padding: 14px 16px; box-shadow: 0 0 18px rgba(34,211,238,.10), inset 0 0 22px rgba(59,130,246,.06); }
+            .macro-kpi-label { color: #7C8CA6; font-size: 13px; letter-spacing: .06em; }
+            .macro-kpi-main { color: #E2E8F0; font-size: 21px; font-weight: 700; margin: 6px 0 2px; }
+            .macro-kpi-sub { color: #7C8CA6; font-size: 12px; }
+            .macro-kpi-delta { font-size: 13px; font-weight: 600; margin-top: 6px; }
+            .macro-merchant-card { background: linear-gradient(160deg, rgba(20,30,54,.92), rgba(8,13,24,.94)); border: 1px solid rgba(167,139,250,.26); border-radius: 12px; padding: 12px 14px; min-height: 76px; }
+            .macro-merchant-name { color: #E2E8F0; font-size: 15px; font-weight: 600; }
+            .macro-merchant-meta { color: #7C8CA6; font-size: 12px; margin-top: 6px; }
+            .macro-ai-card { color: #E2E8F0; line-height: 1.75; font-size: 14px; background: linear-gradient(150deg, rgba(13,24,44,.96), rgba(6,10,18,.96)); border: 1px solid rgba(34,211,238,.45); border-radius: 14px; padding: 16px 18px; margin-top: 10px; box-shadow: 0 0 22px rgba(34,211,238,.22), inset 0 0 26px rgba(167,139,250,.08); }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # ---- 取数：后端缺失 / 抛错 / 返回非 dict 一律按「暂不可用」降级 ----
+        _macro_stats = None
+        try:
+            _macro_stats_fn = _get_macro_stats_fn()
+            if callable(_macro_stats_fn):
+                _macro_stats = _macro_stats_fn(st.session_state.user_id)
+        except Exception as _macro_stats_exc:
+            print(
+                f"[macro] 读取全站宏观统计失败："
+                f"{type(_macro_stats_exc).__name__}: {_macro_stats_exc}"
+            )
+            _macro_stats = None
+        if not isinstance(_macro_stats, dict):
+            _macro_stats = None
+
+        _macro_month_label = str(
+            (_macro_stats or {}).get("month_label") or current_month_str
+        ).strip()
+        _macro_user_count = int(_peer_number((_macro_stats or {}).get("user_count")))
+
+        with st.container(key="macro_dashboard"):
+            # ---- 头部：标题 / 副标题 / 右上角退出（无论数据是否可用都要在）----
+            _macro_head_left, _macro_head_right = st.columns([0.78, 0.22])
+            with _macro_head_left:
+                st.markdown("### 🌌 全息财务大屏")
+                st.caption(
+                    f"{_macro_month_label} · 全站 {_macro_user_count} 位同学匿名聚合"
+                )
+            with _macro_head_right:
+                if st.button("✕ 退出大屏", key="macro_close_btn"):
+                    st.session_state["macro_dashboard_open"] = False
+                    st.rerun()
+
+            if _macro_stats is None:
+                st.caption("大屏数据暂不可用，稍后再来看看吧")
+            elif _macro_stats.get("has_data") is False:
+                st.caption("全站样本还在积累中，先记几笔账再回来看看～")
+            else:
+                # ---- 健康分：沿用本页已算好的 health（异常 / 缺失按 0 / 空等级）----
+                try:
+                    _macro_health_score = _peer_number(health.get("score"))
+                except Exception:
+                    _macro_health_score = 0.0
+                try:
+                    _macro_health_grade = str(health.get("grade") or "")
+                except Exception:
+                    _macro_health_grade = ""
+
+                _macro_left, _macro_right = st.columns([1, 1.35], gap="large")
+                with _macro_left:
+                    if macro_chart is not None and callable(
+                        getattr(macro_chart, "build_liquid_html", None)
+                    ):
+                        try:
+                            _macro_liquid_html = macro_chart.build_liquid_html(
+                                _macro_health_score,
+                                _macro_health_grade,
+                                "财务健康分",
+                                380,
+                            )
+                            st.components.v1.html(
+                                _macro_liquid_html, height=400, scrolling=False
+                            )
+                        except Exception as _macro_liquid_exc:
+                            print(
+                                f"[macro] 水球渲染失败："
+                                f"{type(_macro_liquid_exc).__name__}: {_macro_liquid_exc}"
+                            )
+                            st.caption("健康分水球暂不可用")
+                    else:
+                        st.caption("健康分水球暂不可用（图表模块未就绪）")
+
+                with _macro_right:
+                    _macro_kpi_html = ""
+                    if macro_chart is not None and callable(
+                        getattr(macro_chart, "build_kpi_cards", None)
+                    ):
+                        try:
+                            _macro_kpi_cards = macro_chart.build_kpi_cards(_macro_stats)
+                        except Exception as _macro_kpi_exc:
+                            print(
+                                f"[macro] KPI 卡数据拼装失败："
+                                f"{type(_macro_kpi_exc).__name__}: {_macro_kpi_exc}"
+                            )
+                            _macro_kpi_cards = []
+                        _macro_kpi_parts = []
+                        for _macro_card in _macro_kpi_cards:
+                            if not isinstance(_macro_card, dict):
+                                continue
+                            _macro_unit = str(_macro_card.get("unit") or "")
+                            _macro_better = str(_macro_card.get("better") or "neutral")
+                            _macro_delta = _peer_number(_macro_card.get("delta"))
+                            # 负向差值一律红；正向且「越低越好」也红；正向且「越高越好」绿。
+                            if _macro_delta < 0:
+                                _macro_delta_color = "#F87171"
+                            elif _macro_delta > 0 and _macro_better == "lower":
+                                _macro_delta_color = "#F87171"
+                            elif _macro_delta > 0 and _macro_better == "higher":
+                                _macro_delta_color = "#34D399"
+                            else:
+                                _macro_delta_color = "#7C8CA6"
+                            _macro_kpi_parts.append(
+                                '<div class="macro-kpi-card">'
+                                '<div class="macro-kpi-label">'
+                                f'{html.escape(str(_macro_card.get("label") or ""))}'
+                                "</div>"
+                                '<div class="macro-kpi-main">我的 '
+                                f'{_macro_fmt_value(_macro_card.get("me"), _macro_unit)}'
+                                "</div>"
+                                '<div class="macro-kpi-sub">全站均值 '
+                                f'{_macro_fmt_value(_macro_card.get("avg"), _macro_unit)}'
+                                "</div>"
+                                f'<div class="macro-kpi-delta" style="color:{_macro_delta_color}">'
+                                f'差值 {_macro_fmt_delta(_macro_delta, _macro_unit)}'
+                                "</div>"
+                                "</div>"
+                            )
+                        _macro_kpi_html = (
+                            '<div class="macro-kpi-grid">'
+                            + "".join(_macro_kpi_parts)
+                            + "</div>"
+                        )
+                    else:
+                        st.caption("KPI 卡暂不可用（图表模块未就绪）")
+
+                    if _macro_kpi_html:
+                        st.markdown(_macro_kpi_html, unsafe_allow_html=True)
+
+                    if _macro_stats.get("low_sample") is True:
+                        st.caption(f"样本仅 {_macro_user_count} 人，均值参考性有限")
+
+                # ---- 消费分布对比（双柱状图）----
+                st.markdown("#### 📊 我的消费分布 vs 全站平均")
+                if macro_chart is not None and callable(
+                    getattr(macro_chart, "build_compare_option", None)
+                ):
+                    try:
+                        _macro_compare_option = macro_chart.build_compare_option(
+                            _macro_stats
+                        )
+                        st_echarts(
+                            _macro_compare_option,
+                            height="400px",
+                            key="macro_compare",
+                        )
+                        st.caption(
+                            "百分比 = 该分类占个人总支出的比例；全站平均为同月匿名聚合均值"
+                        )
+                    except Exception as _macro_chart_exc:
+                        print(
+                            f"[macro] 对比图渲染失败："
+                            f"{type(_macro_chart_exc).__name__}: {_macro_chart_exc}"
+                        )
+                        st.caption("分类对比图表暂不可用")
+                else:
+                    st.caption("分类对比图表暂不可用（图表模块未就绪）")
+
+                # ---- Top3 热门商户 ----
+                st.markdown("#### 🔥 全站 Top3 热门商户")
+                _macro_top_merchants = []
+                try:
+                    _macro_global_block = _macro_stats.get("global")
+                    if isinstance(_macro_global_block, dict):
+                        _macro_top_merchants = list(
+                            _macro_global_block.get("top_merchants") or []
+                        )[:3]
+                except Exception as _macro_merchant_exc:
+                    print(
+                        f"[macro] 热门商户读取失败："
+                        f"{type(_macro_merchant_exc).__name__}: {_macro_merchant_exc}"
+                    )
+                    _macro_top_merchants = []
+
+                if _macro_top_merchants:
+                    _macro_merchant_cols = st.columns(3)
+                    for _macro_index, _macro_merchant in enumerate(
+                        _macro_top_merchants
+                    ):
+                        _macro_name = "未命名商户"
+                        _macro_users = 0
+                        _macro_count = 0
+                        if isinstance(_macro_merchant, dict):
+                            _macro_name = (
+                                str(_macro_merchant.get("name") or "").strip()
+                                or "未命名商户"
+                            )
+                            _macro_users = int(
+                                _peer_number(_macro_merchant.get("users"))
+                            )
+                            _macro_count = int(
+                                _peer_number(_macro_merchant.get("count"))
+                            )
+                        with _macro_merchant_cols[_macro_index]:
+                            st.markdown(
+                                '<div class="macro-merchant-card">'
+                                '<div class="macro-merchant-name">'
+                                f"{html.escape(_macro_name)}"
+                                "</div>"
+                                '<div class="macro-merchant-meta">'
+                                f"{_macro_users} 人常去 · {_macro_count} 笔"
+                                "</div>"
+                                "</div>",
+                                unsafe_allow_html=True,
+                            )
+                else:
+                    st.caption("暂无热门商户数据")
+
+                # ---- AI 宏观洞察：缓存命中不调 API，失败不扣额度 ----
+                st.markdown("#### 🧠 AI 宏观洞察")
+                _macro_ai_key = ""
+                try:
+                    _macro_ai_key = hashlib.sha256(
+                        json.dumps(
+                            _macro_stats, sort_keys=True, default=str
+                        ).encode("utf-8")
+                    ).hexdigest()
+                except Exception as _macro_ai_key_exc:
+                    print(
+                        f"[macro] 宏观洞察缓存 key 计算失败："
+                        f"{type(_macro_ai_key_exc).__name__}: {_macro_ai_key_exc}"
+                    )
+                    _macro_ai_key = ""
+
+                _macro_ai_saved = st.session_state.get("macro_ai_cache")
+                _macro_ai_text = ""
+                if (
+                    isinstance(_macro_ai_saved, dict)
+                    and _macro_ai_saved.get("key") == _macro_ai_key
+                    and str(_macro_ai_saved.get("text") or "").strip()
+                ):
+                    _macro_ai_text = str(_macro_ai_saved["text"]).strip()
+
+                _macro_ai_status = ""
+                if st.button("🧠 生成宏观洞察", key="macro_ai_btn"):
+                    if st.session_state.get("ai_daily_count", 0) >= 20:
+                        _macro_ai_status = "今日免费额度已用完，明天再来看全站洞察吧"
+                    elif _macro_ai_text:
+                        pass  # 同一份数据已生成过：直接展示缓存，不调 API、不扣额度
+                    else:
+                        _macro_insight_fn = _get_macro_insight_fn()
+                        if not callable(_macro_insight_fn):
+                            _macro_ai_status = (
+                                "宏观洞察暂时生成失败：AI 模块还没准备好"
+                            )
+                        else:
+                            try:
+                                with st.spinner("学长正在读全站匿名数据…"):
+                                    _macro_ai_text = _macro_insight_fn(
+                                        _macro_stats,
+                                        api_key=get_deepseek_api_key(),
+                                    )
+                            except Exception as _macro_ai_exc:
+                                # 失败只提示、不扣额度、不写缓存：下次点击可重试
+                                print(
+                                    f"[macro] 宏观洞察生成失败："
+                                    f"{type(_macro_ai_exc).__name__}: {_macro_ai_exc}"
+                                )
+                                _macro_ai_text = ""
+                                _macro_ai_status = (
+                                    f"宏观洞察暂时生成失败：{_macro_ai_exc}"
+                                )
+                            else:
+                                _macro_ai_text = (
+                                    str(_macro_ai_text).strip()
+                                    if isinstance(_macro_ai_text, str)
+                                    else ""
+                                )
+                                if _macro_ai_text:
+                                    st.session_state["macro_ai_cache"] = {
+                                        "key": _macro_ai_key,
+                                        "text": _macro_ai_text,
+                                    }
+                                    st.session_state.ai_daily_count = (
+                                        st.session_state.get("ai_daily_count", 0) + 1
+                                    )
+                                    st.session_state.ai_last_count_date = date.today()
+                                else:
+                                    _macro_ai_status = (
+                                        "宏观洞察暂时生成失败：AI 没有返回内容"
+                                    )
+
+                if _macro_ai_text:
+                    _macro_ai_html = (
+                        html.escape(_macro_ai_text)
+                        .replace("\r\n", "\n")
+                        .replace("\n", "<br/>")
+                    )
+                    st.markdown(
+                        f'<div class="macro-ai-card">{_macro_ai_html}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.caption("由 AI 根据全站匿名均值生成，仅供参考")
+                elif _macro_ai_status:
+                    st.caption(_macro_ai_status)
+                else:
+                    st.caption("点上方按钮，让 AI 用全站匿名均值给你一份宏观解读")
 
     # Metric cards
     st.subheader("收支概览")

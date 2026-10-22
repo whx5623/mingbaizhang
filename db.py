@@ -7899,3 +7899,450 @@ def get_idle_assets(user_id, today=None, min_months: int = IDLE_MIN_MONTHS,
         "min_rate": float(rate_threshold),
         "items": items,
     }
+
+
+# ===========================================================================
+# 全站宏观统计（get_macro_stats）
+# ---------------------------------------------------------------------------
+# 本段只**追加**：不改动上面任何既有函数、常量与取数口径。
+#
+# 定位：给「我 vs 全站」的对比卡片与 AI 解读提供一份**匿名聚合**数据。
+#   · 每人等权：先算个人指标，再对有支出的用户取算术平均 —— 大额/多笔用户
+#     不会把均值拉偏（与 get_peer_benchmark 同源的权重口径）；
+#   · 只统计当月**有支出**的用户：0 支出用户的恩格尔系数、分类结构、商户榜
+#     没有对比意义，留在样本里只会把全站均值稀释成「没人消费」；
+#   · 返回体里绝不出现别人的 user_id、单笔明细或可反查的商户组合 ——
+#     唯一允许的用户标识是 me.user_id（调用方自己）。
+#
+# 与 get_peer_benchmark 的关系：同为「每人等权 + 当月账单」，但本函数面向宏观
+# 画像（恩格尔系数、分类结构、商户榜、结余率），因此不复用它的四维得分。
+# ===========================================================================
+
+MACRO_MIN_USERS = 5        # 样本少于这个数 → low_sample=True（均值照给，仅提示参考性弱）
+MACRO_TOP_MERCHANTS = 3    # 全站商户榜取前几名
+
+# 分类列缺失（迁移 012 未执行）时的固定文案：与 _PEER_CATEGORY_MISSING 同一个降级约定
+# （RuntimeError + 中文 + 可操作，页面 try/except 接住后隐藏模块，不红屏）。
+_MACRO_CATEGORY_MISSING = (
+    "宏观统计失败：分类功能未启用，请先执行 migrations/012_bills_category.sql"
+)
+
+# 输出键序固定成 BILL_CATEGORIES 的顺序：dict 有序，前端/AI 每次拿到的键序可复现，
+# 测试也能逐字比对。不在这个集合里的历史脏分类统一归 FALLBACK_CATEGORY，
+# 保证「各分类占比之和 = 1」不会因为一个陌生标签而漏掉一块。
+_MACRO_CATEGORY_KEYS = tuple(BILL_CATEGORIES)
+
+
+def _macro_uid(user_id):
+    """把 user_id 收敛成 int / None：None、布尔、空串、非数字一律 None。
+
+    None 表示「没有『我』这个视角」：不查个人数据、me 全 0、delta 按 0 参与减法。
+    绝不在这里抛错 —— 页面把 session 里的脏值透传进来时也只该降级，不该红屏。
+    """
+    if user_id is None or isinstance(user_id, bool):
+        return None
+    try:
+        return int(user_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def _macro_money(value) -> float:
+    """金额 → float，两位小数（ROUND_HALF_UP，与 NUMERIC(12,2) / _CENT 同口径）。
+
+    脏值（None / 非数字 / NaN / inf）→ 0.0：宏观统计绝不能因为一行脏数据抛错。
+    """
+    try:
+        return _money_to_float(_radar_decimal(value))
+    except (InvalidOperation, OverflowError, ValueError):
+        return 0.0
+
+
+def _macro_money_avg(values) -> float:
+    """多用户金额指标的算术平均（每人等权），Decimal 求和后再定量到分。"""
+    values = list(values)
+    if not values:
+        return 0.0
+    total = sum((_radar_decimal(value) for value in values), Decimal("0"))
+    return _macro_money(total / Decimal(len(values)))
+
+
+def _macro_ratio(numerator, denominator, *, clamp: bool = False) -> float:
+    """比率 = numerator / denominator，保留 4 位小数；分母 <= 0 → 0.0，NaN/inf → 0.0。
+
+    clamp=True 只用于「占比」（0..1，浮点误差不该把 0.999999 显示成 1.0001）；
+    结余率与其差值一律不 clamp —— 允许为负，硬夹会把「平均透支」显示成 0。
+    """
+    num = _radar_decimal(numerator)
+    den = _radar_decimal(denominator)
+    try:
+        if den <= 0:
+            return 0.0
+        value = float(num / den)
+    except (InvalidOperation, OverflowError, ValueError):
+        return 0.0
+    if not math.isfinite(value):
+        return 0.0
+    if clamp:
+        value = max(0.0, min(1.0, value))
+    return round(value, 4)
+
+
+def _macro_saving_rate(income, expense):
+    """结余率 = (income - expense) / income；income <= 0 → None（不参与全站均值）。
+
+    与 _peer_metrics_from_row 的 saving_rate 刻意不同：那边用 -1.0 当作「纯花钱」
+    的哨兵给雷达图打分；宏观统计要的是「能对比的真实比率」，所以这里如实返回 None。
+    """
+    income_dec = _radar_decimal(income)
+    if income_dec <= 0:
+        return None
+    return _macro_ratio(income_dec - _radar_decimal(expense), income_dec)
+
+
+def _macro_number(value, digits: int = 4) -> float:
+    """把差值 / 比率收敛成有限 float 并保留 digits 位（NaN / inf / 非数字 → 0.0）。
+
+    差值是「我 − 全站」，允许为负、也允许超过 1（例如结余率我 0.8、全站 -0.5），
+    所以这里不做 [0, 1] 夹取，只保证「一定是有限值」。
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(number):
+        return 0.0
+    return round(number, digits)
+
+
+def _macro_count_avg(values) -> float:
+    """笔数均值：保留 2 位（1 人 10 笔 + 1 人 1 笔 → 5.5 笔，取整会丢信息）。"""
+    values = list(values)
+    if not values:
+        return 0.0
+    try:
+        total = sum(int(value) for value in values)
+        value = total / len(values)
+    except (TypeError, ValueError):
+        return 0.0
+    return round(value, 2) if math.isfinite(value) else 0.0
+
+
+def get_macro_stats(user_id=None, month=None, today=None) -> dict:
+    """统计某个月全站「每人等权」的宏观指标，并与指定用户做「我 − 全站」差值。
+
+    参数
+    ----
+    user_id : 要对比的「我」。None / 不存在 / 当月无账单 → me.has_data=False，其余按 0。
+    month   : "YYYY-MM"；None → today 所在月。非法格式直接 ValueError
+              （复用 _parse_report_month，在开连接之前就拒绝）。
+    today   : 默认北京时间今天；只用于 month=None 时确定「本月」。
+
+    口径
+    ----
+    · 一条只读 SQL 取 [月初, 下月初) 的账单（date::date 比较、参数化），
+      在 Python 里按 user_id 聚合 —— 学生项目的数据量，单查询完全够用；
+    · 个人指标：expense / income / bill_count（收入 + 支出笔数）/
+      engel（餐饮支出 / 总支出，无支出 → 0.0）/
+      saving_rate（(income-expense)/income，income<=0 → None）/
+      category_shares（各支出分类占个人支出的比例，只保留真正出现过的分类）/
+      top_merchant（个人「消费笔数」最多的商户：笔数降序 → 金额降序 → 名称升序）；
+    · 全站均值只对**当月有支出**（expense > 0）的用户取算术平均：
+      avg_expense / avg_income / avg_engel（对每人的恩格尔系数取平均，不是金额合并）/
+      avg_saving_rate（只对有收入用户取平均，一个都没有 → 0.0）/ avg_bill_count；
+      category_shares 逐分类取平均（缺失分类按 0 参与，保证每人权重相同）；
+      top_merchants 按「去重用户数降序 → 笔数降序 → 金额降序」取前 MACRO_TOP_MERCHANTS 个；
+    · delta 一律「我 − 全站」：expense（元）/ expense_ratio（avg<=0 → None）/
+      engel（小数差）/ saving_rate（小数差，任一侧 None → None）；
+    · 金额保留 2 位小数、比率保留 4 位小数，所有 float 保证有限（NaN/inf → 0.0）；
+    · 隐私：只返回聚合值，唯一出现的用户标识是 me.user_id。
+
+    异常
+    ----
+    · bills.category 不存在（迁移 012 未执行）→ RuntimeError（中文、可操作提示）；
+    · 数据库异常（含历史脏日期导致 date::date cast 失败）→ RuntimeError(
+      "宏观统计失败：..."），文本已脱敏（_peer_error_text），日志只写脱敏原因；
+    · 没有账单 → **不抛错**：user_count=0、has_data=False、global 全 0 / 空 dict / 空 list，
+      me 各 0、delta 无假数据（expense_ratio / saving_rate 为 None）。
+    """
+    today_date = _radar_normalize_today(today)
+    # 先解析再 strip：month 不是字符串时让 _parse_report_month 抛 ValueError（对外契约），
+    # 而不是在这里先吃一个 AttributeError。
+    raw_month = (
+        f"{today_date.year:04d}-{today_date.month:02d}" if month is None else month
+    )
+    month_start, month_end = _parse_report_month(raw_month)
+    month_text = raw_month.strip()
+    month_label = _radar_month_label(month_text)
+    me_uid = _macro_uid(user_id)
+
+    if engine is None:
+        try:
+            init_db()
+        except Exception as exc:  # noqa: BLE001 - 统一包装成页面能接住的 RuntimeError
+            # 只记脱敏后的一句话：SQLAlchemy 的异常文本里可能带连接串 / 密码。
+            logging.getLogger(__name__).warning(
+                "[db] 宏观统计前初始化数据库失败：%s", _peer_error_text(exc)
+            )
+            raise RuntimeError(f"宏观统计失败：{_peer_error_text(exc)}") from exc
+
+    # 分类列不存在时，恩格尔系数 / 分类结构没有口径可言：显式抛错让页面隐藏模块，
+    # 而不是悄悄返回一堆 0（那会被误读成「大家都很健康」）。
+    if not _bills_category_supported():
+        raise RuntimeError(_MACRO_CATEGORY_MISSING)
+
+    # 唯一一条取数 SQL：只读、只取聚合需要的五个字段、全部绑定参数（不拼接）。
+    # date 是 VARCHAR，统一 ::date 转换后按 [月初, 下月初) 比较（与日报 / 雷达同口径）。
+    sql = text("""
+        SELECT b.user_id,
+               b.amount,
+               b.type,
+               COALESCE(NULLIF(btrim(b.category), ''), :fallback) AS category,
+               COALESCE(NULLIF(btrim(b.merchant), ''), '') AS merchant
+        FROM public.bills b
+        WHERE b.date::date >= :start
+          AND b.date::date <  :end
+    """)
+    params = {
+        "start": month_start,
+        "end": month_end,
+        "fallback": FALLBACK_CATEGORY,
+    }
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+    except Exception as exc:  # noqa: BLE001 - 统一包装成 RuntimeError，且文本脱敏
+        logging.getLogger(__name__).warning(
+            "[db] 宏观统计失败（SQL 执行阶段）：%s", _peer_error_text(exc)
+        )
+        raise RuntimeError(f"宏观统计失败：{_peer_error_text(exc)}") from exc
+
+    # ------------------------------------------------------------------
+    # 第一步：按 user_id 聚合原始账单（user_id 为 NULL 的账单无法归到人头上，
+    # 不参与「每人等权」的均值；商户榜同样只由这些能归属的消费构成）。
+    # ------------------------------------------------------------------
+    buckets: dict[int, dict] = {}
+    for row in rows:
+        uid = _macro_uid(getattr(row, "user_id", None))
+        if uid is None:
+            continue
+        amount = _radar_decimal(getattr(row, "amount", None))
+        bill_type = getattr(row, "type", None)
+        category = getattr(row, "category", None)
+        if category not in _MACRO_CATEGORY_KEYS:
+            category = FALLBACK_CATEGORY
+        merchant = str(getattr(row, "merchant", None) or "").strip()
+
+        bucket = buckets.get(uid)
+        if bucket is None:
+            bucket = buckets[uid] = {
+                "expense": Decimal("0"),
+                "income": Decimal("0"),
+                "bill_count": 0,
+                "categories": {},
+                "merchants": {},
+            }
+        bucket["bill_count"] += 1
+        if bill_type == EXPENSE_TYPE:
+            bucket["expense"] += amount
+            bucket["categories"][category] = (
+                bucket["categories"].get(category, Decimal("0")) + amount
+            )
+            if merchant:
+                entry = bucket["merchants"].get(merchant)
+                if entry is None:
+                    entry = bucket["merchants"][merchant] = [0, Decimal("0")]
+                entry[0] += 1
+                entry[1] += amount
+        elif bill_type == INCOME_TYPE:
+            bucket["income"] += amount
+        # 其它脏 type：不计入任何一侧（与 get_peer_benchmark 的 `s.type = :expense` 同口径），
+        # 但仍算一笔账单（bill_count），不会凭空消失。
+
+    # ------------------------------------------------------------------
+    # 第二步：每人等权的个人指标（唯一公式来源；me 与全站均值都从这里取）。
+    # ------------------------------------------------------------------
+    person_metrics: dict[int, dict] = {}
+    for uid, bucket in buckets.items():
+        expense_dec = bucket["expense"]
+        income_dec = bucket["income"]
+        expense_value = _macro_money(expense_dec)
+        income_value = _macro_money(income_dec)
+
+        category_shares = {}
+        engel = 0.0
+        if expense_dec > 0:
+            for name in _MACRO_CATEGORY_KEYS:
+                amount = bucket["categories"].get(name)
+                if amount is not None and amount > 0:
+                    category_shares[name] = _macro_ratio(amount, expense_dec, clamp=True)
+            engel = _macro_ratio(
+                bucket["categories"].get("餐饮", Decimal("0")), expense_dec, clamp=True
+            )
+
+        top_merchant = None
+        if bucket["merchants"]:
+            ranked = sorted(
+                bucket["merchants"].items(),
+                key=lambda item: (-item[1][0], -item[1][1], item[0]),
+            )
+            name, (count, amount) = ranked[0]
+            top_merchant = {
+                "name": name,
+                "count": int(count),
+                "amount": _macro_money(amount),
+            }
+
+        person_metrics[uid] = {
+            "user_id": uid,
+            "expense": expense_value,
+            "income": income_value,
+            "engel": engel,
+            "saving_rate": _macro_saving_rate(income_dec, expense_dec),
+            "bill_count": int(bucket["bill_count"]),
+            "category_shares": category_shares,
+            "top_merchant": top_merchant,
+        }
+
+    # ------------------------------------------------------------------
+    # 第三步：全站均值（只取当月有支出的用户；顺序按 uid 排序，结果可复现）。
+    # ------------------------------------------------------------------
+    sample_uids = sorted(
+        uid for uid, metrics in person_metrics.items() if metrics["expense"] > 0
+    )
+    sample = [person_metrics[uid] for uid in sample_uids]
+
+    if sample:
+        avg_expense = _macro_money_avg(metrics["expense"] for metrics in sample)
+        avg_income = _macro_money_avg(metrics["income"] for metrics in sample)
+        avg_engel = _macro_ratio(
+            sum(metrics["engel"] for metrics in sample), len(sample)
+        )
+        saving_rates = [
+            metrics["saving_rate"]
+            for metrics in sample
+            if metrics["saving_rate"] is not None
+        ]
+        avg_saving_rate = (
+            _macro_ratio(sum(saving_rates), len(saving_rates)) if saving_rates else 0.0
+        )
+        avg_bill_count = _macro_count_avg(
+            metrics["bill_count"] for metrics in sample
+        )
+        share_keys = [
+            name
+            for name in _MACRO_CATEGORY_KEYS
+            if any(name in metrics["category_shares"] for metrics in sample)
+        ]
+        category_shares = {
+            name: _macro_ratio(
+                sum(metrics["category_shares"].get(name, 0.0) for metrics in sample),
+                len(sample),
+            )
+            for name in share_keys
+        }
+    else:
+        avg_expense = 0.0
+        avg_income = 0.0
+        avg_engel = 0.0
+        avg_saving_rate = 0.0
+        avg_bill_count = 0.0
+        category_shares = {}
+
+    # 全站商户榜：在**样本用户**范围内聚合「消费笔数」，同一个商户按去重用户数计权重。
+    merchant_stats: dict[str, dict] = {}
+    for uid in sample_uids:
+        for name, (count, amount) in buckets[uid]["merchants"].items():
+            entry = merchant_stats.get(name)
+            if entry is None:
+                entry = merchant_stats[name] = {
+                    "users": set(),
+                    "count": 0,
+                    "amount": Decimal("0"),
+                }
+            entry["users"].add(uid)
+            entry["count"] += count
+            entry["amount"] += amount
+    ranked_merchants = sorted(
+        merchant_stats.items(),
+        key=lambda item: (
+            -len(item[1]["users"]), -item[1]["count"], -item[1]["amount"], item[0]
+        ),
+    )
+    top_merchants = [
+        {
+            "name": name,
+            "users": len(entry["users"]),
+            "count": int(entry["count"]),
+            "amount": _macro_money(entry["amount"]),
+        }
+        for name, entry in ranked_merchants[:MACRO_TOP_MERCHANTS]
+    ]
+
+    # ------------------------------------------------------------------
+    # 第四步：我的视角 + 差值（「我 − 全站」；没有个人数据时「我」按 0 参与减法）。
+    # ------------------------------------------------------------------
+    me_person = person_metrics.get(me_uid) if me_uid is not None else None
+    me_has_data = bool(me_person) and me_person["bill_count"] > 0
+    if me_has_data:
+        me = {
+            "user_id": me_uid,
+            "has_data": True,
+            "expense": me_person["expense"],
+            "income": me_person["income"],
+            "engel": me_person["engel"],
+            "saving_rate": me_person["saving_rate"],
+            "bill_count": me_person["bill_count"],
+            "category_shares": dict(me_person["category_shares"]),
+            "top_merchant": (
+                dict(me_person["top_merchant"]) if me_person["top_merchant"] else None
+            ),
+        }
+    else:
+        me = {
+            "user_id": me_uid,
+            "has_data": False,
+            "expense": 0.0,
+            "income": 0.0,
+            "engel": 0.0,
+            "saving_rate": None,
+            "bill_count": 0,
+            "category_shares": {},
+            "top_merchant": None,
+        }
+
+    me_expense = me["expense"]
+    me_saving = me["saving_rate"]
+    delta = {
+        "expense": _macro_money(_as_decimal(me_expense) - _as_decimal(avg_expense)),
+        "expense_ratio": (
+            _macro_ratio(me_expense, avg_expense) if avg_expense > 0 else None
+        ),
+        "engel": _macro_number(me["engel"] - avg_engel),
+        "saving_rate": (
+            _macro_number(me_saving - avg_saving_rate)
+            if me_saving is not None and avg_saving_rate is not None
+            else None
+        ),
+    }
+
+    user_count = len(sample)
+    return {
+        "month": month_text,
+        "month_label": month_label,
+        "user_count": user_count,
+        "min_users": MACRO_MIN_USERS,
+        "low_sample": user_count < MACRO_MIN_USERS,
+        "has_data": user_count > 0,
+        "global": {
+            "avg_expense": avg_expense,
+            "avg_income": avg_income,
+            "avg_engel": avg_engel,
+            "avg_saving_rate": avg_saving_rate,
+            "avg_bill_count": avg_bill_count,
+            "category_shares": category_shares,
+            "top_merchants": top_merchants,
+        },
+        "me": me,
+        "delta": delta,
+    }
