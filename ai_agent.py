@@ -5982,3 +5982,160 @@ def generate_macro_insight(stats: dict, api_key: str = "") -> str:
 
     logger.info("宏观洞察生成成功（月份=%s，字数=%d）", month_label, len(content))
     return content
+
+
+# ===========================================================================
+# 债务协商话术（deepseek-chat）
+# ---------------------------------------------------------------------------
+# 输入：平台 / 欠款金额 / 还款日 / 困难原因（可选）。
+# 输出：一段可以直接发给平台客服的中文协商话术（150~300 字）。
+# 边界：
+#   · 只做「话术生成」，不提供法律意见、不承诺任何平台政策；
+#   · 没有 api_key / 参数非法时**一个请求都不发**；
+#   · 日志只记平台与字数，绝不记欠款明细或 api_key。
+# ===========================================================================
+
+NEGOTIATION_SYSTEM_PROMPT = """你是一个帮助大学生和平台客服沟通的助手。请根据用户提供的平台、欠款金额、还款日和困难原因，写一段可以直接复制发给客服的协商话术。
+要求：
+1. 150~300 字，口语、礼貌、不卑不亢；先说明当前困难，再明确表达还款意愿，最后提出具体可执行的方案（例如申请延期 15 天、或分 2~3 期还）。
+2. 不要编造平台政策、不要引用法律条文、不要承诺“一定不影响征信”；只请求客服“帮忙登记/申请”。
+3. 不要提 AI、不要出现“根据您的数据”等字样；只输出话术正文，不要标题、不要分点、不要解释。
+"""
+NEGOTIATION_MODEL = "deepseek-chat"
+NEGOTIATION_TEMPERATURE = 0.7
+NEGOTIATION_MAX_TOKENS = 500
+NEGOTIATION_TIMEOUT = 20
+NEGOTIATION_MAX_CHARS = 600
+NEGOTIATION_MIN_CHARS = 30
+
+
+class NegotiationScriptError(Exception):
+    """协商话术生成失败。
+
+    code 取值：
+      no_api_key     未配置 DeepSeek API Key（**未发请求**）
+      invalid_input  平台/金额/日期非法（**未发请求**）
+      network        网络异常（超时 / 连接失败 / 其它请求层异常）
+      http           接口返回非 200（message 只带状态码，不带响应体）
+      parse          响应不是合法 JSON / content 缺失、为空或过短
+
+    message 为面向用户的中文提示，可直接展示。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"NegotiationScriptError(code={self.code!r}, message={self.message!r})"
+
+
+def _negotiation_amount(value) -> float:
+    """金额校验：有限正数；非法抛 ValueError。"""
+    if isinstance(value, bool):
+        raise ValueError("金额必须是数字")
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"金额必须是数字：{value!r}") from None
+    if not math.isfinite(amount) or amount <= 0:
+        raise ValueError("金额必须大于 0")
+    return round(amount, 2)
+
+
+def _negotiation_due_date(value) -> str:
+    """还款日校验：ISO 字符串或 date；统一返回 YYYY-MM-DD。"""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    text = str(value or "").strip()
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        raise ValueError(f"还款日必须是 YYYY-MM-DD：{value!r}") from None
+
+
+def generate_negotiation_script(platform, amount, due_date, reason="", api_key="") -> str:
+    """生成一段给平台客服的延期/分期协商话术；失败抛 NegotiationScriptError。"""
+    platform_text = str(platform or "").strip()
+    if not platform_text:
+        raise NegotiationScriptError("invalid_input", "请先选择要协商的平台")
+    if len(platform_text) > 50:
+        raise NegotiationScriptError("invalid_input", "平台名过长，请重新选择")
+    try:
+        amount_value = _negotiation_amount(amount)
+        due_text = _negotiation_due_date(due_date)
+    except ValueError as exc:
+        raise NegotiationScriptError("invalid_input", str(exc)) from None
+
+    key = (api_key or "").strip()
+    if not key:
+        raise NegotiationScriptError(
+            "no_api_key", "未配置 DeepSeek API Key，协商话术暂不可用"
+        )
+
+    reason_text = str(reason or "").strip()[:200]
+    user_content = (
+        f"平台：{platform_text}\n"
+        f"欠款金额：{amount_value:.2f} 元\n"
+        f"还款日：{due_text}\n"
+        f"困难原因：{reason_text or '本月生活费紧张，暂时凑不齐全额'}"
+    )
+    payload = {
+        "model": NEGOTIATION_MODEL,
+        "messages": [
+            {"role": "system", "content": NEGOTIATION_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": NEGOTIATION_TEMPERATURE,
+        "max_tokens": NEGOTIATION_MAX_TOKENS,
+    }
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.post(
+            DEEPSEEK_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=NEGOTIATION_TIMEOUT,
+        )
+    except requests.Timeout:
+        logger.warning("协商话术请求超时（平台=%s）", platform_text)
+        raise NegotiationScriptError("network", "生成协商话术超时，请稍后再试") from None
+    except requests.ConnectionError:
+        logger.warning("协商话术请求连接失败（平台=%s）", platform_text)
+        raise NegotiationScriptError("network", "网络连接失败，请检查网络") from None
+    except requests.RequestException as exc:
+        logger.warning(
+            "协商话术请求失败（平台=%s，异常=%s）", platform_text, type(exc).__name__
+        )
+        raise NegotiationScriptError("network", "网络连接失败，请检查网络") from None
+
+    if resp.status_code != 200:
+        logger.warning("协商话术接口返回 HTTP %s（平台=%s）", resp.status_code, platform_text)
+        raise NegotiationScriptError(
+            "http", f"AI 服务返回异常（HTTP {resp.status_code}），请稍后重试"
+        )
+    try:
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+    except (ValueError, TypeError, KeyError, IndexError):
+        logger.warning("协商话术响应结构不符合预期（平台=%s）", platform_text)
+        raise NegotiationScriptError("parse", "AI 没有返回有效话术，请重试") from None
+    if not isinstance(content, str) or not content.strip():
+        logger.warning("协商话术响应 content 为空（平台=%s）", platform_text)
+        raise NegotiationScriptError("parse", "AI 没有返回有效话术，请重试")
+
+    content = content.strip().strip('"“”')
+    if len(content) > NEGOTIATION_MAX_CHARS:
+        content = content[:NEGOTIATION_MAX_CHARS] + "…"
+    if len(content) < NEGOTIATION_MIN_CHARS:
+        logger.warning("协商话术过短（平台=%s，字数=%d）", platform_text, len(content))
+        raise NegotiationScriptError("parse", "AI 返回的话术过短，请重试")
+    logger.info("协商话术生成成功（平台=%s，字数=%d）", platform_text, len(content))
+    return content

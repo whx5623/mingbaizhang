@@ -3887,6 +3887,252 @@ with tab_dash:
             print(f"[debt] 还款预测失败：{type(_debt_exc).__name__}: {_debt_exc}")
             st.caption("还款预测暂不可用")
 
+        # ===== 💳 负债台账 + 还款作战日历（023_debts）=====
+        # 数据由用户主动录入（平台/欠款/还款日/利率），排期由 db.plan_repayment 纯函数完成：
+        # 表未执行迁移、录入非法、排期异常都只降级成提示，绝不红屏。
+        st.markdown("#### 💳 还款作战日历")
+        st.caption(
+            "录入花呗/白条/信用卡的欠款与还款日：资金不够时，"
+            "按「到期日近的优先、同一天利率高的优先」排出还款顺序"
+        )
+
+        if not db.debts_available():
+            st.info("负债台账未启用：请先执行 migrations/023_debts.sql")
+        else:
+            _debt_uid = st.session_state.user_id
+            _debt_rows = db.list_debts(_debt_uid)
+
+            with st.expander("📋 管理负债台账", expanded=not _debt_rows):
+                with st.form("debt_add_form", clear_on_submit=True):
+                    _df_col1, _df_col2, _df_col3 = st.columns(3)
+                    with _df_col1:
+                        _debt_platform_input = st.selectbox(
+                            "平台", list(db.DEBT_PLATFORM_OPTIONS)
+                        )
+                        _debt_platform_other = st.text_input(
+                            "平台名（选择「其他」时填写）", max_chars=50
+                        )
+                    with _df_col2:
+                        _debt_amount_input = st.number_input(
+                            "欠款金额（元）", min_value=0.0, step=100.0, format="%.2f"
+                        )
+                        _debt_apr_input = st.number_input(
+                            "年化利率（%）",
+                            min_value=0.0,
+                            max_value=100.0,
+                            step=0.25,
+                            format="%.2f",
+                            help="信用卡循环利息约 18.25%；免息填 0",
+                        )
+                    with _df_col3:
+                        _debt_due_input = st.date_input(
+                            "下次还款日", value=date.today() + timedelta(days=7)
+                        )
+                        _debt_note_input = st.text_input("备注（可选）", max_chars=100)
+                    _debt_added = st.form_submit_button("加入台账")
+
+                if _debt_added:
+                    try:
+                        _debt_platform_value = (
+                            _debt_platform_other.strip()
+                            if _debt_platform_input == "其他"
+                            else _debt_platform_input
+                        )
+                        db.add_debt(
+                            _debt_uid,
+                            _debt_platform_value,
+                            float(_debt_amount_input),
+                            _debt_due_input.strftime("%Y-%m-%d"),
+                            apr=float(_debt_apr_input),
+                            note=_debt_note_input,
+                        )
+                        st.session_state["flash"] = {
+                            "level": "success",
+                            "msg": f"已加入台账：{_debt_platform_value} ¥{_debt_amount_input:.2f}",
+                        }
+                        st.rerun()
+                    except Exception as _debt_add_exc:
+                        st.error(f"加入台账失败：{_debt_add_exc}")
+
+                if _debt_rows:
+                    st.dataframe(
+                        [
+                            {
+                                "平台": _d["platform"],
+                                "欠款（元）": _d["amount"],
+                                "还款日": _d["due_date"],
+                                "年化利率（%）": _d["apr"],
+                                "备注": _d["note"],
+                            }
+                            for _d in _debt_rows
+                        ],
+                        use_container_width=True,
+                    )
+                    _debt_delete_labels = [
+                        f"#{_d['id']} {_d['platform']} ¥{_d['amount']:.2f}（{_d['due_date']}）"
+                        for _d in _debt_rows
+                    ]
+                    _debt_delete_choice = st.selectbox(
+                        "删除一条记录", _debt_delete_labels, key="debt_delete_pick"
+                    )
+                    if st.button("删除所选记录", key="debt_delete_btn"):
+                        _debt_delete_id = _debt_rows[
+                            _debt_delete_labels.index(_debt_delete_choice)
+                        ]["id"]
+                        try:
+                            db.delete_debt(_debt_uid, _debt_delete_id)
+                            st.session_state["flash"] = {
+                                "level": "success",
+                                "msg": "负债记录已删除",
+                            }
+                            st.rerun()
+                        except Exception as _debt_del_exc:
+                            st.error(f"删除失败：{_debt_del_exc}")
+
+            if not _debt_rows:
+                st.caption("还没有负债记录：在上面「管理负债台账」里加一笔，日历就会开始排期")
+            else:
+                try:
+                    _debt_today_fn = getattr(db, "_report_today", None)
+                    _debt_today = _debt_today_fn() if callable(_debt_today_fn) else date.today()
+                except Exception:
+                    _debt_today = date.today()
+
+                _debt_funds = st.number_input(
+                    "本月可用于还款的资金（元）",
+                    min_value=0.0,
+                    value=float(max(0.0, balance)),
+                    step=100.0,
+                    format="%.2f",
+                    key="debt_repay_funds",
+                    help="默认取当前结余；可以改成你本月真正拿得出来的钱",
+                )
+                _repay_plan = db.get_repayment_plan(
+                    _debt_uid, _debt_funds, today=_debt_today
+                )
+                _plan_items = _repay_plan.get("items") or []
+
+                _pm1, _pm2, _pm3, _pm4 = st.columns(4)
+                _pm1.metric("负债合计", f"¥{_repay_plan['total_debt']:,.2f}")
+                _pm2.metric("本月到期", f"¥{_repay_plan['due_soon']:,.2f}")
+                _pm3.metric("本月缺口", f"¥{_repay_plan['shortfall']:,.2f}")
+                _pm4.metric("逾期笔数", f"{_repay_plan['overdue_count']} 笔")
+
+                # 按还款日分组：每天一组「日期 + 剩余天数」+ 当日各笔的优先级卡片
+                _debt_groups = {}
+                for _plan_item in _plan_items:
+                    _debt_groups.setdefault(_plan_item["due_date"], []).append(_plan_item)
+                for _due_day, _day_items in _debt_groups.items():
+                    try:
+                        _days_left = (
+                            datetime.strptime(_due_day, "%Y-%m-%d").date() - _debt_today
+                        ).days
+                    except ValueError:
+                        _days_left = 0
+                    if _days_left < 0:
+                        _day_label = f"{_due_day} · 已逾期 {-_days_left} 天"
+                    elif _days_left == 0:
+                        _day_label = f"{_due_day} · 今天到期"
+                    else:
+                        _day_label = f"{_due_day} · {_days_left} 天后"
+                    st.markdown(f"**📅 {_day_label}**")
+                    for _plan_item in _day_items:
+                        with st.container(border=True):
+                            _pc1, _pc2, _pc3 = st.columns([2.6, 1.4, 1.6])
+                            _pc1.markdown(
+                                f"**#{_plan_item['priority']} {_plan_item['platform']}** · "
+                                f"{_plan_item['status']} · 年化 {_plan_item['apr']:.2f}%"
+                            )
+                            _pc2.markdown(f"欠款 **¥{_plan_item['amount']:,.2f}**")
+                            _pc3.markdown(
+                                f"建议还 **¥{_plan_item['suggested']:,.2f}**"
+                                + (
+                                    f" · 缺口 ¥{_plan_item['remaining']:,.2f}"
+                                    if _plan_item["remaining"] > 0
+                                    else " · 可结清"
+                                )
+                            )
+
+                if _repay_plan["overdue_count"]:
+                    st.error(
+                        f"已有 {_repay_plan['overdue_count']} 笔逾期"
+                        f"（合计 ¥{_repay_plan['overdue_total']:,.2f}）：先处理它们，别等催收。"
+                    )
+                if _repay_plan["shortfall"] > 0:
+                    st.warning(
+                        f"本月资金缺口 ¥{_repay_plan['shortfall']:,.2f}："
+                        "按上面的顺序还，先把到期最近的补上，能最大程度避免逾期上征信。"
+                    )
+                else:
+                    st.success("按当前资金，本月到期负债可以全部覆盖。")
+
+                # ---- AI 协商话术：只生成文案，不替用户做任何承诺 ----
+                st.markdown("#### 🤝 还不上了？让 AI 帮你跟客服协商")
+                _neg_items = [
+                    _item for _item in _plan_items if _item["remaining"] > 0
+                ] or _plan_items
+                _neg_labels = [
+                    f"{_item['platform']} · 欠 ¥{_item['amount']:.0f} · {_item['due_date']}"
+                    for _item in _neg_items
+                ]
+                _neg_choice = st.selectbox(
+                    "要协商哪一笔", _neg_labels, key="debt_neg_pick"
+                )
+                _neg_reason = st.text_input(
+                    "困难原因（可选）",
+                    key="debt_neg_reason",
+                    placeholder="如：生活费没到账 / 生病",
+                )
+                if st.button("生成协商话术", key="debt_neg_btn"):
+                    if st.session_state.get("ai_daily_count", 0) >= 20:
+                        st.warning("今日免费额度已用完，请明天再来")
+                    else:
+                        try:
+                            from ai_agent import (
+                                NegotiationScriptError,
+                                generate_negotiation_script,
+                            )
+                        except ImportError as _neg_import_exc:
+                            print(
+                                f"[debt] 协商话术模块不可用："
+                                f"{type(_neg_import_exc).__name__}: {_neg_import_exc}"
+                            )
+                            st.info("协商话术暂不可用，请稍后再试")
+                        else:
+                            _neg_target = _neg_items[_neg_labels.index(_neg_choice)]
+                            try:
+                                with st.spinner("AI 正在写协商话术…"):
+                                    _neg_text = generate_negotiation_script(
+                                        _neg_target["platform"],
+                                        _neg_target["amount"],
+                                        _neg_target["due_date"],
+                                        reason=_neg_reason,
+                                        api_key=get_deepseek_api_key(),
+                                    )
+                            except NegotiationScriptError as _neg_err:
+                                st.error(_neg_err.message)
+                                # 只有真正发起过请求（非 no_api_key / invalid_input）才计一次额度
+                                if getattr(_neg_err, "code", "") not in (
+                                    "no_api_key",
+                                    "invalid_input",
+                                ):
+                                    st.session_state.ai_daily_count += 1
+                            except Exception as _neg_exc:
+                                print(
+                                    f"[debt] 协商话术生成失败："
+                                    f"{type(_neg_exc).__name__}: {_neg_exc}"
+                                )
+                                st.error("生成失败，请稍后再试")
+                                st.session_state.ai_daily_count += 1
+                            else:
+                                st.session_state.ai_daily_count += 1
+                                st.session_state["debt_neg_script"] = _neg_text
+                _neg_script = st.session_state.get("debt_neg_script")
+                if _neg_script:
+                    st.markdown("**发给客服的话术（可直接复制）**")
+                    st.code(_neg_script, language=None)
+                    st.caption("话术只表达困难与还款意愿；平台是否同意延期以客服答复为准。")
+
     with st.expander("💼 资产与同龄人对比", expanded=False):
         # ===== 🧺 断舍离集市：高危闲置资产的「回血」清单 =====
         # db.get_idle_assets / ai_agent.generate_xianyu_copy 由并行方提供：

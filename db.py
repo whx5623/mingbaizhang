@@ -8584,3 +8584,340 @@ def get_macro_stats(user_id=None, month=None, today=None) -> dict:
         "me": me,
         "delta": delta,
     }
+
+
+# ===========================================================================
+# 负债台账 + 还款优先级排期（023_debts）
+# ---------------------------------------------------------------------------
+# 产品语义：「AI 债务重组与还款优先级规划器」。
+#   · 台账（debts 表）由用户录入：平台 / 欠款 / 还款日 / 年化利率；
+#   · 排期是纯函数：资金不足时按「到期日近的优先 → 同一天利率高的优先」分配，
+#     输出每笔的建议还款额与缺口，前端据此画「还款作战日历」；
+#   · 所有读接口对「023 未执行」宽容：返回空列表，页面只提示迁移，不红屏；
+#   · 写接口只在表存在时可用，表缺失抛 RuntimeError（前端转成迁移提示）。
+# ===========================================================================
+
+DEBT_PLATFORM_OPTIONS = (
+    "花呗",
+    "白条",
+    "信用卡",
+    "借呗",
+    "京东金条",
+    "美团月付",
+    "其他",
+)
+DEBT_AMOUNT_MAX = 1_000_000.0   # 单笔上限 100 万：超过多半是误输入（如把分当元）
+DEBT_APR_MAX = 100.0            # 年化 100% 以上不接受：不是负债是诈骗
+_DEBTS_TABLE_SUPPORT = None     # None=未探测；True/False=探测结果（只缓存成功结果）
+
+
+def _debts_table_supported():
+    """探测 public.debts 是否存在（023 是否已执行），结果进程内缓存。
+
+    与 _bills_sub_tags_supported 同一套取舍：探测失败不缓存、返回 False；
+    读接口据此返回空列表，写接口据此抛中文 RuntimeError。
+    """
+    global _DEBTS_TABLE_SUPPORT
+    if _DEBTS_TABLE_SUPPORT is not None:
+        return _DEBTS_TABLE_SUPPORT
+    if engine is None:
+        try:
+            init_db()
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "[db] 探测 debts 表前初始化数据库失败，本次按「无负债台账」处理",
+                exc_info=True,
+            )
+            return False
+    try:
+        with engine.connect() as conn:
+            exists = bool(conn.execute(text("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                      AND table_name = 'debts'
+                )
+            """)).scalar())
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "[db] 探测 debts 表失败，本次按「无负债台账」处理", exc_info=True
+        )
+        return False
+    _DEBTS_TABLE_SUPPORT = exists
+    if not exists:
+        logging.getLogger(__name__).warning(
+            "[db] debts 表不存在（migrations/023_debts.sql 未执行）："
+            "负债台账与还款作战日历将不可用，请执行 023 迁移后重启应用"
+        )
+    return exists
+
+
+def debts_available() -> bool:
+    """公开的可用性判断：前端据此决定「显示台账」还是「提示执行 023」。"""
+    return bool(_debts_table_supported())
+
+
+def _normalize_debt_amount(value) -> float:
+    """欠款金额收敛：有限正数、最多两位小数、上限 DEBT_AMOUNT_MAX；非法抛 ValueError。"""
+    if isinstance(value, bool):
+        raise ValueError("欠款金额必须是数字")
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"欠款金额必须是数字：{value!r}") from None
+    if not math.isfinite(amount) or amount <= 0:
+        raise ValueError("欠款金额必须大于 0")
+    if amount > DEBT_AMOUNT_MAX:
+        raise ValueError(f"单笔欠款不能超过 {DEBT_AMOUNT_MAX:,.0f} 元，请确认单位是「元」")
+    return round(amount, 2)
+
+
+def _normalize_debt_apr(value) -> float:
+    """年化利率收敛到 0~DEBT_APR_MAX（百分数）；空值按 0（免息/未知）。"""
+    if value is None or value == "":
+        return 0.0
+    if isinstance(value, bool):
+        raise ValueError("年化利率必须是数字")
+    try:
+        apr = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"年化利率必须是数字：{value!r}") from None
+    if not math.isfinite(apr) or apr < 0 or apr > DEBT_APR_MAX:
+        raise ValueError(f"年化利率必须在 0~{DEBT_APR_MAX:g}% 之间")
+    return round(apr, 2)
+
+
+def _normalize_debt_due_date(value) -> date:
+    """还款日收敛成 date：接受 date/datetime/ISO 字符串；非法抛 ValueError。"""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.strptime(value.strip(), "%Y-%m-%d").date()
+        except ValueError:
+            raise ValueError(f"还款日必须是 YYYY-MM-DD：{value!r}") from None
+    raise ValueError(f"还款日必须是日期：{value!r}")
+
+
+def _normalize_debt_platform(value) -> str:
+    """平台名：去空白、1~50 字；空值抛 ValueError。"""
+    platform = str(value or "").strip()
+    if not platform:
+        raise ValueError("平台名不能为空")
+    if len(platform) > 50:
+        raise ValueError("平台名不能超过 50 个字")
+    return platform
+
+
+def list_debts(user_id) -> list:
+    """读取某用户的负债台账（按还款日、id 升序）；表不存在 / 读库失败返回 []。
+
+    返回项：{id, platform, amount, due_date(ISO), apr, note}
+    """
+    if not _debts_table_supported():
+        return []
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT id, platform, amount, due_date, apr, note
+                    FROM debts
+                    WHERE user_id = :uid
+                    ORDER BY due_date ASC, id ASC
+                """),
+                {"uid": uid},
+            ).mappings().all()
+    except Exception as exc:
+        print(f"[db] 读取负债台账失败：{type(exc).__name__}: {exc}")
+        return []
+
+    debts = []
+    for row in rows:
+        try:
+            due = row["due_date"]
+            if isinstance(due, datetime):
+                due = due.date()
+            elif isinstance(due, str):
+                due = datetime.strptime(due.strip(), "%Y-%m-%d").date()
+            debts.append({
+                "id": int(row["id"]),
+                "platform": str(row["platform"] or "").strip() or "未知平台",
+                "amount": round(float(row["amount"] or 0), 2),
+                "due_date": due.isoformat(),
+                "apr": round(float(row["apr"] or 0), 2),
+                "note": str(row["note"] or "").strip(),
+            })
+        except Exception:
+            # 单行脏数据只跳过自己：台账是只读展示，不能因为一行坏数据整块消失
+            continue
+    return debts
+
+
+def add_debt(user_id, platform, amount, due_date, apr=0.0, note="") -> dict:
+    """新增一笔负债，返回入库后的 dict；参数非法抛 ValueError，表不存在抛 RuntimeError。"""
+    if not _debts_table_supported():
+        raise RuntimeError("负债台账未启用：请先执行 migrations/023_debts.sql")
+    uid = int(user_id)
+    platform_value = _normalize_debt_platform(platform)
+    amount_value = _normalize_debt_amount(amount)
+    due_value = _normalize_debt_due_date(due_date)
+    apr_value = _normalize_debt_apr(apr)
+    note_value = str(note or "").strip()[:200] or None
+    with engine.connect() as conn:
+        new_id = conn.execute(
+            text("""
+                INSERT INTO debts(user_id, platform, amount, due_date, apr, note)
+                VALUES (:uid, :platform, :amount, :due, :apr, :note)
+                RETURNING id
+            """),
+            {
+                "uid": uid,
+                "platform": platform_value,
+                "amount": amount_value,
+                "due": due_value,
+                "apr": apr_value,
+                "note": note_value,
+            },
+        ).scalar()
+        conn.commit()
+    return {
+        "id": int(new_id),
+        "platform": platform_value,
+        "amount": amount_value,
+        "due_date": due_value.isoformat(),
+        "apr": apr_value,
+        "note": note_value or "",
+    }
+
+
+def delete_debt(user_id, debt_id) -> bool:
+    """删除某用户名下的一笔负债；不存在 / 不属于该用户返回 False（幂等）。"""
+    if not _debts_table_supported():
+        raise RuntimeError("负债台账未启用：请先执行 migrations/023_debts.sql")
+    uid = int(user_id)
+    did = int(debt_id)
+    with engine.connect() as conn:
+        deleted = conn.execute(
+            text("DELETE FROM debts WHERE id = :did AND user_id = :uid"),
+            {"did": did, "uid": uid},
+        ).rowcount
+        conn.commit()
+    return bool(deleted)
+
+
+def _debt_month_end(day: date) -> date:
+    """所在自然月的最后一天（不依赖 calendar 模块，避免闰年/大小月手写错）。"""
+    return (day.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+
+
+def plan_repayment(debts, available_funds, today=None) -> dict:
+    """还款优先级排期（纯函数，不读库）。
+
+    排序规则（从左到右的强优先级）：
+      1. due_date 升序 —— 还款日越近越先还，逾期的自然排最前（避免上征信）；
+      2. 同一天 apr 降序 —— 利息高的先还，少付利息；
+      3. platform 升序 —— 纯为结果稳定（同日同利率不随机）。
+    资金分配：按上述顺序依次「能还多少还多少」，直到 available_funds 用完；
+    没分到钱的账单 remaining 不为 0，并由调用方汇总成资金缺口。
+
+    返回：
+      {today, available, total_debt, due_soon, shortfall, overdue_count,
+       overdue_total, covered_total, items:[...]}
+    每项含：id/platform/amount/due_date/apr/days_left/overdue/urgent/
+             priority/suggested/remaining/status。
+    """
+    today_value = _normalize_debt_due_date(today) if today is not None else _report_today()
+    try:
+        available = float(available_funds)
+    except (TypeError, ValueError):
+        available = 0.0
+    if not math.isfinite(available) or available < 0:
+        available = 0.0
+    available = round(available, 2)
+    month_end = _debt_month_end(today_value)
+
+    items = []
+    for raw in debts or []:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            amount = round(float(raw.get("amount") or 0), 2)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(amount) or amount <= 0:
+            continue
+        try:
+            due = _normalize_debt_due_date(raw.get("due_date"))
+        except ValueError:
+            continue
+        try:
+            apr = float(raw.get("apr") or 0)
+        except (TypeError, ValueError):
+            apr = 0.0
+        if not math.isfinite(apr) or apr < 0:
+            apr = 0.0
+        items.append({
+            "id": raw.get("id"),
+            "platform": str(raw.get("platform") or "").strip() or "未知平台",
+            "amount": amount,
+            "due_date": due.isoformat(),
+            "_due": due,
+            "apr": round(apr, 2),
+            "days_left": (due - today_value).days,
+        })
+
+    items.sort(key=lambda item: (item["_due"], -item["apr"], item["platform"]))
+
+    remaining_funds = available
+    overdue_items = []
+    for priority, item in enumerate(items, 1):
+        due = item.pop("_due")
+        days_left = item["days_left"]
+        overdue = due < today_value
+        alloc = min(item["amount"], max(0.0, remaining_funds))
+        remaining_funds = round(remaining_funds - alloc, 2)
+        item["overdue"] = overdue
+        item["urgent"] = (not overdue) and days_left <= 3
+        item["priority"] = priority
+        item["suggested"] = round(alloc, 2)
+        item["remaining"] = round(item["amount"] - alloc, 2)
+        if overdue:
+            item["status"] = f"已逾期 {abs(days_left)} 天"
+            overdue_items.append(item)
+        elif days_left == 0:
+            item["status"] = "今天到期"
+        elif days_left <= 3:
+            item["status"] = f"{days_left} 天后到期"
+        else:
+            item["status"] = f"{days_left} 天后到期"
+
+    total_debt = round(sum(item["amount"] for item in items), 2)
+    # 本月到期：due_date 是 ISO 字符串，字典序即日期序；含已逾期（<= 月末）
+    due_soon = round(
+        sum(item["amount"] for item in items if item["due_date"] <= month_end.isoformat()),
+        2,
+    )
+    overdue_total = round(sum(item["amount"] for item in overdue_items), 2)
+    covered = round(sum(item["suggested"] for item in items), 2)
+    return {
+        "today": today_value.isoformat(),
+        "available": available,
+        "total_debt": total_debt,
+        "due_soon": due_soon,
+        "shortfall": round(max(0.0, due_soon - available), 2),
+        "overdue_count": len(overdue_items),
+        "overdue_total": overdue_total,
+        "covered_total": covered,
+        "items": items,
+    }
+
+
+def get_repayment_plan(user_id, available_funds, today=None) -> dict:
+    """读台账 + 排期；表不存在时返回空计划（页面提示执行 023，而不是红屏）。"""
+    return plan_repayment(list_debts(user_id), available_funds, today=today)
