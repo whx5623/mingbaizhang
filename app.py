@@ -2403,6 +2403,68 @@ with tab_dash:
                     print(f"[chart] 玫瑰图渲染失败：{type(_rose_exc).__name__}: {_rose_exc}")
                     st.warning("玫瑰图暂时无法渲染，请刷新页面重试")
 
+        # 场景词云（022）：本月支出按副标签汇总，字号 = 金额（面积感知，避免巨额标签压扁其他词）
+        st.subheader("场景词云")
+        st.caption(
+            "本月支出按副标签汇总：字号越大，说明这类场景花得越多；"
+            "一笔钱可以同时计入多个场景，所以各标签合计会大于总支出"
+        )
+        if "sub_tags" not in df_current_month.columns:
+            st.info("副标签功能未启用：请先执行 migrations/022_bills_sub_tags.sql")
+        else:
+            _tag_rows = db.aggregate_sub_tag_spending(month_exp_df, limit=14)
+            if not _tag_rows:
+                st.caption("本月还没有带副标签的支出；记账时选几个场景标签，这里就会长出来")
+            else:
+                _tag_max = _tag_rows[0][1] or 1.0
+                _tag_palette = ["#1f4e79", "#2e6da4", "#3f8fbf", "#5aa9c9", "#7bc4b8"]
+                _tag_nodes = []
+                for _tag_idx, (_tag_name, _tag_amount) in enumerate(_tag_rows):
+                    # 面积感知：金额翻 4 倍，字号才翻倍 → 头部标签够醒目，长尾也不至于看不见
+                    _font_size = int(12 + 20 * math.sqrt(max(_tag_amount, 0.0) / _tag_max))
+                    _tag_nodes.append({
+                        "name": _tag_name,
+                        "value": round(float(_tag_amount), 2),
+                        "symbolSize": 1,          # 只留文字：graph 的节点圆点设为 1px
+                        "label": {
+                            "fontSize": _font_size,
+                            "fontWeight": 700 if _tag_idx < 3 else 500,
+                            "color": _tag_palette[min(_tag_idx // 3, len(_tag_palette) - 1)],
+                        },
+                    })
+                _tag_option = {
+                    "tooltip": {"trigger": "item", "formatter": "{b}<br/>本月支出：{c} 元"},
+                    "series": [{
+                        "type": "graph",
+                        "layout": "force",        # ECharts 核心内置力导向，不依赖 wordcloud 扩展
+                        "roam": False,
+                        "draggable": False,
+                        "left": "4%", "right": "4%", "top": 16, "bottom": 16,
+                        "force": {
+                            "repulsion": 180,
+                            "gravity": 0.08,
+                            "edgeLength": 24,
+                            "friction": 0.15,
+                        },
+                        "label": {"show": True, "position": "inside"},
+                        "itemStyle": {"opacity": 0},   # 隐藏节点圆点，只显示标签文字
+                        "labelLayout": {"hideOverlap": True},  # 落位后自动隐藏重叠文字
+                        "data": _tag_nodes,
+                        "links": [],
+                    }],
+                }
+                try:
+                    # 用容器包裹，避免父级 flex/样式异常时图表塌陷；异常只降级提示，不红屏
+                    with st.container():
+                        st_echarts(_tag_option, height="360px", key="sub_tag_wordcloud")
+                except Exception as _tag_exc:
+                    print(f"[chart] 场景词云渲染失败：{type(_tag_exc).__name__}: {_tag_exc}")
+                    st.warning("场景词云暂时无法渲染，请刷新页面重试")
+                _tag_top_text = " · ".join(
+                    f"{_tag_name} ¥{_tag_amount:.0f}" for _tag_name, _tag_amount in _tag_rows[:3]
+                )
+                st.caption(f"本月 Top 3 场景：{_tag_top_text}")
+
     with _dash_chart_tabs[1]:
         # ===== 消费日历热力图（本月 / 近三个月）=====
         # 数据由并行方 db.get_daily_expense_totals 提供（连续零填充的每日支出合计）：
@@ -7868,11 +7930,16 @@ with tab_ai:
             _income = float(bill_df.loc[bill_df["type"] == "收入", "amount"].sum())
         except (KeyError, TypeError, ValueError):
             pass
+        # 副标签在明细里是 list：给模型和聊天表格都转成 "人情 / 答谢"，避免出现 ['人情']
+        _view_df = bill_df
+        if "sub_tags" in _view_df.columns:
+            _view_df = _view_df.copy()
+            _view_df["sub_tags"] = _view_df["sub_tags"].map(_format_sub_tags_cell)
         _tool_text = (
             f"查询到 {len(bill_df)} 笔，支出合计 {_spend:.2f}，收入合计 {_income:.2f}\n"
-            f"{bill_df.head(20).to_string(index=False)}"
+            f"{_view_df.head(20).to_string(index=False)}"
         )
-        return _tool_text, bill_df.head(50).to_dict("records")
+        return _tool_text, _view_df.head(50).to_dict("records")
 
     def _build_delete_confirmation(func_args):
         """delete_bills tool call → 预览 + 写 pending_delete，返回给用户看的确认文案。
@@ -8063,8 +8130,13 @@ with tab_ai:
                                         payment_method,
                                         bill_type,
                                         mood=func_args.get("mood") or "",
+                                        sub_tags=func_args.get("sub_tags"),
                                     )
-                                    tool_result = f"已成功添加账单：日期{bill_date}，商户{merchant}，金额{amount}，类型{bill_type}"
+                                    _tag_note = ""
+                                    _chat_tags = db.normalize_sub_tags(func_args.get("sub_tags"))
+                                    if _chat_tags:
+                                        _tag_note = f"，副标签{'/'.join(_chat_tags)}"
+                                    tool_result = f"已成功添加账单：日期{bill_date}，商户{merchant}，金额{amount}，类型{bill_type}{_tag_note}"
                                     st.cache_data.clear()
                                 elif func_name == "get_summary":
                                     tool_result = f"用户财务汇总：总收入{total_income:.2f}，总支出{total_expense:.2f}，结余{balance:.2f}"
@@ -8079,6 +8151,7 @@ with tab_ai:
                                                 func_args.get("end_date"),
                                                 func_args.get("category"),
                                                 func_args.get("keyword"),
+                                                sub_tag=func_args.get("sub_tag"),
                                             )
                                     except ValueError as _query_err:
                                         # 参数非法：把中文原因交回模型解释，页面不红屏

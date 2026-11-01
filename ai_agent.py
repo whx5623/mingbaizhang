@@ -88,6 +88,7 @@ def build_system_prompt(total_income, total_expense, balance, recent_bills_text,
 3. 如果用户没说清日期区间，先追问清楚再调用工具，不要自行猜测。
 4. 不要在一次回复里同时调用 add_bill 和 delete_bills。
 5. 用户明确提到消费时的心情（emo/焦虑/开心/累/激动/压力大…）时，把对应情绪填进 add_bill 的 mood 字段（可选值：开心/Emo/焦虑/疲惫/激动）；没提就不要猜、不要编造。
+6. 用户描述消费场景（人情往来/答谢/考研/冲动消费/社交/通勤…）时，把 0~2 个场景词填进 add_bill 的 sub_tags 数组；只写场景，不要把商品名或分类重复一遍，拿不准就不填。查询时如果用户问的是某个场景（如“这月人情花了多少”），把该场景词填进 query_bills 的 sub_tag 字段。
 """
     return prompt
 
@@ -116,7 +117,12 @@ def get_ai_response(messages, api_key, zhipu_api_key, total_income, total_expens
                         "amount": {"type": "number", "description": "金额"},
                         "payment_method": {"type": "string", "description": "支付方式"},
                         "type": {"type": "string", "description": "收入/支出"},
-                        "mood": {"type": "string", "description": "消费时的情绪，可选值：开心/Emo/焦虑/疲惫/激动；只有用户明确提到心情时才填，没提就不填"}
+                        "mood": {"type": "string", "description": "消费时的情绪，可选值：开心/Emo/焦虑/疲惫/激动；只有用户明确提到心情时才填，没提就不填"},
+                        "sub_tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "消费场景副标签，0~2 个，如 人情/答谢/考研/冲动消费/社交；只写场景，不要重复分类或商品名，没提到就不填"
+                        }
                     },
                     "required": ["date", "merchant", "amount", "payment_method", "type"]
                 }
@@ -133,7 +139,8 @@ def get_ai_response(messages, api_key, zhipu_api_key, total_income, total_expens
                         "start_date": {"type": "string", "description": "开始日期，格式YYYY-MM-DD"},
                         "end_date": {"type": "string", "description": "结束日期，格式YYYY-MM-DD（含当天）"},
                         "category": {"type": "string", "description": "分类，可选，如 餐饮/奶茶咖啡/购物。不填表示不限分类"},
-                        "keyword": {"type": "string", "description": "商户或分类关键词，可选，如 食堂/咖啡。不填表示不限关键词"}
+                        "keyword": {"type": "string", "description": "商户或分类关键词，可选，如 食堂/咖啡。不填表示不限关键词"},
+                        "sub_tag": {"type": "string", "description": "副标签（消费场景），可选，如 人情/考研/冲动消费。不填表示不限场景"}
                     },
                     "required": ["start_date", "end_date"]
                 }

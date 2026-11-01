@@ -2442,6 +2442,50 @@ def _normalize_sub_tags_column(df):
     return df
 
 
+def aggregate_sub_tag_spending(bills_df, limit=None):
+    """按副标签展开支出金额，返回 [(标签, 合计)] 降序 —— 词云/场景榜的数据源。
+
+    - 只统计 **支出**（收入没有「场景」语义，把工资标签算进去会污染词云）；
+    - 一笔账单有多个副标签时，金额会分别计入每个标签（一笔钱可以同时属于多个场景，
+      这正是副标签相对主分类的价值）；所以各行之和可能大于总支出，这是口径而非 bug；
+    - 缺列 / 空表 / 脏值（None、NaN、非数字金额、负金额）一律跳过，**绝不抛异常**：
+      图表是只读展示，不能因为一条脏数据把整块页面打成异常；
+    - limit 用于「只取 Top N」，None 表示不截断。
+    """
+    if not isinstance(bills_df, pd.DataFrame) or bills_df.empty:
+        return []
+    if "sub_tags" not in bills_df.columns:
+        return []
+    try:
+        frame = bills_df
+        if "type" in frame.columns:
+            frame = frame[frame["type"] == "支出"]
+        totals = {}
+        if "amount" in frame.columns:
+            pairs = zip(frame["sub_tags"], frame["amount"])
+        else:
+            pairs = ((tags, 1.0) for tags in frame["sub_tags"])
+        for tags, amount in pairs:
+            try:
+                value = float(amount)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value) or value <= 0:
+                continue
+            for tag in normalize_sub_tags(tags):
+                totals[tag] = totals.get(tag, 0.0) + value
+        rows = sorted(totals.items(), key=lambda item: (-item[1], item[0]))
+        if limit is not None:
+            try:
+                rows = rows[: max(0, int(limit))]
+            except (TypeError, ValueError):
+                pass
+        return [(tag, round(total, 2)) for tag, total in rows]
+    except Exception as exc:  # 统计失败只降级成「暂无数据」，页面不红屏
+        print(f"[db] 副标签支出统计失败：{type(exc).__name__}: {exc}")
+        return []
+
+
 def _normalize_mood_months(months) -> int:
     """统计月数收敛到 1~24：非数字 / <=0 → 默认 3，>24 → 24。
 
