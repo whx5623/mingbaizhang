@@ -6010,10 +6010,10 @@ with tab_dash:
         if _valid_payments != list(_saved_payments):
             st.session_state["bill_payments"] = _valid_payments
     _saved_tags = st.session_state.get("bill_sub_tags")
-    if _bill_has_sub_tags and _saved_tags:
-        _valid_tags = [t for t in _saved_tags if t in _bill_tag_options]
-        if _valid_tags != list(_saved_tags):
-            st.session_state["bill_sub_tags"] = _valid_tags
+    # 注意：副标签多选开了 accept_new_options，用户可能输入一个尚未出现在选项里的标签；
+    # 这里**不能**按 options 裁剪，否则刚输入的搜索词会被下一轮 rerun 清掉。
+    if _saved_tags is not None and not isinstance(_saved_tags, list):
+        st.session_state["bill_sub_tags"] = []
 
     # ---- 已启用筛选条件数：按维度计数，用于自动展开 + 提示 ----
     def _bill_active_filter_count():
@@ -6029,6 +6029,8 @@ with tab_dash:
         if st.session_state.get("bill_payments"):
             _count += 1
         if st.session_state.get("bill_sub_tags"):
+            _count += 1
+        if str(st.session_state.get("bill_sub_tag_kw", "") or "").strip():
             _count += 1
         try:
             _min_amount = float(st.session_state.get("bill_amount_min", 0.0) or 0.0)
@@ -6089,6 +6091,7 @@ with tab_dash:
             "bill_categories",
             "bill_payments",
             "bill_sub_tags",
+            "bill_sub_tag_kw",
             "bill_amount_min",
             "bill_amount_max",
             "bill_sort",
@@ -6142,14 +6145,26 @@ with tab_dash:
 
         # 副标签：一笔账单可能同时有多个标签，任一命中即保留（OR 语义）。
         if _bill_has_sub_tags:
-            _bill_sub_tags = st.multiselect(
-                "副标签（任一命中）",
-                options=_bill_tag_options,
-                key="bill_sub_tags",
-                help="例：选「人情」只看人情往来；选「考研 + 冲动消费」看两类场景的并集",
-            )
+            _bill_tag_col, _bill_tag_kw_col = st.columns([1.4, 1])
+            with _bill_tag_col:
+                _bill_sub_tags = st.multiselect(
+                    "副标签（任一命中）",
+                    options=_bill_tag_options,
+                    key="bill_sub_tags",
+                    accept_new_options=True,
+                    help="例：选「人情」只看人情往来；选「考研 + 冲动消费」看两类场景的并集",
+                )
+            with _bill_tag_kw_col:
+                # 搜索兜底：标签太多不想翻、或想找一个还没出现在下拉里的标签时，直接输入子串
+                _bill_sub_tag_kw = st.text_input(
+                    "副标签搜索",
+                    key="bill_sub_tag_kw",
+                    placeholder="如：人情 / 考研",
+                    help="按子串模糊匹配副标签（与上面的多选取交集）",
+                )
         else:
             _bill_sub_tags = []
+            _bill_sub_tag_kw = ""
 
         _bill_amt_min_col, _bill_amt_max_col = st.columns(2)
         with _bill_amt_min_col:
@@ -6225,6 +6240,18 @@ with tab_dash:
         filtered = filtered[
             filtered["sub_tags"].map(
                 lambda tags: bool(set(db.normalize_sub_tags(tags)) & _wanted_tags)
+            )
+        ]
+
+    _bill_sub_tag_kw = str(_bill_sub_tag_kw or "").strip().lower()
+    if _bill_sub_tag_kw and "sub_tags" in filtered.columns:
+        # 关键词搜索：任一标签包含该子串即命中（大小写不敏感），与上面的多选取交集。
+        filtered = filtered[
+            filtered["sub_tags"].map(
+                lambda tags: any(
+                    _bill_sub_tag_kw in str(tag).lower()
+                    for tag in db.normalize_sub_tags(tags)
+                )
             )
         ]
 
