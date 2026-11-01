@@ -3,6 +3,16 @@ import pandas as pd
 from streamlit_echarts import st_echarts
 from datetime import datetime, date, timedelta, timezone
 from config import get_deepseek_api_key
+# 隐私脱敏模式（展示打码 + 发送前正则脱敏）：模块缺失时整体降级为「不脱敏」，
+# 绝不让页面因为一个展示增强而 import 失败。
+try:
+    import privacy as _privacy_mod
+except ImportError as _privacy_import_exc:
+    _privacy_mod = None
+    print(
+        f"[privacy] 隐私脱敏模块不可用："
+        f"{type(_privacy_import_exc).__name__}: {_privacy_import_exc}"
+    )
 try:
     from health_score import compute_health_score
 except ImportError as _health_import_exc:
@@ -1425,6 +1435,36 @@ def _mood_value_from_label(label):
     return core
 
 
+def _privacy_on() -> bool:
+    """隐私脱敏模式是否开启（答辩演示用，切换后本页立即生效）。"""
+    try:
+        return bool(st.session_state.get("privacy_mode", False))
+    except Exception:
+        return False
+
+
+def _mask_merchant(value) -> str:
+    """展示层商户名打码：关闭 / 模块缺失 / 异常时原样返回，绝不阻断渲染。"""
+    text = "" if value is None else str(value)
+    if not _privacy_on() or _privacy_mod is None:
+        return text
+    try:
+        return _privacy_mod.mask_merchant(text)
+    except Exception:
+        return text
+
+
+def _mask_sensitive(value) -> str:
+    """发送层敏感信息脱敏（手机号/证件/卡号/邮箱）：关闭或异常时原样返回。"""
+    text = "" if value is None else str(value)
+    if not _privacy_on() or _privacy_mod is None:
+        return text
+    try:
+        return _privacy_mod.mask_sensitive_text(text)
+    except Exception:
+        return text
+
+
 def _format_sub_tags_cell(value) -> str:
     """账单表格里的副标签展示：list → "人情 / 答谢"；空/脏值 → 空串。"""
     return " / ".join(db.normalize_sub_tags(value))
@@ -1631,6 +1671,25 @@ with st.sidebar:
         st.session_state.save_target = st.number_input("目标存款（元）", min_value=0.0, value=st.session_state.save_target, step=50.0)
         st.session_state.city_level = st.selectbox("所在城市", ["一线", "二线", "三线"], index=["一线", "二线", "三线"].index(st.session_state.city_level))
         st.divider()
+
+        # ===== 隐私脱敏模式（答辩演示：一键开关，展示与发送两层同时生效）=====
+        # 展示层：账单明细 / 商户名 / 图表标签打码；发送层：语音、聊天文本在离开本地前
+        # 先做正则脱敏。开关只改前端行为，数据库里始终是原文。
+        if "privacy_mode" not in st.session_state:
+            st.session_state.privacy_mode = False
+        st.toggle(
+            "🕶️ 隐私脱敏模式",
+            key="privacy_mode",
+            help=(
+                "开启后：账单明细与商户名自动打码（蜜雪冰城 → 蜜雪**）；"
+                "语音转写与聊天文本在发往 AI 前，本地替换手机号/证件号/卡号/邮箱。"
+                "原始数据仍完整保存在本地库。"
+            ),
+        )
+        if st.session_state.privacy_mode:
+            st.caption("已开启：商户名以星号展示，敏感号码不会原样发给 AI")
+        else:
+            st.caption("答辩演示：打开开关，账单明细里的商户名会立即打码")
 
         # ===== 负债率常驻预警（>30% 红色，侧边栏始终可见）=====
         # 数据来源：「算算分期有多贵？」最近一次试算的**每期还款额**（存在 inst_result 里）。
@@ -2324,7 +2383,8 @@ with tab_dash:
         pie_data = exp_df.groupby("merchant")["amount"].sum().reset_index()
         pie_list = []
         for _, row in pie_data.iterrows():
-            pie_list.append({"name": row["merchant"], "value": round(row["amount"],2)})
+            # 隐私模式：图表标签里的商户名同样打码
+            pie_list.append({"name": _mask_merchant(row["merchant"]), "value": round(row["amount"],2)})
         pie_option = {
             "title": {"text": "各商户支出占比", "left": "center"},
             "tooltip": {"trigger": "item", "formatter": "{b}<br/>金额：{c} 元"},
@@ -6551,6 +6611,9 @@ with tab_dash:
             df_display["category"] = _cat_series.where(_cat_series != "", "其他")
             if "sub_tags" in df_display.columns:
                 df_display["sub_tags"] = df_display["sub_tags"].map(_format_sub_tags_cell)
+            # 隐私模式：商户名打码（原始 DataFrame 不动，导出仍是原文）
+            if "merchant" in df_display.columns:
+                df_display["merchant"] = df_display["merchant"].map(_mask_merchant)
             st.dataframe(df_display, use_container_width=True)
         else:
             df_display = _bill_page_df[
@@ -6558,6 +6621,9 @@ with tab_dash:
             ].copy()
             if "sub_tags" in df_display.columns:
                 df_display["sub_tags"] = df_display["sub_tags"].map(_format_sub_tags_cell)
+            # 隐私模式：商户名打码（原始 DataFrame 不动，导出仍是原文）
+            if "merchant" in df_display.columns:
+                df_display["merchant"] = df_display["merchant"].map(_mask_merchant)
             st.caption("提示：执行 migrations/012 后这里会显示消费分类")
             st.dataframe(df_display, use_container_width=True)
 
@@ -7505,8 +7571,9 @@ with tab_tools:
                             st.session_state.ai_daily_count += 1
                             _voice_quota_charged = True
                             try:
+                                # 隐私模式：先把手机号/证件/卡号/邮箱在本地替换，再发给 AI
                                 _voice_bill = extract_bill_from_text(
-                                    _voice_text, get_deepseek_api_key()
+                                    _mask_sensitive(_voice_text), get_deepseek_api_key()
                                 )
                                 _add_bill_with_mood(
                                     st.session_state.user_id,
@@ -7522,7 +7589,7 @@ with tab_tools:
                                 _bill_code = getattr(_bill_err, "code", "")
                                 if _bill_code in ("invalid_bill", "parse"):
                                     st.info(
-                                        f"识别为「{_voice_text}」，"
+                                        f"识别为「{_mask_sensitive(_voice_text)}」，"
                                         f"但没提取到完整账单（{_bill_err}），建议手动补全"
                                     )
                                 elif _bill_code in ("network", "http"):
@@ -8085,6 +8152,8 @@ with tab_ai:
         key=f"screenshot_uploader_{st.session_state.user_id}",
     )
     st.caption("支持 png/jpg，单张 ≤5MB；识别后会自动记一笔")
+    if _privacy_on():
+        st.caption("🕶️ 隐私模式已开启：文字/语音会先本地脱敏，但截图原图仍需发给视觉模型识别，无法本地打码")
     if screenshot_file is not None:
         # 防重复提交：file_uploader 的值跨 rerun 保留，成功后的 st.rerun() 会让同一张图
         # 再跑一遍 → 重复记账。签名 = 用户ID + 图片内容哈希，同一张图只处理一次。
@@ -8208,6 +8277,10 @@ with tab_ai:
         if "sub_tags" in _view_df.columns:
             _view_df = _view_df.copy()
             _view_df["sub_tags"] = _view_df["sub_tags"].map(_format_sub_tags_cell)
+        # 隐私模式：聊天查询结果里的商户名同样打码（模型收到的 tool 文本也是打码后的）
+        if _privacy_on() and "merchant" in _view_df.columns:
+            _view_df = _view_df.copy()
+            _view_df["merchant"] = _view_df["merchant"].map(_mask_merchant)
         _tool_text = (
             f"查询到 {len(bill_df)} 笔，支出合计 {_spend:.2f}，收入合计 {_income:.2f}\n"
             f"{_view_df.head(20).to_string(index=False)}"
@@ -8365,10 +8438,24 @@ with tab_ai:
                     with st.sidebar:
                         st.info(f"今日剩余提问次数：{remaining}")
                     try:
-                        recent_5_bills = df.sort_values("date_parsed", ascending=False).head(5)
+                        recent_5_bills = df.sort_values("date_parsed", ascending=False).head(5).copy()
+                        # 隐私模式：最近账单里的商户名打码后再拼进 prompt
+                        if _privacy_on() and "merchant" in recent_5_bills.columns:
+                            recent_5_bills["merchant"] = recent_5_bills["merchant"].map(_mask_merchant)
                         recent_bills_text = recent_5_bills.to_string(index=False)
+                        # 隐私模式：整段聊天历史在离开本地前，先本地脱敏手机号/证件/卡号/邮箱
+                        _send_messages = st.session_state.chat_history
+                        if _privacy_on():
+                            _send_messages = [
+                                {
+                                    "role": _m.get("role"),
+                                    "content": _mask_sensitive(_m.get("content", "")),
+                                }
+                                for _m in st.session_state.chat_history
+                                if isinstance(_m, dict)
+                            ]
                         resp = get_ai_response(
-                            messages=st.session_state.chat_history,
+                            messages=_send_messages,
                             api_key=api_key,
                             zhipu_api_key=ZHIPU_API_KEY,
                             total_income=total_income,
