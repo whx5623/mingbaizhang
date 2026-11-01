@@ -208,6 +208,7 @@ JSON 必须包含以下字段（字段名不可改、不可少）：
   "amount": 0.00,             // 金额，必须是正数，不带货币符号、不加千分位、不做汇率换算
   "paid_at": "YYYY-MM-DD",    // 支付/消费日期；识别不到给空串 ""
   "type": "支出" 或 "收入",     // 退款/红包/入账/收益等为"收入"，其余为"支出"
+  "sub_tags": ["人情"],       // 副标签数组，0~2 个，见下文规则 7；没有就给 []
   "confidence": 0.0,          // 0~1 之间的整体置信度
   "reason": "一句话说明"        // 判断依据，或看不清的原因
 }
@@ -218,9 +219,70 @@ JSON 必须包含以下字段（字段名不可改、不可少）：
 3. 金额一律取正数（支出也不要给负数）；只取本单应付/实付金额，不要相加多张单，不要自行换算。
 4. 日期统一成 YYYY-MM-DD；图片里只有“今天/昨天”等相对描述、没有绝对日期时，给空串 ""，不要猜。
 5. 不要编造商户、金额、日期；不确定就留空，并降低 confidence。
-6. 输出必须能被 json.loads 直接解析：不要中文引号、不要尾随逗号、不要在数字里带单位。"""
+6. 输出必须能被 json.loads 直接解析：不要中文引号、不要尾随逗号、不要在数字里带单位。
+7. sub_tags 是「这笔钱的场景」，不是商品名，也不是主分类：例如给导师买礼物 → ["人情","答谢"]；
+   买考研真题 → ["考研","学习"]；半夜冲动下单 → ["冲动消费"]；请客聚餐 → ["社交"]。
+   最多 2 个，从这些常见场景里选（也可用同义短词）：人情、答谢、考研、冲动消费、学习、社交、
+   通勤、奖励自己、家庭、健康。拿不准就给 []，绝不为了凑数编造。"""
+
+SUB_TAG_PROMPT_GUIDE = (
+    "sub_tags 是「这笔钱的场景」（不是商品名、不是主分类），0~2 个。"
+    "常见：人情、答谢、考研、冲动消费、学习、社交、通勤、奖励自己、家庭、健康。"
+    "例：给导师买教师节礼物→[\"人情\",\"答谢\"]；买考研真题→[\"考研\",\"学习\"]；"
+    "半夜冲动下单→[\"冲动消费\"]；请朋友吃饭→[\"社交\"]。拿不准就给 []，不要编造。"
+)
 
 VISION_USER_PROMPT = "请从这张账单截图里提取信息，严格按要求的 JSON 输出。"
+
+
+# 副标签上限：模型偶尔会返回 5~6 个近义词（"人情/送礼/答谢/社交"），
+# 记账侧只想要「场景」，2~3 个足够；多出来的直接截断，不报错。
+SUB_TAG_AI_MAX_COUNT = 3
+SUB_TAG_AI_MAX_LEN = 12
+
+
+def _clean_sub_tags(value, max_count: int = SUB_TAG_AI_MAX_COUNT) -> list:
+    """把模型返回的 sub_tags 收敛成去重后的短列表；**绝不抛异常**。
+
+    模型可能给 list、JSON 字符串、单个字符串、None，甚至把对象塞进来；
+    副标签只是附加信息，解析失败就当"没识别出来"（[]），绝不能让整笔账单失败。
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except (ValueError, TypeError):
+            parsed = None
+        value = parsed if parsed is not None else re.split(r"[,，、;；|/]+", text)
+    if isinstance(value, dict):
+        # 模型本该给数组；给对象说明结构跑偏，宁可当作没识别，也不要把键名当标签。
+        return []
+    elif isinstance(value, (str, bytes)):
+        value = [value]
+    elif not isinstance(value, (list, tuple, set)):
+        value = [value]
+
+    tags = []
+    seen = set()
+    for item in value:
+        if item is None or isinstance(item, (list, tuple, set, dict)):
+            continue
+        text = str(item).strip().strip("[]\"'")
+        text = re.sub(r"\s+", "", text)
+        if not text:
+            continue
+        text = text[:SUB_TAG_AI_MAX_LEN]
+        if text in seen:
+            continue
+        seen.add(text)
+        tags.append(text)
+        if len(tags) >= max_count:
+            break
+    return tags
 
 
 class BillImageError(Exception):
@@ -594,6 +656,8 @@ def extract_bill_from_image(image_bytes: bytes, mime_type: str, zhipu_api_key: s
         "amount": round(float(amount), 2),
         "occurred_at": occurred_at,
         "bill_type": bill_type,
+        # 022：副标签由模型按场景推断；字段缺失/脏结构一律 []（不影响记账）
+        "sub_tags": _clean_sub_tags(data.get("sub_tags")),
         "confidence": round(confidence, 4),
         "raw": content,
     }
@@ -1659,7 +1723,9 @@ TEXT_BILL_TEMPERATURE = 0        # 抽取信息要可复现，不要发散
 TEXT_BILL_MAX_TOKENS = 200       # 一行 JSON 足够
 TEXT_BILL_TIMEOUT = 20
 
-TEXT_BILL_SYSTEM_PROMPT = """你是一个账单信息抽取器。请从用户的一句中文口述里抽取：商户/项目名称、金额（正数数字）、交易日期、收支类型。只输出一个 JSON 对象，不要任何解释。日期必须是 YYYY-MM-DD；如果用户说“今天/昨天/前天”，请按我给你的今天日期换算成绝对日期；如果完全没提日期，paid_at 给空串。金额取正数，不要说“元”。收入类（工资/红包/退款/收款）type 为“收入”，其余为“支出”。"""
+TEXT_BILL_SYSTEM_PROMPT = """你是一个账单信息抽取器。请从用户的一句中文口述里抽取：商户/项目名称、金额（正数数字）、交易日期、收支类型、副标签。只输出一个 JSON 对象，不要任何解释。日期必须是 YYYY-MM-DD；如果用户说“今天/昨天/前天”，请按我给你的今天日期换算成绝对日期；如果完全没提日期，paid_at 给空串。金额取正数，不要说“元”。收入类（工资/红包/退款/收款）type 为“收入”，其余为“支出”。
+字段：{"merchant": "商户", "amount": 0.00, "paid_at": "YYYY-MM-DD", "type": "支出", "sub_tags": ["人情"]}。
+""" + SUB_TAG_PROMPT_GUIDE
 
 
 class TextBillError(Exception):
@@ -1878,6 +1944,9 @@ def extract_bill_from_text(text: str, api_key: str = "") -> dict:
         "amount": round(float(amount), 2),
         "occurred_at": occurred_at,
         "bill_type": bill_type,
+        # 022：口述里常带场景（"给导师买礼物""考研资料"），模型能直接抽出来；
+        # 没提/脏结构一律 []，绝不让副标签影响这笔账能否记上。
+        "sub_tags": _clean_sub_tags(data.get("sub_tags")),
         "raw": content,
     }
 

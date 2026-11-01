@@ -1425,27 +1425,68 @@ def _mood_value_from_label(label):
     return core
 
 
-def _add_bill_with_mood(
-    user_id, bill_date, merchant, amount, payment_method, bill_type, mood=""
-):
-    """调用 db.add_bill 并透传 mood；并行期后端还不支持该参数时退回旧签名。
+def _format_sub_tags_cell(value) -> str:
+    """账单表格里的副标签展示：list → "人情 / 答谢"；空/脏值 → 空串。"""
+    return " / ".join(db.normalize_sub_tags(value))
 
-    mood 为空按旧签名调用（默认写 NULL）；后端最终会接受 mood 关键字，
+
+def _export_ready_frame(frame):
+    """导出前把 list 列拍平成可读文本（CSV 里不出现 Python 的 ['人情'] 字面量）。"""
+    out = frame.copy()
+    if "sub_tags" in out.columns:
+        out["sub_tags"] = out["sub_tags"].map(_format_sub_tags_cell)
+    return out
+
+
+def _add_bill_with_mood(
+    user_id,
+    bill_date,
+    merchant,
+    amount,
+    payment_method,
+    bill_type,
+    mood="",
+    sub_tags=None,
+):
+    """调用 db.add_bill 并透传 mood / sub_tags；后端暂不支持某个关键字时自动降级。
+
+    为什么要 inspect：线上可能处于「019/022 迁移未执行」或旧版 db.py 的中间态。
+    mood / sub_tags 都只是附加信息，后端不认时应该**照常记账**，而不是整笔失败。
     这里用 inspect 判断而不是 try/except TypeError，避免把「真 TypeError」误当成参数不支持。
     """
+    extra = {}
     if mood:
-        try:
-            params = inspect.signature(add_bill).parameters
-        except (TypeError, ValueError):
-            params = {}
-        supports_mood = "mood" in params or any(
-            getattr(param, "kind", None) is inspect.Parameter.VAR_KEYWORD
-            for param in params.values()
+        extra["mood"] = mood
+    # 空列表 = 用户没选/模型没识别：不传，让数据库保持 NULL（与「标注了空标签」区分开）
+    tags = [str(tag).strip() for tag in (sub_tags or []) if str(tag).strip()]
+    if tags:
+        extra["sub_tags"] = tags
+    if not extra:
+        return add_bill(user_id, bill_date, merchant, amount, payment_method, bill_type)
+
+    try:
+        params = inspect.signature(add_bill).parameters
+    except (TypeError, ValueError):
+        params = {}
+    has_var_kw = any(
+        getattr(param, "kind", None) is inspect.Parameter.VAR_KEYWORD
+        for param in params.values()
+    )
+    supported = {
+        key: value
+        for key, value in extra.items()
+        if key in params or has_var_kw
+    }
+    if supported:
+        return add_bill(
+            user_id,
+            bill_date,
+            merchant,
+            amount,
+            payment_method,
+            bill_type,
+            **supported,
         )
-        if supports_mood:
-            return add_bill(
-                user_id, bill_date, merchant, amount, payment_method, bill_type, mood=mood
-            )
     return add_bill(user_id, bill_date, merchant, amount, payment_method, bill_type)
 
 
@@ -5887,6 +5928,13 @@ with tab_dash:
         if "payment_method" in df.columns
         else []
     )
+    # 副标签（022）：从全量 df 里拍平去重，作为筛选下拉候选；老库没有该列时为空。
+    _bill_has_sub_tags = "sub_tags" in df.columns
+    _bill_tag_options = (
+        sorted({tag for _tags in df["sub_tags"] for tag in db.normalize_sub_tags(_tags)})
+        if _bill_has_sub_tags
+        else []
+    )
 
     # 导入新数据后旧的多选值可能已不在新选项里：先收敛，避免 multiselect 报错
     _saved_categories = st.session_state.get("bill_categories")
@@ -5899,6 +5947,11 @@ with tab_dash:
         _valid_payments = [p for p in _saved_payments if p in _bill_payment_options]
         if _valid_payments != list(_saved_payments):
             st.session_state["bill_payments"] = _valid_payments
+    _saved_tags = st.session_state.get("bill_sub_tags")
+    if _bill_has_sub_tags and _saved_tags:
+        _valid_tags = [t for t in _saved_tags if t in _bill_tag_options]
+        if _valid_tags != list(_saved_tags):
+            st.session_state["bill_sub_tags"] = _valid_tags
 
     # ---- 已启用筛选条件数：按维度计数，用于自动展开 + 提示 ----
     def _bill_active_filter_count():
@@ -5912,6 +5965,8 @@ with tab_dash:
         if _bill_has_category and st.session_state.get("bill_categories"):
             _count += 1
         if st.session_state.get("bill_payments"):
+            _count += 1
+        if st.session_state.get("bill_sub_tags"):
             _count += 1
         try:
             _min_amount = float(st.session_state.get("bill_amount_min", 0.0) or 0.0)
@@ -5971,6 +6026,7 @@ with tab_dash:
             "bill_type",
             "bill_categories",
             "bill_payments",
+            "bill_sub_tags",
             "bill_amount_min",
             "bill_amount_max",
             "bill_sort",
@@ -5989,7 +6045,7 @@ with tab_dash:
         )
 
     with st.expander(
-        "🔍 更多筛选（日期 / 分类 / 支付方式 / 金额）",
+        "🔍 更多筛选（日期 / 分类 / 副标签 / 支付方式 / 金额）",
         expanded=(_bill_active_count > 0),
         key="bill_filter_expander",
         on_change="rerun",
@@ -6021,6 +6077,17 @@ with tab_dash:
             _bill_payments = st.multiselect(
                 "支付方式", options=_bill_payment_options, key="bill_payments"
             )
+
+        # 副标签：一笔账单可能同时有多个标签，任一命中即保留（OR 语义）。
+        if _bill_has_sub_tags:
+            _bill_sub_tags = st.multiselect(
+                "副标签（任一命中）",
+                options=_bill_tag_options,
+                key="bill_sub_tags",
+                help="例：选「人情」只看人情往来；选「考研 + 冲动消费」看两类场景的并集",
+            )
+        else:
+            _bill_sub_tags = []
 
         _bill_amt_min_col, _bill_amt_max_col = st.columns(2)
         with _bill_amt_min_col:
@@ -6090,6 +6157,15 @@ with tab_dash:
         _bill_filter_pay = filtered["payment_method"].fillna("").astype(str).str.strip()
         filtered = filtered[_bill_filter_pay.isin(_bill_payments)]
 
+    if _bill_sub_tags and "sub_tags" in filtered.columns:
+        # 副标签是 list 列：先归一化（防老数据/脏字符串），再做集合交集。
+        _wanted_tags = set(_bill_sub_tags)
+        filtered = filtered[
+            filtered["sub_tags"].map(
+                lambda tags: bool(set(db.normalize_sub_tags(tags)) & _wanted_tags)
+            )
+        ]
+
     if _bill_amount_min > 0:
         filtered = filtered[filtered["amount"] >= float(_bill_amount_min)]
     if _bill_amount_max > 0:
@@ -6126,7 +6202,10 @@ with tab_dash:
         # 展示口径与改造前一致：有 category 时固定列序（category 紧跟 merchant），
         # 其余列补后；NULL/空串/纯空白归一为「其他」。date_parsed 仅用于筛选，不展示。
         if "category" in _bill_page_df.columns:
-            base_cols = ["date", "merchant", "category", "amount", "payment_method", "type"]
+            base_cols = ["date", "merchant", "category"]
+            if "sub_tags" in _bill_page_df.columns:
+                base_cols.append("sub_tags")
+            base_cols += ["amount", "payment_method", "type"]
             display_cols = [col for col in base_cols if col in _bill_page_df.columns]
             display_cols += [
                 col for col in _bill_page_df.columns
@@ -6135,11 +6214,15 @@ with tab_dash:
             df_display = _bill_page_df[display_cols].copy()
             _cat_series = df_display["category"].fillna("其他").astype(str).str.strip()
             df_display["category"] = _cat_series.where(_cat_series != "", "其他")
+            if "sub_tags" in df_display.columns:
+                df_display["sub_tags"] = df_display["sub_tags"].map(_format_sub_tags_cell)
             st.dataframe(df_display, use_container_width=True)
         else:
             df_display = _bill_page_df[
                 [col for col in _bill_page_df.columns if col != "date_parsed"]
-            ]
+            ].copy()
+            if "sub_tags" in df_display.columns:
+                df_display["sub_tags"] = df_display["sub_tags"].map(_format_sub_tags_cell)
             st.caption("提示：执行 migrations/012 后这里会显示消费分类")
             st.dataframe(df_display, use_container_width=True)
 
@@ -6159,7 +6242,7 @@ with tab_dash:
     # Export
     st.subheader("数据导出")
     export_col1, export_col2 = st.columns(2)
-    csv_data = df.to_csv(index=False, encoding="utf-8-sig")
+    csv_data = _export_ready_frame(df).to_csv(index=False, encoding="utf-8-sig")
     with export_col1:
         st.download_button(
             label="导出账单明细CSV",
@@ -6189,7 +6272,7 @@ with tab_dash:
     # 新增：导出「账单明细」当前筛选结果（不影响上面两个全量导出按钮）
     st.download_button(
         "导出当前筛选结果（CSV）",
-        data=filtered.to_csv(index=False).encode("utf-8-sig"),
+        data=_export_ready_frame(filtered).to_csv(index=False).encode("utf-8-sig"),
         file_name=f"bills_filtered_{current_month_str}.csv",
         mime="text/csv",
     )
@@ -6824,6 +6907,16 @@ with tab_tools:
                     list(_MOOD_FORM_LABELS),
                     help="记录下来，气象站会分析情绪和花钱的关系",
                 )
+                # 副标签（022）：主分类照旧算钱，副标签记录「这笔钱是什么场景」。
+                # 允许现场新建标签（如「考研」「答谢」），不必等产品更新选项表。
+                sub_tags = st.multiselect(
+                    "副标签（可多选）",
+                    options=list(db.SUB_TAG_OPTIONS),
+                    default=[],
+                    accept_new_options=True,
+                    max_selections=db.SUB_TAG_MAX_COUNT,
+                    help="场景标签：人情、答谢、考研、冲动消费…可直接输入新标签",
+                )
                 submitted = st.form_submit_button("保存这笔")
             # 提交逻辑放在 expander 外，避免校验/错误提示被折叠面板收起；
             # 成功提示用 session_state flash 传递，跨 rerun 在页面顶部展示一次
@@ -6848,6 +6941,7 @@ with tab_tools:
                             "手动录入",
                             bill_type,
                             mood=_mood_value,
+                            sub_tags=sub_tags,
                         )
                         _flash_msg = (
                             f"已记录：{bill_date.strftime('%Y-%m-%d')} {merchant} "
@@ -6855,6 +6949,8 @@ with tab_tools:
                         )
                         if _mood_value:
                             _flash_msg += f" · 心情：{_mood_value}"
+                        if sub_tags:
+                            _flash_msg += f" · 标签：{' / '.join(sub_tags)}"
                         st.session_state["flash"] = {"level": "success", "msg": _flash_msg}
                         st.cache_data.clear()          # 清缓存，保证下面的指标/图表/提示条立刻更新
                         st.session_state.page = 0      # 回到第一页，新账单按日期倒序通常在最前
@@ -7085,6 +7181,7 @@ with tab_tools:
                                     "语音记账",
                                     _voice_bill["bill_type"],
                                     mood=_voice_bill.get("mood") if isinstance(_voice_bill, dict) else "",
+                                    sub_tags=_voice_bill.get("sub_tags") if isinstance(_voice_bill, dict) else None,
                                 )
                             except TextBillError as _bill_err:
                                 _bill_code = getattr(_bill_err, "code", "")
@@ -7690,6 +7787,7 @@ with tab_ai:
                         "截图识别",
                         result["bill_type"],
                         mood=result.get("mood") if isinstance(result, dict) else "",
+                        sub_tags=result.get("sub_tags") if isinstance(result, dict) else None,
                     )
                 except BillImageError as exc:
                     code = getattr(exc, "code", "")

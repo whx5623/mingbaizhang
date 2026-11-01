@@ -2,6 +2,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
 import pandas as pd
 import hashlib
+import json
 import logging
 import math
 import re
@@ -80,6 +81,9 @@ def init_db():
                 amount FLOAT,
                 payment_method VARCHAR(50),
                 type VARCHAR(20),
+                -- 副标签（022）：JSON 数组字符串，如 ["人情","答谢"]；NULL = 未标注。
+                -- 老库由 migrations/022 补列，这里只对新建库生效。
+                sub_tags TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
@@ -733,36 +737,43 @@ def verify_user(username, password):
     _touch_last_login(user_id)
     return user_id
 
-def _bill_insert_statement(write_category, write_mood):
-    """按「012 / 019 是否已执行」选出四种 INSERT 之一（列名全是字面量）。
+def _bill_insert_statement(write_category, write_mood, write_sub_tags=False):
+    """按「012 / 019 / 022 是否已执行」拼出可用的 INSERT（列名全是本函数内的字面量）。
 
-    为什么要写死四种组合：category 与 mood 分属两个迁移，线上完全可能出现
-    「012 已执行、019 未执行」（或反过来）的中间态。只要把**不存在的列**写进
-    INSERT，整笔账单就会失败 —— 而分类和情绪都只是附加信息，绝不能拖垮记账。
-    调用方只有在 write_* 为 True 时才绑对应的参数，用户数据一律走绑定参数。
+    为什么要按列存在性拼 SQL：category / mood / sub_tags 分属三个迁移，线上完全可能
+    出现「012 已执行、019/022 未执行」的任意中间态。只要把**不存在的列**写进
+    INSERT，整笔账单就会失败 —— 而这三项都只是附加信息，绝不能拖垮记账。
+    列名只来自下面的固定白名单（不是用户输入），值一律走绑定参数。
+
+    调用方只在 write_* 为 True 时才绑对应的参数。
     """
-    if write_category and write_mood:
-        return text("""
-            INSERT INTO bills(user_id, date, merchant, amount, payment_method, type, category, mood)
-            VALUES (:uid, :dt, :mer, :amt, :pm, :tp, :cat, :mood)
-        """)
+    columns = ["user_id", "date", "merchant", "amount", "payment_method", "type"]
+    values = [":uid", ":dt", ":mer", ":amt", ":pm", ":tp"]
     if write_category:
-        return text("""
-            INSERT INTO bills(user_id, date, merchant, amount, payment_method, type, category)
-            VALUES (:uid, :dt, :mer, :amt, :pm, :tp, :cat)
-        """)
+        columns.append("category")
+        values.append(":cat")
     if write_mood:
-        return text("""
-            INSERT INTO bills(user_id, date, merchant, amount, payment_method, type, mood)
-            VALUES (:uid, :dt, :mer, :amt, :pm, :tp, :mood)
-        """)
-    return text("""
-        INSERT INTO bills(user_id, date, merchant, amount, payment_method, type)
-        VALUES (:uid, :dt, :mer, :amt, :pm, :tp)
-    """)
+        columns.append("mood")
+        values.append(":mood")
+    if write_sub_tags:
+        columns.append("sub_tags")
+        values.append(":sub_tags")
+    return text(
+        f"INSERT INTO bills({', '.join(columns)}) VALUES ({', '.join(values)})"
+    )
 
 
-def add_bill(user_id, date, merchant, amount, payment_method, type, category=None, mood=None):
+def add_bill(
+    user_id,
+    date,
+    merchant,
+    amount,
+    payment_method,
+    type,
+    category=None,
+    mood=None,
+    sub_tags=None,
+):
     global engine
     # 参数名 date 是历史遗留（遮蔽了 datetime.date），本函数里不再用 date 类型，只当值用。
     #
@@ -784,13 +795,17 @@ def add_bill(user_id, date, merchant, amount, payment_method, type, category=Non
     # 也只会变成 ""（= 未标注），不会让这笔账记不上（与分类同一个硬约束）。
     # 注意 mood 是**只能追加**的 keyword 参数：老调用方仍可按位置传 category。
     mood_value = normalize_mood(mood)
+    # 副标签（022）同一套「外宽内严、绝不抛异常」：AI/前端可能给 list / JSON 数组字符串 /
+    # "人情、答谢" / 单个字符串，统一收敛成去重后的 list；空值写 NULL。
+    sub_tags_value = sub_tags_to_json(sub_tags)
     # 列存在性探测放在开写连接之前：避免在一条已检出的连接上再借第二条连接做元数据查询。
     write_category = _bills_category_supported()
     write_mood = _bills_mood_supported()
+    write_sub_tags = _bills_sub_tags_supported()
     with engine.connect() as conn:
-        # 012 / 019 的四种组合由 _bill_insert_statement 统一挑选：缺哪列就少写哪列。
-        # 降级只发生在这里，告警由两个 _bills_*_supported() 负责（每个进程一次）。
-        stmt = _bill_insert_statement(write_category, write_mood)
+        # 012 / 019 / 022 的组合由 _bill_insert_statement 统一挑选：缺哪列就少写哪列。
+        # 降级只发生在这里，告警由三个 _bills_*_supported() 负责（每个进程一次）。
+        stmt = _bill_insert_statement(write_category, write_mood, write_sub_tags)
         params = {
             "uid": user_id,
             "dt": bill_date,
@@ -805,6 +820,9 @@ def add_bill(user_id, date, merchant, amount, payment_method, type, category=Non
             # 空串在读取侧与 NULL 等价，但库里保持 NULL 更干净：
             # 「没标注」和「标注了一个空情绪」在数据上不该是两种东西。
             params["mood"] = mood_value or None
+        if write_sub_tags:
+            # 同 mood：没有副标签就写 NULL，而不是空数组字符串 "[]"。
+            params["sub_tags"] = sub_tags_value
         conn.execute(stmt, params)
         conn.commit()
 
@@ -813,17 +831,22 @@ def get_all_bills(user_id):
     sql = text("SELECT * FROM bills WHERE user_id = :uid")
     df = pd.read_sql(sql, engine, params={"uid": user_id})
     # 顺序无所谓，但四列都必须收口：type 归一化（字符串口径）+ amount 转 float（数值口径）
-    # + category 空值收敛 + mood 收敛（后两者列不存在时原样返回，绝不凭空造列）。
-    return _normalize_category_column(
-        _normalize_mood_column(_normalize_type_column(_normalize_amount_column(df)))
+    # + category 空值收敛 + mood 收敛 + sub_tags 解析成 list（后三者列不存在时原样返回，
+    # 绝不凭空造列）。
+    return _normalize_sub_tags_column(
+        _normalize_category_column(
+            _normalize_mood_column(_normalize_type_column(_normalize_amount_column(df)))
+        )
     )
 
 def get_bills_paginated(user_id, limit, offset):
     global engine
     sql = text("SELECT * FROM bills WHERE user_id = :uid ORDER BY date DESC LIMIT :lim OFFSET :off")
     df = pd.read_sql(sql, engine, params={"uid": user_id, "lim": limit, "off": offset})
-    return _normalize_category_column(
-        _normalize_mood_column(_normalize_type_column(_normalize_amount_column(df)))
+    return _normalize_sub_tags_column(
+        _normalize_category_column(
+            _normalize_mood_column(_normalize_type_column(_normalize_amount_column(df)))
+        )
     )
 
 def get_total_bill_count(user_id):
@@ -838,23 +861,24 @@ def insert_demo_bills(user_id):
         # mood 是**确定性**写死的（不按商户猜、不调 AI）：演示数据的意义是"点一下就能看到
         # 效果"，同一份数据每次加载出的气象站必须完全一样。收入行标 None —— 情绪分析只
         # 看支出，给收入编一个情绪只会污染口径。
-        {"date":"2026-10-01","merchant":"食堂","amount":12.5,"payment_method":"校园卡","type":"支出","mood":"开心"},
-        {"date":"2026-10-02","merchant":"蜜雪冰城","amount":8.0,"payment_method":"微信","type":"支出","mood":"疲惫"},
-        {"date":"2026-10-03","merchant":"淘宝网购","amount":129.0,"payment_method":"支付宝","type":"支出","mood":"激动"},
-        {"date":"2026-10-04","merchant":"兼职","amount":400.0,"payment_method":"银行卡","type":"收入","mood":None},
-        {"date":"2026-10-05","merchant":"白条分期","amount":99.0,"payment_method":"白条","type":"支出","mood":"焦虑"},
-        {"date":"2026-10-06","merchant":"食堂","amount":15.0,"payment_method":"校园卡","type":"支出","mood":"开心"},
-        {"date":"2026-10-07","merchant":"瑞幸咖啡","amount":14.0,"payment_method":"微信","type":"支出","mood":"疲惫"},
-        {"date":"2026-10-08","merchant":"拼多多","amount":45.5,"payment_method":"支付宝","type":"支出","mood":"激动"},
-        {"date":"2026-10-09","merchant":"家教兼职","amount":300.0,"payment_method":"微信","type":"收入","mood":None},
-        {"date":"2026-10-10","merchant":"超市","amount":56.2,"payment_method":"支付宝","type":"支出","mood":"开心"},
+        {"date":"2026-10-01","merchant":"食堂","amount":12.5,"payment_method":"校园卡","type":"支出","mood":"开心","sub_tags":[]},
+        {"date":"2026-10-02","merchant":"蜜雪冰城","amount":8.0,"payment_method":"微信","type":"支出","mood":"疲惫","sub_tags":["奖励自己"]},
+        {"date":"2026-10-03","merchant":"淘宝网购","amount":129.0,"payment_method":"支付宝","type":"支出","mood":"激动","sub_tags":["冲动消费"]},
+        {"date":"2026-10-04","merchant":"兼职","amount":400.0,"payment_method":"银行卡","type":"收入","mood":None,"sub_tags":[]},
+        {"date":"2026-10-05","merchant":"白条分期","amount":99.0,"payment_method":"白条","type":"支出","mood":"焦虑","sub_tags":["冲动消费"]},
+        {"date":"2026-10-06","merchant":"食堂","amount":15.0,"payment_method":"校园卡","type":"支出","mood":"开心","sub_tags":[]},
+        {"date":"2026-10-07","merchant":"瑞幸咖啡","amount":14.0,"payment_method":"微信","type":"支出","mood":"疲惫","sub_tags":["学习"]},
+        {"date":"2026-10-08","merchant":"拼多多","amount":45.5,"payment_method":"支付宝","type":"支出","mood":"激动","sub_tags":["冲动消费"]},
+        {"date":"2026-10-09","merchant":"家教兼职","amount":300.0,"payment_method":"微信","type":"收入","mood":None,"sub_tags":[]},
+        {"date":"2026-10-10","merchant":"超市","amount":56.2,"payment_method":"支付宝","type":"支出","mood":"开心","sub_tags":["家庭"]},
     ]
     write_category = _bills_category_supported()
     write_mood = _bills_mood_supported()
+    write_sub_tags = _bills_sub_tags_supported()
     with engine.connect() as conn:
         conn.execute(text("DELETE FROM bills WHERE user_id = :uid"), {"uid": user_id})
-        # 012 / 019 的四种组合由同一个函数挑选：缺哪列就少写哪列（降级，记账优先）。
-        stmt = _bill_insert_statement(write_category, write_mood)
+        # 012 / 019 / 022 的组合由同一个函数挑选：缺哪列就少写哪列（降级，记账优先）。
+        stmt = _bill_insert_statement(write_category, write_mood, write_sub_tags)
         for row in demo_data:
             # 演示数据里本来就是中文字面量，归一化是幂等的（防止以后有人改数据源）
             bill_type = normalize_bill_type(row["type"], strict=True)
@@ -879,6 +903,8 @@ def insert_demo_bills(user_id):
             if write_mood:
                 # 与 add_bill 同一口径：认不出/收入行都写 NULL（= 未标注）
                 params["mood"] = normalize_mood(row.get("mood")) or None
+            if write_sub_tags:
+                params["sub_tags"] = sub_tags_to_json(row.get("sub_tags"))
             conn.execute(stmt, params)
         conn.commit()
     return True
@@ -996,7 +1022,10 @@ def import_csv_to_bills(user_id, df):
             "amt": amt,
             "pm": r.get("payment_method"),
             "tp": bill_type,
-            "cat": category_value
+            "cat": category_value,
+            # 022：CSV 里可以带 sub_tags 列（JSON 数组 / "人情、答谢" / 空）；
+            # 没这一列就是 None（未标注），与手工/AI 记账同一口径。
+            "sub_tags": sub_tags_to_json(r.get("sub_tags") if "sub_tags" in df.columns else None),
         })
 
     if not rows:
@@ -1005,21 +1034,27 @@ def import_csv_to_bills(user_id, df):
         return result
 
     write_category = _bills_category_supported()
+    write_sub_tags = _bills_sub_tags_supported()
     try:
         with engine.connect() as conn:
             conn.execute(text("DELETE FROM bills WHERE user_id = :uid"), {"uid": user_id})
+            # 与 _bill_insert_statement 同一套「缺列就少写」逻辑；列名全部是本函数字面量。
+            columns = ["user_id", "date", "merchant", "amount", "payment_method", "type"]
+            values = [":uid", ":dt", ":mer", ":amt", ":pm", ":tp"]
             if write_category:
-                stmt = text("""
-                    INSERT INTO bills(user_id, date, merchant, amount, payment_method, type, category)
-                    VALUES (:uid, :dt, :mer, :amt, :pm, :tp, :cat)
-                """)
+                columns.append("category")
+                values.append(":cat")
             else:
                 # 012 未执行：去掉 category 键再插入（降级，导入优先）
-                stmt = text("""
-                    INSERT INTO bills(user_id, date, merchant, amount, payment_method, type)
-                    VALUES (:uid, :dt, :mer, :amt, :pm, :tp)
-                """)
                 rows = [{k: v for k, v in row.items() if k != "cat"} for row in rows]
+            if write_sub_tags:
+                columns.append("sub_tags")
+                values.append(":sub_tags")
+            else:
+                rows = [{k: v for k, v in row.items() if k != "sub_tags"} for row in rows]
+            stmt = text(
+                f"INSERT INTO bills({', '.join(columns)}) VALUES ({', '.join(values)})"
+            )
             for row in rows:
                 conn.execute(stmt, row)
             conn.commit()
@@ -2254,6 +2289,156 @@ def _normalize_mood_column(df):
         df["mood"] = df["mood"].map(normalize_mood)
     except Exception as exc:  # 兜底逻辑本身不能把页面搞崩，异常时退回原始数据
         print(f"[db] mood 列归一化失败，返回原始数据：{exc}")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 副标签（022_bills_sub_tags）
+# ---------------------------------------------------------------------------
+# 「主分类算钱，副标签看场景」：category 决定这笔钱算进哪一类（餐饮/购物…），
+# sub_tags 记录这笔钱的场景（人情/答谢/考研/冲动消费…），一笔钱可以同时属于多个场景。
+# 这里给出常用标签作为前端下拉候选；DB/写入侧不做白名单（AI 与用户都可以造新场景词），
+# 只做数量/长度/去重收敛 —— 场景标签是开放的，硬白名单会把新场景挡在门外。
+SUB_TAG_OPTIONS = (
+    "人情",
+    "答谢",
+    "考研",
+    "冲动消费",
+    "学习",
+    "社交",
+    "通勤",
+    "奖励自己",
+    "家庭",
+    "健康",
+)
+SUB_TAG_MAX_COUNT = 8     # 单笔最多 8 个：再多就不是“场景”，而是把整段备注塞进来了
+SUB_TAG_MAX_LEN = 12      # 单个标签最长 12 字：够表达「考研资料/人情往来」，又不至于写小作文
+_SUB_TAG_SPLIT_RE = re.compile(r"[,，、;；|/]+")
+# bills.sub_tags 是否存在的进程级缓存（与 mood 同一套“只缓存探测成功结果”的取舍）
+_BILLS_SUB_TAGS_SUPPORT = None
+
+
+def normalize_sub_tags(value) -> list:
+    """把任意传入值收敛成去重后的副标签 list；**绝不抛异常**。
+
+    接受：list/tuple/set、JSON 数组字符串 '["人情","答谢"]'、分隔符字符串
+    '人情、答谢' / '人情,答谢'、单个字符串 '考研'、None/NaN。
+    规则：strip → 去内部空白 → 截断到 SUB_TAG_MAX_LEN → 去重（保留首次出现顺序）
+    → 最多 SUB_TAG_MAX_COUNT 个。非法/空值一律返回 []（= 未标注）。
+
+    为什么宽容：它跑在记账主路径上（AI 可能返回幻觉结构、CSV 可能是人手写的），
+    副标签只是附加信息，任何脏值最多变成“没有标注”，不能让一笔账记不上。
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        parsed = None
+        if raw[:1] in "[{":
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, TypeError):
+                parsed = None
+        if parsed is None:
+            parsed = _SUB_TAG_SPLIT_RE.split(raw)
+        value = parsed
+    if isinstance(value, dict):
+        value = list(value.keys())
+    elif isinstance(value, (str, bytes)):
+        value = [value]
+    elif not isinstance(value, (list, tuple, set)):
+        value = [value]
+
+    tags = []
+    seen = set()
+    for item in value:
+        if item is None or isinstance(item, (list, tuple, set, dict)):
+            continue
+        try:
+            if pd.isna(item):
+                continue
+        except (TypeError, ValueError):
+            pass
+        text = str(item).strip().strip("[]\"'")
+        text = re.sub(r"\s+", "", text)
+        if not text:
+            continue
+        text = text[:SUB_TAG_MAX_LEN]
+        if text in seen:
+            continue
+        seen.add(text)
+        tags.append(text)
+        if len(tags) >= SUB_TAG_MAX_COUNT:
+            break
+    return tags
+
+
+def sub_tags_to_json(value):
+    """副标签 → 入库用的 JSON 字符串；没有标签返回 None（库里保持 NULL 而非 '[]'）。"""
+    tags = normalize_sub_tags(value)
+    return json.dumps(tags, ensure_ascii=False) if tags else None
+
+
+def _bills_sub_tags_supported():
+    """探测 bills.sub_tags 是否存在（迁移 022 是否已执行），结果进程内缓存。
+
+    False 时调用方必须走"不带 sub_tags 的 INSERT"：022 未执行时硬塞 sub_tags
+    会让整笔账单写入失败 —— 副标签是可选信息，绝不能拖垮记账主路径。
+    这里只告警一次（缓存 False 之后的调用直接返回，不再刷日志）。
+    """
+    global _BILLS_SUB_TAGS_SUPPORT
+    if _BILLS_SUB_TAGS_SUPPORT is not None:
+        return _BILLS_SUB_TAGS_SUPPORT
+    if engine is None:
+        try:
+            init_db()
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "[db] 探测 bills.sub_tags 前初始化数据库失败，本次按「无 sub_tags 列」处理",
+                exc_info=True,
+            )
+            return False
+    try:
+        with engine.connect() as conn:
+            exists = bool(conn.execute(text("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'bills'
+                      AND column_name = 'sub_tags'
+                )
+            """)).scalar())
+    except Exception:
+        # 探测失败不等于列不存在：不写缓存，下次再探（写库本身也会失败并照常抛出）。
+        logging.getLogger(__name__).warning(
+            "[db] 探测 bills.sub_tags 失败，本次按「无 sub_tags 列」写入（不带副标签）",
+            exc_info=True,
+        )
+        return False
+    _BILLS_SUB_TAGS_SUPPORT = exists
+    if not exists:
+        logging.getLogger(__name__).warning(
+            "[db] bills.sub_tags 不存在（migrations/022_bills_sub_tags.sql 未执行）："
+            "账单将不带副标签写入，请执行 022 迁移后重启应用"
+        )
+    return exists
+
+
+def _normalize_sub_tags_column(df):
+    """读取兜底：sub_tags 列（JSON 字符串 / NULL）解析成 list；**没有该列时不造列**。
+
+    与 _normalize_mood_column 同样"绝不抛异常"：归一化失败就返回原始数据，
+    页面最多显示不出副标签，不会因为兜底逻辑崩掉。
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty or "sub_tags" not in df.columns:
+        return df
+    try:
+        df = df.copy()
+        df["sub_tags"] = df["sub_tags"].map(normalize_sub_tags)
+    except Exception as exc:  # 兜底逻辑本身不能把页面搞崩，异常时退回原始数据
+        print(f"[db] sub_tags 列归一化失败，返回原始数据：{exc}")
     return df
 
 
@@ -4240,7 +4425,7 @@ def _normalize_bill_query_user_id(user_id) -> int:
     return _normalize_budget_user_id(user_id)
 
 
-def query_bills(user_id, start_date, end_date, category=None, keyword=None) -> pd.DataFrame:
+def query_bills(user_id, start_date, end_date, category=None, keyword=None, sub_tag=None) -> pd.DataFrame:
     """按日期区间（可选分类 / 关键词）查询某个用户的账单明细。
 
     返回 DataFrame，列与 get_all_bills 一致（``SELECT *`` + 同三列归一化：
@@ -4254,6 +4439,7 @@ def query_bills(user_id, start_date, end_date, category=None, keyword=None) -> p
     start, end = _normalize_bill_query_range(start_date, end_date)
     cat = _normalize_bill_filter_text(category, "分类")
     kw = _normalize_bill_filter_text(keyword, "关键词")
+    tag = _normalize_bill_filter_text(sub_tag, "副标签")
 
     if engine is None:
         init_db()
@@ -4284,8 +4470,16 @@ def query_bills(user_id, start_date, end_date, category=None, keyword=None) -> p
             columns = list(conn.execute(text("SELECT * FROM bills WHERE 1 = 0")).keys())
             df = pd.DataFrame(columns=columns)
 
-    # 与 get_all_bills 完全同口径：type 字符串口径 + amount float + category 空值→「其他」。
-    df = _normalize_category_column(_normalize_type_column(_normalize_amount_column(df)))
+    # 与 get_all_bills 完全同口径：type 字符串口径 + amount float + category 空值→「其他」
+    # + sub_tags JSON → list。
+    df = _normalize_sub_tags_column(
+        _normalize_category_column(_normalize_type_column(_normalize_amount_column(df)))
+    )
+    if tag is not None and "sub_tags" in df.columns:
+        # 副标签在 Python 侧过滤：老库（022 未执行）根本没有这一列，SQL 里写死
+        # sub_tags 会让整个查询报错；而 query_bills 的区间通常很小，过滤成本可忽略。
+        df = df[df["sub_tags"].map(lambda tags: tag in tags if isinstance(tags, list) else False)]
+        df = df.reset_index(drop=True)
 
     # 只记区间与命中行数，不记 category / keyword（keyword 可能是商户名，属隐私）。
     logging.getLogger(__name__).info(
