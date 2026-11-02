@@ -189,7 +189,9 @@ def get_ai_response(messages, api_key, zhipu_api_key, total_income, total_expens
 #               network / http / parse）；
 #     - message 是可直接渲染到页面的中文，必须带可操作建议；
 # · 绝不把 api key（或含 key 的响应体片段）写进异常 message / 日志；
-# · 日期解析失败**绝不**静默回退成“今天”，一律 ambiguous 让用户手填。
+# · 日期解析失败**绝不**静默回退成“今天”，一律 ambiguous 让用户手填；
+# · 最小化上传 / 阅后即焚：识别函数只接收本地裁剪后的 Base64 字节（不收文件路径），
+#   只在内存里拼一次请求，不落盘、不缓存图片、不写日志、不写库的图片字段。
 # ============================================================================
 
 ZHIPU_VISION_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
@@ -456,15 +458,27 @@ def _extract_error_snippet(resp, api_key: str) -> str:
 
 
 def extract_bill_from_image(image_bytes: bytes, mime_type: str, zhipu_api_key: str) -> dict:
-    """调用智谱 GLM-4V 从账单截图中抽取结构化信息。
+    """视觉识别入口：调用智谱 GLM-4V 从账单截图中抽取结构化信息。
 
-    返回::
+    输入（最小化上传 / 阅后即焚）：
+      · 只接收**已在本地裁剪并 Base64 编码**的图片字节（bytes / bytearray），
+        **不接收文件路径**，函数内也不会打开任何图片文件；
+      · 函数内部只把这份字节临时编码成 base64 data URL 塞进**当前这一条**请求，
+        **不写任何文件、不缓存图片、不把 Base64 内容写进日志 / 异常信息 / 返回值**；
+      · 图片数据在本函数里不落地，调用方拿到结果后即可丢弃原图（阅后即焚）。
+
+    返回（只有结构化字段，不含任何图片数据）::
 
         {"merchant": str, "amount": float, "occurred_at": "YYYY-MM-DD",
-         "bill_type": "支出" | "收入", "confidence": float, "raw": str}
+         "bill_type": "支出" | "收入", "sub_tags": list[str],
+         "confidence": float, "raw": str}
+
+      · occurred_at / bill_type 即 Prompt 里的 paid_at / type，对外沿用 db.bills 的列名；
+      · sub_tags 由模型按场景推断，最多 2 个，字段缺失/脏结构一律 []；
+      · raw 只是**模型返回的原始文本**（便于排查与页面“查看原始结果”），
+        不是图片，也不含 Base64；写入 bills 表的只有商户/金额/日期/类型/分类/标签。
 
     失败统一抛 BillImageError(code, message)，message 为可展示的中文。
-    raw 是模型原始输出，便于排查与页面“查看原始结果”。
     """
     # ---- 0) api key 检查：空 → no_api_key（且绝不回显 key 内容） ----
     if not isinstance(zhipu_api_key, str) or not zhipu_api_key.strip():
@@ -513,6 +527,7 @@ def extract_bill_from_image(image_bytes: bytes, mime_type: str, zhipu_api_key: s
     # ---- 2) 组装请求（OpenAI 兼容，image 走 base64 data URL） ----
     vision_model = get_secret("ZHIPU_VISION_MODEL") or DEFAULT_VISION_MODEL
     b64 = base64.b64encode(bytes(image_bytes)).decode("ascii")
+    # 最小化上传：这里只发送本地裁剪后的 Base64，原图不上传、不落盘
     payload = {
         "model": vision_model,
         "messages": [

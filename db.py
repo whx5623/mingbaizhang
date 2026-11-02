@@ -84,6 +84,8 @@ def init_db():
                 -- 副标签（022）：JSON 数组字符串，如 ["人情","答谢"]；NULL = 未标注。
                 -- 老库由 migrations/022 补列，这里只对新建库生效。
                 sub_tags TEXT,
+                -- 极简落库：本表**没有** image / image_url / base64 / screenshot 之类的列。
+                -- 截图只在内存里裁剪、Base64 上传、解析完即焚；落库的永远只有结构化字段。
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
@@ -787,6 +789,8 @@ def add_bill(
     bill_date = _normalize_bill_date(date)
     bill_type = normalize_bill_type(type, strict=True)
     amt = _normalize_amount(amount, bill_type)
+    # 极简落库（隐私护城河）：bills 表只写「金额 / 日期 / 商户 / 类型 / 主分类 / 副标签 / 情绪」，
+    # 没有任何图片列，也绝不写图片 URL 或 Base64 —— 截图在内存里解析完就丢弃。
     # 分类在开连接之前算好。auto_categorize 内部已经吞掉 AI/导入异常并回落 "其他"，
     # 所以分类失败绝不会让这笔账记不上（这是本功能的硬约束）。
     # category 显式传了就尊重调用方（app.py 目前不传，保持位置参数兼容）。

@@ -1465,6 +1465,20 @@ def _mask_sensitive(value) -> str:
         return text
 
 
+def _mask_amount(value) -> str:
+    """展示层金额打码：隐藏小数后两位（128.50 → 128.**）。
+
+    只在**展示副本**上调用：数据库、导出、KPI 聚合始终用真实金额，
+    否则「明细打码」会连带把总额也算错。
+    """
+    if not _privacy_on() or _privacy_mod is None:
+        return value
+    try:
+        return _privacy_mod.mask_amount(value)
+    except Exception:
+        return value
+
+
 def _format_sub_tags_cell(value) -> str:
     """账单表格里的副标签展示：list → "人情 / 答谢"；空/脏值 → 空串。"""
     return " / ".join(db.normalize_sub_tags(value))
@@ -1678,16 +1692,16 @@ with st.sidebar:
         if "privacy_mode" not in st.session_state:
             st.session_state.privacy_mode = False
         st.toggle(
-            "🕶️ 隐私脱敏模式",
+            "🕶️ 开启数据脱敏模式",
             key="privacy_mode",
             help=(
-                "开启后：账单明细与商户名自动打码（蜜雪冰城 → 蜜雪**）；"
+                "开启后：账单明细与商户名自动打码（蜜雪冰城 → 蜜雪**）、金额隐藏小数两位；"
                 "语音转写与聊天文本在发往 AI 前，本地替换手机号/证件号/卡号/邮箱。"
                 "原始数据仍完整保存在本地库。"
             ),
         )
         if st.session_state.privacy_mode:
-            st.caption("已开启：商户名以星号展示，敏感号码不会原样发给 AI")
+            st.caption("已开启：商户名以星号展示、金额隐藏后两位，敏感号码不会原样发给 AI")
         else:
             st.caption("答辩演示：打开开关，账单明细里的商户名会立即打码")
 
@@ -6652,9 +6666,11 @@ with tab_dash:
             df_display["category"] = _cat_series.where(_cat_series != "", "其他")
             if "sub_tags" in df_display.columns:
                 df_display["sub_tags"] = df_display["sub_tags"].map(_format_sub_tags_cell)
-            # 隐私模式：商户名打码（原始 DataFrame 不动，导出仍是原文）
+            # 隐私模式：商户名与金额打码（原始 DataFrame 不动，导出仍是原文）
             if "merchant" in df_display.columns:
                 df_display["merchant"] = df_display["merchant"].map(_mask_merchant)
+            if "amount" in df_display.columns:
+                df_display["amount"] = df_display["amount"].map(_mask_amount)
             st.dataframe(df_display, use_container_width=True)
         else:
             df_display = _bill_page_df[
@@ -6662,9 +6678,11 @@ with tab_dash:
             ].copy()
             if "sub_tags" in df_display.columns:
                 df_display["sub_tags"] = df_display["sub_tags"].map(_format_sub_tags_cell)
-            # 隐私模式：商户名打码（原始 DataFrame 不动，导出仍是原文）
+            # 隐私模式：商户名与金额打码（原始 DataFrame 不动，导出仍是原文）
             if "merchant" in df_display.columns:
                 df_display["merchant"] = df_display["merchant"].map(_mask_merchant)
+            if "amount" in df_display.columns:
+                df_display["amount"] = df_display["amount"].map(_mask_amount)
             st.caption("提示：执行 migrations/012 后这里会显示消费分类")
             st.dataframe(df_display, use_container_width=True)
 
@@ -8201,8 +8219,12 @@ with tab_ai:
         key=f"screenshot_uploader_{st.session_state.user_id}",
     )
     st.caption("支持 png/jpg，单张 ≤5MB；识别后会自动记一笔")
+    st.caption(
+        "🔒 最小化上传：截图会**先在本地裁掉顶部/底部敏感区**（头像、昵称、订单号、广告），"
+        "只把中间 60% 转 Base64 交给视觉模型；原图不上传、不落盘，解析完立即在内存清零"
+    )
     if _privacy_on():
-        st.caption("🕶️ 隐私模式已开启：文字/语音会先本地脱敏，但截图原图仍需发给视觉模型识别，无法本地打码")
+        st.caption("🕶️ 数据脱敏模式已开启：账单明细与聊天里的商户名、金额也会打码")
     if screenshot_file is not None:
         # 防重复提交：file_uploader 的值跨 rerun 保留，成功后的 st.rerun() 会让同一张图
         # 再跑一遍 → 重复记账。签名 = 用户ID + 图片内容哈希，同一张图只处理一次。
@@ -8223,6 +8245,33 @@ with tab_ai:
                 print(f"[screenshot] 截图识别模块不可用：{type(exc).__name__}: {exc}")
                 st.error("截图处理失败，请稍后再试")
             else:
+                # ---- 最小化上传：本地裁剪 → Base64（只在内存）→ 发送 ----
+                # 顶部通常有头像/昵称/订单号，底部有广告/按钮；只保留中间 60% 高度。
+                # 无论隐私开关是否开启都执行：原图绝不外发，这是架构而非开关。
+                _image_privacy = None
+                _privacy_image_buf = None
+                _privacy_image_b64 = ""
+                try:
+                    import image_privacy as _image_privacy
+                except Exception as _img_import_exc:
+                    print(
+                        f"[screenshot] 图片脱敏模块不可用，按原图识别："
+                        f"{type(_img_import_exc).__name__}: {_img_import_exc}"
+                    )
+                if _image_privacy is not None:
+                    try:
+                        _cropped_bytes = _image_privacy.crop_center_privacy(
+                            screenshot_bytes, keep_ratio=0.6
+                        )
+                        # 只在内存里 Base64，不写临时文件；这一步的产物只用于本次请求。
+                        _privacy_image_b64 = _image_privacy.encode_base64(_cropped_bytes)
+                        _privacy_image_buf = bytearray(_cropped_bytes)
+                        screenshot_bytes = _cropped_bytes
+                    except Exception as _crop_exc:
+                        print(
+                            f"[screenshot] 本地裁剪失败，按原图识别："
+                            f"{type(_crop_exc).__name__}: {_crop_exc}"
+                        )
                 # 失败也计一次（避免反复上传刷额度）；但**不**落签名 —— 失败后允许用同一张图
                 # 直接重试（演示时网络抖动不应逼用户刷新页面）。签名只在成功入库后落位。
                 st.session_state.ai_daily_count += 1
@@ -8270,6 +8319,13 @@ with tab_ai:
                     st.cache_data.clear()      # 让指标/图表/明细立刻反映新账单
                     st.session_state.page = 0  # 新账单按日期倒序，通常在第一页
                     st.rerun()
+                finally:
+                    # 阅后即焚，最小化上传：成功 / 失败 / 中途 rerun 都会走到这里，
+                    # 立刻把内存里裁剪后的图片字节与 Base64 清零，绝不落盘、不留引用。
+                    if _image_privacy is not None:
+                        _image_privacy.burn(_privacy_image_buf)
+                    _privacy_image_b64 = ""
+                    _privacy_image_buf = None
 
     # ===== 聊天工具（query_bills / delete_bills）的代码级安全辅助 =====
     # 安全原则：删除**绝不**直接执行模型给的参数。
@@ -8334,7 +8390,13 @@ with tab_ai:
             f"查询到 {len(bill_df)} 笔，支出合计 {_spend:.2f}，收入合计 {_income:.2f}\n"
             f"{_view_df.head(20).to_string(index=False)}"
         )
-        return _tool_text, _view_df.head(50).to_dict("records")
+        # 展示给用户的聊天表格：金额也打码（128.50 → 128.**）；
+        # 但 tool 文本保留真实金额，否则模型算不出合计 —— 脱敏只作用于「给人看的界面」。
+        _display_df = _view_df.head(50)
+        if _privacy_on() and "amount" in _view_df.columns:
+            _display_df = _display_df.copy()
+            _display_df["amount"] = _display_df["amount"].map(_mask_amount)
+        return _tool_text, _display_df.to_dict("records")
 
     def _build_delete_confirmation(func_args):
         """delete_bills tool call → 预览 + 写 pending_delete，返回给用户看的确认文案。

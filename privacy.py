@@ -94,6 +94,34 @@ def mask_sensitive_text(text) -> str:
         return source
 
 
+def mask_amount(value) -> str:
+    """金额展示打码：隐藏小数后两位（128.50 → 128.**，-39.90 → -39.**）。
+
+    为什么是「隐藏后两位」而不是随机打乱：随机数会让同一笔账单每次刷新都不一样，
+    演示时容易被追问「这数怎么变了」；隐藏两位既遮住精确金额，又保留量级可读性。
+
+    边界：
+      · None / 空串 / 非数字 → ""（不显示金额，而不是显示 0）；
+      · 0 → "0.**"；
+      · 负数保留负号；千分位保留（1,234.**）。
+    """
+    if value is None:
+        return ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if number != number:  # NaN
+        return ""
+    try:
+        sign = "-" if number < 0 else ""
+        body = f"{abs(number):,.2f}"
+        integer_part = body.split(".")[0]
+        return f"{sign}{integer_part}.**"
+    except Exception:
+        return ""
+
+
 def mask_record(record: dict, fields=("merchant",)) -> dict:
     """字典版打码（不修改入参）：只处理指定字段，其它字段原样返回。"""
     if not isinstance(record, dict):
