@@ -1847,9 +1847,20 @@ with st.sidebar:
 
 # Load full data for metrics and charts
 df = load_all_data(st.session_state.user_id)
+# 核心指标只对 amount 做一次 SUM：bills 一笔一行，sub_tags 是同一行里的数组、不参与 JOIN，
+# 所以加副标签不会让收入/支出/结余翻倍。优先用 SQL 聚合，读库失败再回退到明细求和。
 total_income = df[df["type"] == "收入"]["amount"].sum()
 total_expense = df[df["type"] == "支出"]["amount"].sum()
 balance = total_income - total_expense
+try:
+    _sql_totals = db.get_user_bill_totals(st.session_state.user_id)
+except Exception as _totals_exc:
+    print(f"[layout] SQL 指标聚合失败，回退明细求和：{type(_totals_exc).__name__}: {_totals_exc}")
+    _sql_totals = None
+if isinstance(_sql_totals, dict):
+    total_income = _sql_totals["total_income"]
+    total_expense = _sql_totals["total_expense"]
+    balance = _sql_totals["balance"]
 
 # 计算本月支出
 now = datetime.now()
@@ -2462,6 +2473,31 @@ with tab_dash:
                     except Exception as _rose_exc:
                         print(f"[chart] 玫瑰图渲染失败：{type(_rose_exc).__name__}: {_rose_exc}")
                         st.warning("玫瑰图暂时无法渲染，请刷新页面重试")
+
+            # 图表联动：明细区选中副标签时，在玫瑰图下提示当前过滤范围。
+            # 玫瑰图本身仍按「全量本月支出」画：筛选只影响明细，不能让图表口径跟着变，
+            # 否则用户会以为总额变了；这里只做一句只读说明。
+            _selected_tags = st.session_state.get("bill_sub_tags") or []
+            if _selected_tags and "sub_tags" in df.columns:
+                try:
+                    _linked_exp = df[df["type"] == "支出"]
+                    _linked_mask = _linked_exp["sub_tags"].map(
+                        lambda tags: bool(
+                            set(db.normalize_sub_tags(tags)) & set(_selected_tags)
+                        )
+                    )
+                    _linked_hit = _linked_exp[_linked_mask]
+                    st.caption(
+                        f"🔗 当前明细已按【{' + '.join(str(t) for t in _selected_tags)}】"
+                        f"标签过滤，共发现 {len(_linked_hit)} 笔支出"
+                        f"（合计 ¥{float(_linked_hit['amount'].sum()):,.2f}）；"
+                        "上方图表仍按全量数据展示"
+                    )
+                except Exception as _tag_link_exc:
+                    print(
+                        f"[chart] 副标签联动提示失败："
+                        f"{type(_tag_link_exc).__name__}: {_tag_link_exc}"
+                    )
 
             # 场景词云（022）：本月支出按副标签汇总，字号 = 金额（面积感知，避免巨额标签压扁其他词）
             st.subheader("场景词云")
@@ -6415,8 +6451,45 @@ with tab_dash:
             on_click=_reset_all_bill_filters,
         )
 
+    # ---- 两个独立过滤维度：主分类（category）与副标签（sub_tags）----
+    # 两者是 AND：先按主分类限定「钱花在什么品类」，再按副标签限定「是什么场景」，
+    # 例：主分类=餐饮 且 副标签=人情 → 只留「请客吃饭」这类账单。
+    # 金额只 SUM 一次：一笔账单在明细里只有一行，副标签是同一行的数组，不参与 JOIN。
+    _bill_dim_cat_col, _bill_dim_tag_col = st.columns(2)
+    with _bill_dim_cat_col:
+        if _bill_has_category:
+            _bill_categories = st.multiselect(
+                "主分类（可多选）",
+                options=_bill_category_options,
+                key="bill_categories",
+                help="按账单的主分类筛选：餐饮 / 购物 / 交通…",
+            )
+        else:
+            _bill_categories = []
+            st.caption("主分类未启用：执行 migrations/012 后可筛选")
+    with _bill_dim_tag_col:
+        if _bill_has_sub_tags:
+            _bill_sub_tags = st.multiselect(
+                "副标签（可多选，含自定义）",
+                options=_bill_tag_options,
+                key="bill_sub_tags",
+                accept_new_options=True,
+                help="候选包含你历史用过的全部标签（含自定义）；任一命中即保留",
+            )
+        else:
+            _bill_sub_tags = []
+    if _bill_has_sub_tags:
+        _bill_sub_tag_kw = st.text_input(
+            "副标签关键词（可选）",
+            key="bill_sub_tag_kw",
+            placeholder="细分搜索：如 考研 / 人情",
+            help="按子串模糊匹配副标签（与上面的多选取交集）",
+        )
+    else:
+        _bill_sub_tag_kw = ""
+
     with st.expander(
-        "🔍 更多筛选（日期 / 分类 / 副标签 / 支付方式 / 金额）",
+        "🔍 更多筛选（日期 / 支付方式 / 金额）",
         expanded=(_bill_active_count > 0),
         key="bill_filter_expander",
         on_change="rerun",
@@ -6436,41 +6509,9 @@ with tab_dash:
             _bill_date_from = _bill_default_date_from
             _bill_date_to = _bill_default_date_to
 
-        _bill_cat_col, _bill_pay_col = st.columns(2)
-        with _bill_cat_col:
-            if _bill_has_category:
-                _bill_categories = st.multiselect(
-                    "分类", options=_bill_category_options, key="bill_categories"
-                )
-            else:
-                _bill_categories = []
-        with _bill_pay_col:
-            _bill_payments = st.multiselect(
-                "支付方式", options=_bill_payment_options, key="bill_payments"
-            )
-
-        # 副标签：一笔账单可能同时有多个标签，任一命中即保留（OR 语义）。
-        if _bill_has_sub_tags:
-            _bill_tag_col, _bill_tag_kw_col = st.columns([1.4, 1])
-            with _bill_tag_col:
-                _bill_sub_tags = st.multiselect(
-                    "副标签（任一命中，含自定义）",
-                    options=_bill_tag_options,
-                    key="bill_sub_tags",
-                    accept_new_options=True,
-                    help="候选包含你历史用过的全部标签（含自定义）；也可直接输入新标签筛选",
-                )
-            with _bill_tag_kw_col:
-                # 搜索兜底：标签太多不想翻、或想找一个还没出现在下拉里的标签时，直接输入子串
-                _bill_sub_tag_kw = st.text_input(
-                    "副标签搜索",
-                    key="bill_sub_tag_kw",
-                    placeholder="如：人情 / 考研",
-                    help="按子串模糊匹配副标签（与上面的多选取交集）",
-                )
-        else:
-            _bill_sub_tags = []
-            _bill_sub_tag_kw = ""
+        _bill_payments = st.multiselect(
+            "支付方式", options=_bill_payment_options, key="bill_payments"
+        )
 
         _bill_amt_min_col, _bill_amt_max_col = st.columns(2)
         with _bill_amt_min_col:

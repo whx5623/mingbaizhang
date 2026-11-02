@@ -2527,6 +2527,61 @@ def get_user_all_sub_tags(user_id):
     return tags + extra
 
 
+def get_user_bill_totals(user_id):
+    """核心指标（总收入 / 总支出 / 结余）的 SQL 聚合：对 amount **只 SUM 一次**。
+
+    为什么单独写：副标签让「一笔流水」可以带多个场景，最容易踩的坑是
+    「按 sub_tags 展开后再求和」——那样请客吃饭的 100 元会被算成 300 元。
+    本函数只按 type 分组 SUM(bills.amount)，bills 一笔一行、sub_tags 是同一行内的
+    TEXT 数组，**不参与 JOIN**，所以收入/支出/结余不会随标签数量翻倍。
+
+    返回 {"total_income", "total_expense", "balance"}（两位小数）；读库失败返回 None，
+    由调用方回退到明细 DataFrame 求和（两条路径口径一致）。
+    """
+    if engine is None:
+        try:
+            init_db()
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "[db] 聚合核心指标前初始化数据库失败", exc_info=True
+            )
+            return None
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT type, COALESCE(SUM(amount), 0) AS total "
+                    "FROM bills WHERE user_id = :uid GROUP BY type"
+                ),
+                {"uid": uid},
+            ).all()
+    except Exception as exc:
+        print(f"[db] 核心指标聚合失败：{type(exc).__name__}: {exc}")
+        return None
+
+    income = 0.0
+    expense = 0.0
+    for row in rows:
+        try:
+            kind = str(row[0] or "").strip()
+            total = float(row[1] or 0)
+        except (TypeError, ValueError):
+            continue
+        if kind == "收入":
+            income += total
+        elif kind == "支出":
+            expense += total
+    return {
+        "total_income": round(income, 2),
+        "total_expense": round(expense, 2),
+        "balance": round(income - expense, 2),
+    }
+
+
 def _normalize_mood_months(months) -> int:
     """统计月数收敛到 1~24：非数字 / <=0 → 默认 3，>24 → 24。
 
