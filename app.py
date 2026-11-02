@@ -1908,11 +1908,6 @@ else:
 tab_dash, tab_tools, tab_ai = st.tabs(["📊 财务看板", "💡 实用工具", "🤖 AI 管家"])
 
 with tab_dash:
-    # ===== 全息数据大屏入口：点开后才渲染 fixed 覆盖层，默认不影响原页面 =====
-    if st.button("🚀 进入全息数据大屏", key="macro_open_btn", type="primary"):
-        st.session_state["macro_dashboard_open"] = True
-        st.rerun()
-
     # ===== 核心指标：四大金刚（收入 / 支出 / 结余 / 净资产）=====
     st.markdown("### 💰 核心指标")
     st.caption("一眼看清钱从哪来、到哪去、还剩多少")
@@ -2369,686 +2364,658 @@ with tab_dash:
                 else:
                     st.caption("点上方按钮，让 AI 用全站匿名均值给你一份宏观解读")
 
-    # ===== 图表中心：默认只看消费结构，其余按需切换 =====
-    st.markdown("### 📊 图表中心")
-    st.caption("默认只看消费结构，其余图表按需切换，避免一屏塞满")
-    _dash_chart_tabs = st.tabs(["🛒 消费结构", "🗓️ 消费日历", "🔮 沙盘推演", "📉 资产大盘"])
-    with _dash_chart_tabs[0]:
-        # ECharts 双图表
-        st.subheader("支出可视化图表")
-        chart_col1, chart_col2 = st.columns(2)
-        exp_df = df[df["type"] == "支出"].copy()
+    # ===== 支出趋势：首屏唯一露出的图表 =====
+    st.markdown("### 📈 本月支出趋势")
+    st.caption("每天花了多少一目了然；消费结构、日历、沙盘、资产统一收进「深度分析」")
+    _trend_exp_df = df[df["type"] == "支出"].copy()
+    _trend_daily = _trend_exp_df.groupby("date")["amount"].sum().reset_index()
+    _trend_option = {
+        "title": {"text": "每日消费趋势", "left": "center"},
+        "tooltip": {"trigger": "axis", "formatter": "日期：{b}<br/>消费金额：{c} 元"},
+        "xAxis": {"type": "category", "data": _trend_daily["date"].tolist(), "axisLabel": {"rotate": 30}},
+        "yAxis": {"type": "value", "name": "金额(元)"},
+        "series": [{
+            "type": "line",
+            "data": _trend_daily["amount"].round(2).tolist(),
+            "itemStyle": {"color": "#638bd6"},
+            "areaStyle": {"color": "rgba(178, 233, 204,0.3)"},
+        }],
+        "color": ["#62c490"],
+    }
+    st_echarts(_trend_option, height="320px")
 
-        # 饼图：各商户支出占比
-        pie_data = exp_df.groupby("merchant")["amount"].sum().reset_index()
-        pie_list = []
-        for _, row in pie_data.iterrows():
-            # 隐私模式：图表标签里的商户名同样打码
-            pie_list.append({"name": _mask_merchant(row["merchant"]), "value": round(row["amount"],2)})
-        pie_option = {
-            "title": {"text": "各商户支出占比", "left": "center"},
-            "tooltip": {"trigger": "item", "formatter": "{b}<br/>金额：{c} 元"},
-            "series": [{
-                "type": "pie",
-                "radius": ["40%", "70%"],
-                "data": pie_list
-            }],
-            "color": ["#b8e1ff", "#b2e9cc", "#96ccf0", "#a9e6d0", "#c8e8ff"]
-        }
-        with chart_col1:
-            st_echarts(pie_option, height="400px")
+    # ===== 深度分析：其余图表全部折叠，避免一屏塞满 =====
+    with st.expander("📊 深度分析（点击展开）", expanded=False):
+        st.caption("消费结构 / 消费日历 / 沙盘推演 / 资产大盘 · 按需查看，不占首屏")
 
-        # 折线图：每日消费趋势
-        daily_exp = exp_df.groupby("date")["amount"].sum().reset_index()
-        x_data = daily_exp["date"].tolist()
-        y_data = daily_exp["amount"].round(2).tolist()
-        line_option = {
-            "title": {"text": "每日消费趋势", "left": "center"},
-            "tooltip": {"trigger": "axis", "formatter": "日期：{b}<br/>消费金额：{c} 元"},
-            "xAxis": {"type": "category", "data": x_data, "axisLabel": {"rotate":30}},
-            "yAxis": {"type": "value", "name": "金额(元)"},
-            "series": [{
-                "type": "line",
-                "data": y_data,
-                "itemStyle": {"color":"#638bd6"},
-                "areaStyle": {"color":"rgba(178, 233, 204,0.3)"}
-            }],
-            "color":["#62c490"]
-        }
-        with chart_col2:
-            st_echarts(line_option, height="400px")
+        if st.button("🚀 进入全息数据大屏", key="macro_open_btn", type="primary"):
+            st.session_state["macro_dashboard_open"] = True
+            st.rerun()
 
-        # 环形玫瑰图：本月支出按消费分类聚合（category 列在迁移 012 执行后才存在）
-        st.subheader("消费分类占比")
-        st.caption("本月支出按消费分类聚合，扇形半径越大代表该类花得越多")
-        month_exp_df = df_current_month[df_current_month["type"] == "支出"]
-        if "category" not in df_current_month.columns:
-            st.info("分类功能未启用：请先执行 migrations/012_bills_category.sql")
-        elif month_exp_df.empty:
-            st.caption("本月还没有支出，先记几笔吧")
-        else:
-            # NULL / 空串 / 纯空白统一归到「其他」，与上方明细表口径一致
-            month_cat = month_exp_df["category"].fillna("其他").astype(str).str.strip()
-            cat_totals = (
-                month_exp_df.assign(_category=month_cat.where(month_cat != "", "其他"))
-                .groupby("_category")["amount"]
-                .sum()
-                .sort_values(ascending=False)
-            )
-            rose_data = [
-                {"name": str(cat_name), "value": round(float(cat_amount), 2)}
-                for cat_name, cat_amount in cat_totals.items()
-                if float(cat_amount) > 0
-            ]
-            if not rose_data:
+        _dash_chart_tabs = st.tabs(["🛒 消费结构", "🗓️ 消费日历", "🔮 沙盘推演", "📉 资产大盘"])
+        with _dash_chart_tabs[0]:
+            # ECharts 双图表
+            st.subheader("支出可视化图表")
+            exp_df = df[df["type"] == "支出"].copy()
+
+            # 饼图：各商户支出占比
+            pie_data = exp_df.groupby("merchant")["amount"].sum().reset_index()
+            pie_list = []
+            for _, row in pie_data.iterrows():
+                # 隐私模式：图表标签里的商户名同样打码
+                pie_list.append({"name": _mask_merchant(row["merchant"]), "value": round(row["amount"],2)})
+            pie_option = {
+                "title": {"text": "各商户支出占比", "left": "center"},
+                "tooltip": {"trigger": "item", "formatter": "{b}<br/>金额：{c} 元"},
+                "series": [{
+                    "type": "pie",
+                    "radius": ["40%", "70%"],
+                    "data": pie_list
+                }],
+                "color": ["#b8e1ff", "#b2e9cc", "#96ccf0", "#a9e6d0", "#c8e8ff"]
+            }
+            with st.container():
+                st_echarts(pie_option, height="400px")
+
+
+            # 环形玫瑰图：本月支出按消费分类聚合（category 列在迁移 012 执行后才存在）
+            st.subheader("消费分类占比")
+            st.caption("本月支出按消费分类聚合，扇形半径越大代表该类花得越多")
+            month_exp_df = df_current_month[df_current_month["type"] == "支出"]
+            if "category" not in df_current_month.columns:
+                st.info("分类功能未启用：请先执行 migrations/012_bills_category.sql")
+            elif month_exp_df.empty:
                 st.caption("本月还没有支出，先记几笔吧")
             else:
-                rose_option = {
-                    "tooltip": {"trigger": "item", "formatter": "{b}: {c} 元 ({d}%)"},
-                    "legend": {"orient": "vertical", "left": "left"},
-                    "series": [{
-                        "type": "pie",
-                        "radius": ["30%", "70%"],
-                        "center": ["50%", "55%"],
-                        "roseType": "radius",
-                        "itemStyle": {"borderRadius": 6},
-                        "data": rose_data
-                    }]
-                }
-                # 用容器包裹，避免父级 flex/样式异常时图表塌陷；异常只降级提示，不红屏。
-                try:
-                    with st.container():
-                        st_echarts(rose_option, height="320px")
-                except Exception as _rose_exc:
-                    print(f"[chart] 玫瑰图渲染失败：{type(_rose_exc).__name__}: {_rose_exc}")
-                    st.warning("玫瑰图暂时无法渲染，请刷新页面重试")
-
-        # 场景词云（022）：本月支出按副标签汇总，字号 = 金额（面积感知，避免巨额标签压扁其他词）
-        st.subheader("场景词云")
-        st.caption(
-            "本月支出按副标签汇总：字号越大，说明这类场景花得越多；"
-            "一笔钱可以同时计入多个场景，所以各标签合计会大于总支出"
-        )
-        if "sub_tags" not in df_current_month.columns:
-            st.info("副标签功能未启用：请先执行 migrations/022_bills_sub_tags.sql")
-        else:
-            _tag_rows = db.aggregate_sub_tag_spending(month_exp_df, limit=14)
-            if not _tag_rows:
-                st.caption("本月还没有带副标签的支出；记账时选几个场景标签，这里就会长出来")
-            else:
-                _tag_max = _tag_rows[0][1] or 1.0
-                _tag_palette = ["#1f4e79", "#2e6da4", "#3f8fbf", "#5aa9c9", "#7bc4b8"]
-                _tag_nodes = []
-                for _tag_idx, (_tag_name, _tag_amount) in enumerate(_tag_rows):
-                    # 面积感知：金额翻 4 倍，字号才翻倍 → 头部标签够醒目，长尾也不至于看不见
-                    _font_size = int(12 + 20 * math.sqrt(max(_tag_amount, 0.0) / _tag_max))
-                    _tag_nodes.append({
-                        "name": _tag_name,
-                        "value": round(float(_tag_amount), 2),
-                        "symbolSize": 1,          # 只留文字：graph 的节点圆点设为 1px
-                        "label": {
-                            "fontSize": _font_size,
-                            "fontWeight": 700 if _tag_idx < 3 else 500,
-                            "color": _tag_palette[min(_tag_idx // 3, len(_tag_palette) - 1)],
-                        },
-                    })
-                _tag_option = {
-                    "tooltip": {"trigger": "item", "formatter": "{b}<br/>本月支出：{c} 元"},
-                    "series": [{
-                        "type": "graph",
-                        "layout": "force",        # ECharts 核心内置力导向，不依赖 wordcloud 扩展
-                        "roam": False,
-                        "draggable": False,
-                        "left": "4%", "right": "4%", "top": 16, "bottom": 16,
-                        "force": {
-                            "repulsion": 180,
-                            "gravity": 0.08,
-                            "edgeLength": 24,
-                            "friction": 0.15,
-                        },
-                        "label": {"show": True, "position": "inside"},
-                        "itemStyle": {"opacity": 0},   # 隐藏节点圆点，只显示标签文字
-                        "labelLayout": {"hideOverlap": True},  # 落位后自动隐藏重叠文字
-                        "data": _tag_nodes,
-                        "links": [],
-                    }],
-                }
-                try:
-                    # 用容器包裹，避免父级 flex/样式异常时图表塌陷；异常只降级提示，不红屏
-                    with st.container():
-                        st_echarts(_tag_option, height="360px", key="sub_tag_wordcloud")
-                except Exception as _tag_exc:
-                    print(f"[chart] 场景词云渲染失败：{type(_tag_exc).__name__}: {_tag_exc}")
-                    st.warning("场景词云暂时无法渲染，请刷新页面重试")
-                _tag_top_text = " · ".join(
-                    f"{_tag_name} ¥{_tag_amount:.0f}" for _tag_name, _tag_amount in _tag_rows[:3]
+                # NULL / 空串 / 纯空白统一归到「其他」，与上方明细表口径一致
+                month_cat = month_exp_df["category"].fillna("其他").astype(str).str.strip()
+                cat_totals = (
+                    month_exp_df.assign(_category=month_cat.where(month_cat != "", "其他"))
+                    .groupby("_category")["amount"]
+                    .sum()
+                    .sort_values(ascending=False)
                 )
-                st.caption(f"本月 Top 3 场景：{_tag_top_text}")
-
-    with _dash_chart_tabs[1]:
-        # ===== 消费日历热力图（本月 / 近三个月）=====
-        # 数据由并行方 db.get_daily_expense_totals 提供（连续零填充的每日支出合计）：
-        # 函数缺失 / 取数异常 / 返回空 dict 都只降级成一行提示，绝不红屏。
-        # 放在玫瑰图之后、AI 洞察之前；与上方玫瑰图不同，这里不依赖 df 的 category 列。
-        st.subheader("🗓️ 消费日历热力图")
-        st.caption("💡 颜色越红，代表当天花钱越猛。鼠标悬停可查看具体金额。")
-        # 默认展示「近三个月」：只在首次访问时写入默认值，用户之后切到「本月」不会被重置。
-        if "cal_range" not in st.session_state:
-            st.session_state["cal_range"] = "近三个月"
-        _cal_range = st.radio("范围", ["本月", "近三个月"], horizontal=True, key="cal_range")
-        _cal_months = 1 if _cal_range == "本月" else 3
-
-        # 用项目统一的 UTC+8 日报时钟确定「今天」，避免部署机为 UTC 时月份错位；
-        # 时钟异常时退回本机 date.today()，只影响月份归属，不影响其它区块。
-        _cal_today_fn = getattr(db, "_report_today", None)
-        try:
-            _cal_today = _cal_today_fn() if callable(_cal_today_fn) else None
-        except Exception as _cal_today_exc:
-            print(
-                f"[calendar] 读取日报时钟失败："
-                f"{type(_cal_today_exc).__name__}: {_cal_today_exc}"
-            )
-            _cal_today = None
-        _cal_base_today = _cal_today if isinstance(_cal_today, date) else date.today()
-
-        # 近 N 个月：以今天所在月为最后一个月往前推（升序，方便日历从上到下按时间排列）
-        _cal_month_keys = []
-        for _cal_back in range(_cal_months - 1, -1, -1):
-            _cal_m = _cal_base_today.month - _cal_back
-            _cal_y = _cal_base_today.year
-            while _cal_m <= 0:
-                _cal_m += 12
-                _cal_y -= 1
-            _cal_month_keys.append(f"{_cal_y:04d}-{_cal_m:02d}")
-
-        # 优先取 db 模块属性：并行方稍后合入、或测试里 patch db.get_daily_expense_totals 都能生效；
-        # 模块属性不存在时退回顶部 guarded import 绑定的名字（同样可能为 None）。
-        _cal_lookup = getattr(db, "get_daily_expense_totals", None)
-        if _cal_lookup is None:
-            _cal_lookup = get_daily_expense_totals
-
-        _cal_daily = None
-        _cal_unavailable = False
-        if _cal_lookup is None:
-            # 后端函数尚未合入：与取数异常同样处理，只给一行提示
-            _cal_unavailable = True
-        else:
-            try:
-                _cal_daily = _cal_lookup(
-                    st.session_state.user_id, months=_cal_months, today=_cal_today
-                )
-            except Exception as _cal_exc:
-                print(f"[calendar] 读取每日支出失败：{type(_cal_exc).__name__}: {_cal_exc}")
-                _cal_daily = None
-                _cal_unavailable = True
-
-        if _cal_unavailable or not isinstance(_cal_daily, dict) or not _cal_daily:
-            # 空 dict 视为后端未能给出连续序列（正常契约至少含零填充日期），同样降级
-            st.caption("日历热力图暂不可用")
-        else:
-            # 归一成 [["YYYY-MM-DD", float], ...]；跳过非法键 / NaN / 负数 / 非数字值，
-            # 一条脏数据不拖垮整块日历。
-            _cal_points = []
-            for _cal_date, _cal_value in _cal_daily.items():
-                try:
-                    _cal_amount = float(_cal_value)
-                except (TypeError, ValueError):
-                    continue
-                _cal_date_str = str(_cal_date).strip()
-                if (
-                    len(_cal_date_str) != 10
-                    or _cal_date_str[4] != "-"
-                    or _cal_date_str[7] != "-"
-                    or not math.isfinite(_cal_amount)
-                    or _cal_amount < 0
-                ):
-                    continue
-                _cal_points.append((_cal_date_str, _cal_amount))
-            _cal_points.sort(key=lambda _item: _item[0])
-
-            _cal_vmax = max((_value for _, _value in _cal_points), default=0.0)
-            if _cal_vmax <= 0:
-                # 契约里零填充的日期也会有 0 值：全 0 说明这段时间没有支出，不画空图
-                st.caption("这段时间还没有支出记录，先记几笔吧")
-            else:
-                # streamlit-echarts 的 height 参数是字符串（默认 "300px"）：传整数时前端
-                # 会拼成无单位的 style.height → canvas 高度为 0（图表整块空白），必须带 px。
-                # 本月压到 240px 减少下方空白；三个月横向并排，300px 足够放下 6 行格子。
-                _cal_height = "240px" if _cal_months == 1 else "300px"
-                # 三个月：三个 calendar 横向并排（3 × 7 列 ≈ 460px），比纵向堆叠饱满得多，
-                # 也不会出现月份标签互相叠压；本月：单个 calendar 居中、格子放大到 26px。
-                _cal_lefts = ["3%", "36%", "69%"] if _cal_months > 1 else ["center"]
-                _cal_cell = 26 if _cal_months == 1 else 22
-                _cal_calendars = []
-                _cal_series = []
-                for _cal_index, _cal_month_key in enumerate(_cal_month_keys):
-                    _cal_calendar = {
-                        "range": [_cal_month_key],
-                        # 固定正方形色块：cellSize 两个数值必须相等；传 ["auto", N] 时
-                        # 宽度会被日历布局拉长成细长条（上一版的问题）。
-                        "cellSize": [_cal_cell, _cal_cell],
-                        "yearLabel": {"show": False},
-                        "dayLabel": {"nameMap": "ZH"},
-                        "monthLabel": {"nameMap": "ZH", "position": "start"},
-                        "itemStyle": {"color": "transparent", "borderWidth": 0},
-                        "splitLine": {"show": False},
-                        "left": _cal_lefts[_cal_index],
-                        "top": "12%",
+                rose_data = [
+                    {"name": str(cat_name), "value": round(float(cat_amount), 2)}
+                    for cat_name, cat_amount in cat_totals.items()
+                    if float(cat_amount) > 0
+                ]
+                if not rose_data:
+                    st.caption("本月还没有支出，先记几笔吧")
+                else:
+                    rose_option = {
+                        "tooltip": {"trigger": "item", "formatter": "{b}: {c} 元 ({d}%)"},
+                        "legend": {"orient": "vertical", "left": "left"},
+                        "series": [{
+                            "type": "pie",
+                            "radius": ["30%", "70%"],
+                            "center": ["50%", "55%"],
+                            "roseType": "radius",
+                            "itemStyle": {"borderRadius": 6},
+                            "data": rose_data
+                        }]
                     }
-                    _cal_calendars.append(_cal_calendar)
-                    _cal_series.append(
-                        {
-                            "type": "heatmap",
-                            "coordinateSystem": "calendar",
-                            "calendarIndex": _cal_index,
-                            "data": [
-                                [_date_str, _value]
-                                for _date_str, _value in _cal_points
-                                if _date_str[:7] == _cal_month_key
-                            ],
-                            "itemStyle": {"borderRadius": 3},
-                        }
-                    )
-
-                # tooltip 用 ECharts 默认的 item 触发（显示「日期, 值」）：
-                # st_echarts 通过 JSON 传参，JS 函数字符串不会被执行，故不写 formatter 函数。
-                _cal_option = {
-                    "tooltip": {"trigger": "item"},
-                    "visualMap": {
-                        "min": 0,
-                        "max": _cal_vmax,
-                        "orient": "horizontal",
-                        "left": "center",
-                        "bottom": 0,
-                        "calculable": False,
-                        "itemWidth": 12,
-                        "itemHeight": 80,
-                        "inRange": {
-                            "color": [
-                                "#f1f3f5",
-                                "#ffe3e3",
-                                "#ffb3b3",
-                                "#ff6b6b",
-                                "#c92a2a",
-                            ]
-                        },
-                        "text": ["高", "低"],
-                    },
-                    "calendar": _cal_calendars,
-                    "series": _cal_series,
-                }
-                # 左图右榜：左侧日历热力图，右侧是跟随当前时间范围的花钱 Top 3。
-                # 图表保留原有 st.container() + 异常降级（容器在列内，不会视觉双框）。
-                _cal_left, _cal_right = st.columns([2, 1], gap="large")
-                with _cal_left:
+                    # 用容器包裹，避免父级 flex/样式异常时图表塌陷；异常只降级提示，不红屏。
                     try:
                         with st.container():
-                            st_echarts(_cal_option, height=_cal_height)
-                    except Exception as _cal_chart_exc:
-                        print(
-                            f"[chart] 日历热力图渲染失败："
-                            f"{type(_cal_chart_exc).__name__}: {_cal_chart_exc}"
-                        )
-                        st.warning("日历热力图暂时无法渲染，请刷新页面重试")
-                with _cal_right:
-                    st.markdown("#### 🏆 花钱最猛 Top 3")
-                    st.caption("按当前选择的时间范围统计")
-                    # 用归一化后的 _cal_points（日期已校验、金额已转 float）：
-                    # 榜单范围随上方 radio 走（本月 → 本月 Top3；近三个月 → 近三个月 Top3）。
-                    _cal_top3 = sorted(
-                        ((_day, _amount) for _day, _amount in _cal_points if _amount > 0),
-                        key=lambda _item: _item[1],
-                        reverse=True,
-                    )[:3]
-                    if not _cal_top3:
-                        st.caption("这段时间还没有支出")
-                    else:
-                        for _cal_rank, (_cal_day_str, _cal_amount) in enumerate(_cal_top3):
-                            _cal_medal = ["🥇", "🥈", "🥉"][_cal_rank]
-                            _cal_day = datetime.strptime(_cal_day_str, "%Y-%m-%d")
-                            st.markdown(
-                                f"{_cal_medal} **{_cal_day.month}月{_cal_day.day}日**："
-                                f"花了 **{_cal_amount:.0f}** 元"
-                            )
+                            st_echarts(rose_option, height="320px")
+                    except Exception as _rose_exc:
+                        print(f"[chart] 玫瑰图渲染失败：{type(_rose_exc).__name__}: {_rose_exc}")
+                        st.warning("玫瑰图暂时无法渲染，请刷新页面重试")
 
-    with _dash_chart_tabs[2]:
-        # ---- 🧪 财务沙盘推演（放在「我的挑战」之后，Tab2 最后一张卡片）----
-        # 推演后端 db.simulate_sandbox_scenarios / ai_agent.generate_sandbox_advice、
-        # 折线图 option（sandbox_chart）任一缺失 / 异常都只在卡片内降级，绝不红屏。
-        with st.container(border=True, key="card_sandbox"):
-            st.subheader("🧪 财务沙盘推演")
-            _sandbox_months = st.slider(
-                "推演月数（月）",
-                min_value=1,
-                max_value=24,
-                value=6,
-                step=1,
-                key="sandbox_months",
-                help="1~24 个月自由拖拽；月份从下个月开始算",
-            )
+            # 场景词云（022）：本月支出按副标签汇总，字号 = 金额（面积感知，避免巨额标签压扁其他词）
+            st.subheader("场景词云")
             st.caption(
-                f"假设未来的收支变化，推演接下来 {_sandbox_months} 个月的结余走势："
-                "保守消费省 20%、现行消费不变、激进消费多花 20%"
+                "本月支出按副标签汇总：字号越大，说明这类场景花得越多；"
+                "一笔钱可以同时计入多个场景，所以各标签合计会大于总支出"
             )
+            if "sub_tags" not in df_current_month.columns:
+                st.info("副标签功能未启用：请先执行 migrations/022_bills_sub_tags.sql")
+            else:
+                _tag_rows = db.aggregate_sub_tag_spending(month_exp_df, limit=14)
+                if not _tag_rows:
+                    st.caption("本月还没有带副标签的支出；记账时选几个场景标签，这里就会长出来")
+                else:
+                    _tag_max = _tag_rows[0][1] or 1.0
+                    _tag_palette = ["#1f4e79", "#2e6da4", "#3f8fbf", "#5aa9c9", "#7bc4b8"]
+                    _tag_nodes = []
+                    for _tag_idx, (_tag_name, _tag_amount) in enumerate(_tag_rows):
+                        # 面积感知：金额翻 4 倍，字号才翻倍 → 头部标签够醒目，长尾也不至于看不见
+                        _font_size = int(12 + 20 * math.sqrt(max(_tag_amount, 0.0) / _tag_max))
+                        _tag_nodes.append({
+                            "name": _tag_name,
+                            "value": round(float(_tag_amount), 2),
+                            "symbolSize": 1,          # 只留文字：graph 的节点圆点设为 1px
+                            "label": {
+                                "fontSize": _font_size,
+                                "fontWeight": 700 if _tag_idx < 3 else 500,
+                                "color": _tag_palette[min(_tag_idx // 3, len(_tag_palette) - 1)],
+                            },
+                        })
+                    _tag_option = {
+                        "tooltip": {"trigger": "item", "formatter": "{b}<br/>本月支出：{c} 元"},
+                        "series": [{
+                            "type": "graph",
+                            "layout": "force",        # ECharts 核心内置力导向，不依赖 wordcloud 扩展
+                            "roam": False,
+                            "draggable": False,
+                            "left": "4%", "right": "4%", "top": 16, "bottom": 16,
+                            "force": {
+                                "repulsion": 180,
+                                "gravity": 0.08,
+                                "edgeLength": 24,
+                                "friction": 0.15,
+                            },
+                            "label": {"show": True, "position": "inside"},
+                            "itemStyle": {"opacity": 0},   # 隐藏节点圆点，只显示标签文字
+                            "labelLayout": {"hideOverlap": True},  # 落位后自动隐藏重叠文字
+                            "data": _tag_nodes,
+                            "links": [],
+                        }],
+                    }
+                    try:
+                        # 用容器包裹，避免父级 flex/样式异常时图表塌陷；异常只降级提示，不红屏
+                        with st.container():
+                            st_echarts(_tag_option, height="360px", key="sub_tag_wordcloud")
+                    except Exception as _tag_exc:
+                        print(f"[chart] 场景词云渲染失败：{type(_tag_exc).__name__}: {_tag_exc}")
+                        st.warning("场景词云暂时无法渲染，请刷新页面重试")
+                    _tag_top_text = " · ".join(
+                        f"{_tag_name} ¥{_tag_amount:.0f}" for _tag_name, _tag_amount in _tag_rows[:3]
+                    )
+                    st.caption(f"本月 Top 3 场景：{_tag_top_text}")
 
+        with _dash_chart_tabs[1]:
+            # ===== 消费日历热力图（本月 / 近三个月）=====
+            # 数据由并行方 db.get_daily_expense_totals 提供（连续零填充的每日支出合计）：
+            # 函数缺失 / 取数异常 / 返回空 dict 都只降级成一行提示，绝不红屏。
+            # 放在玫瑰图之后、AI 洞察之前；与上方玫瑰图不同，这里不依赖 df 的 category 列。
+            st.subheader("🗓️ 消费日历热力图")
+            st.caption("💡 颜色越红，代表当天花钱越猛。鼠标悬停可查看具体金额。")
+            # 默认展示「近三个月」：只在首次访问时写入默认值，用户之后切到「本月」不会被重置。
+            if "cal_range" not in st.session_state:
+                st.session_state["cal_range"] = "近三个月"
+            _cal_range = st.radio("范围", ["本月", "近三个月"], horizontal=True, key="cal_range")
+            _cal_months = 1 if _cal_range == "本月" else 3
+
+            # 用项目统一的 UTC+8 日报时钟确定「今天」，避免部署机为 UTC 时月份错位；
+            # 时钟异常时退回本机 date.today()，只影响月份归属，不影响其它区块。
+            _cal_today_fn = getattr(db, "_report_today", None)
             try:
-                _sandbox_col_extra, _sandbox_col_cut = st.columns(2)
-                with _sandbox_col_extra:
-                    _sandbox_extra = st.number_input(
-                        "每月额外增加支出（元）",
-                        min_value=0,
-                        value=300,
-                        step=50,
-                        key="sandbox_extra",
-                    )
-                with _sandbox_col_cut:
-                    _sandbox_cut = st.number_input(
-                        "每月减少支出（元）",
-                        min_value=0,
-                        value=0,
-                        step=50,
-                        key="sandbox_cut",
-                    )
+                _cal_today = _cal_today_fn() if callable(_cal_today_fn) else None
+            except Exception as _cal_today_exc:
+                print(
+                    f"[calendar] 读取日报时钟失败："
+                    f"{type(_cal_today_exc).__name__}: {_cal_today_exc}"
+                )
+                _cal_today = None
+            _cal_base_today = _cal_today if isinstance(_cal_today, date) else date.today()
 
-                if st.button(
-                    f"📊 推演未来 {_sandbox_months} 个月",
-                    key="sandbox_run",
-                    use_container_width=True,
-                ):
-                    _sandbox_balance = float(total_income - total_expense)
-                    try:
-                        _sandbox_month_expense = float(month_expense)
-                    except (TypeError, ValueError):
-                        _sandbox_month_expense = 0.0
-                    try:
-                        _sandbox_today = db._report_today()
-                    except Exception as _sandbox_today_exc:
-                        print(
-                            f"[sandbox] 读取日报时钟失败："
-                            f"{type(_sandbox_today_exc).__name__}: {_sandbox_today_exc}"
-                        )
-                        _sandbox_today = date.today()
-                    # 本月支出 / 已过天数 → 日均；再估算整月基线支出。
-                    _sandbox_daily_avg = _sandbox_month_expense / max(
-                        int(getattr(_sandbox_today, "day", 1) or 1), 1
-                    )
-                    try:
-                        _sandbox_budget = float(st.session_state.monthly_budget)
-                    except (TypeError, ValueError):
-                        _sandbox_budget = 0.0
+            # 近 N 个月：以今天所在月为最后一个月往前推（升序，方便日历从上到下按时间排列）
+            _cal_month_keys = []
+            for _cal_back in range(_cal_months - 1, -1, -1):
+                _cal_m = _cal_base_today.month - _cal_back
+                _cal_y = _cal_base_today.year
+                while _cal_m <= 0:
+                    _cal_m += 12
+                    _cal_y -= 1
+                _cal_month_keys.append(f"{_cal_y:04d}-{_cal_m:02d}")
 
-                    if _sandbox_budget <= 0 and _sandbox_daily_avg <= 0:
-                        st.info("缺少预算与消费数据，无法推演")
-                    else:
-                        _sandbox_monthly_base = (
-                            _sandbox_budget
-                            if _sandbox_budget > 0
-                            else _sandbox_daily_avg * 30.0
+            # 优先取 db 模块属性：并行方稍后合入、或测试里 patch db.get_daily_expense_totals 都能生效；
+            # 模块属性不存在时退回顶部 guarded import 绑定的名字（同样可能为 None）。
+            _cal_lookup = getattr(db, "get_daily_expense_totals", None)
+            if _cal_lookup is None:
+                _cal_lookup = get_daily_expense_totals
+
+            _cal_daily = None
+            _cal_unavailable = False
+            if _cal_lookup is None:
+                # 后端函数尚未合入：与取数异常同样处理，只给一行提示
+                _cal_unavailable = True
+            else:
+                try:
+                    _cal_daily = _cal_lookup(
+                        st.session_state.user_id, months=_cal_months, today=_cal_today
+                    )
+                except Exception as _cal_exc:
+                    print(f"[calendar] 读取每日支出失败：{type(_cal_exc).__name__}: {_cal_exc}")
+                    _cal_daily = None
+                    _cal_unavailable = True
+
+            if _cal_unavailable or not isinstance(_cal_daily, dict) or not _cal_daily:
+                # 空 dict 视为后端未能给出连续序列（正常契约至少含零填充日期），同样降级
+                st.caption("日历热力图暂不可用")
+            else:
+                # 归一成 [["YYYY-MM-DD", float], ...]；跳过非法键 / NaN / 负数 / 非数字值，
+                # 一条脏数据不拖垮整块日历。
+                _cal_points = []
+                for _cal_date, _cal_value in _cal_daily.items():
+                    try:
+                        _cal_amount = float(_cal_value)
+                    except (TypeError, ValueError):
+                        continue
+                    _cal_date_str = str(_cal_date).strip()
+                    if (
+                        len(_cal_date_str) != 10
+                        or _cal_date_str[4] != "-"
+                        or _cal_date_str[7] != "-"
+                        or not math.isfinite(_cal_amount)
+                        or _cal_amount < 0
+                    ):
+                        continue
+                    _cal_points.append((_cal_date_str, _cal_amount))
+                _cal_points.sort(key=lambda _item: _item[0])
+
+                _cal_vmax = max((_value for _, _value in _cal_points), default=0.0)
+                if _cal_vmax <= 0:
+                    # 契约里零填充的日期也会有 0 值：全 0 说明这段时间没有支出，不画空图
+                    st.caption("这段时间还没有支出记录，先记几笔吧")
+                else:
+                    # streamlit-echarts 的 height 参数是字符串（默认 "300px"）：传整数时前端
+                    # 会拼成无单位的 style.height → canvas 高度为 0（图表整块空白），必须带 px。
+                    # 本月压到 240px 减少下方空白；三个月横向并排，300px 足够放下 6 行格子。
+                    _cal_height = "240px" if _cal_months == 1 else "300px"
+                    # 三个月：三个 calendar 横向并排（3 × 7 列 ≈ 460px），比纵向堆叠饱满得多，
+                    # 也不会出现月份标签互相叠压；本月：单个 calendar 居中、格子放大到 26px。
+                    _cal_lefts = ["3%", "36%", "69%"] if _cal_months > 1 else ["center"]
+                    _cal_cell = 26 if _cal_months == 1 else 22
+                    _cal_calendars = []
+                    _cal_series = []
+                    for _cal_index, _cal_month_key in enumerate(_cal_month_keys):
+                        _cal_calendar = {
+                            "range": [_cal_month_key],
+                            # 固定正方形色块：cellSize 两个数值必须相等；传 ["auto", N] 时
+                            # 宽度会被日历布局拉长成细长条（上一版的问题）。
+                            "cellSize": [_cal_cell, _cal_cell],
+                            "yearLabel": {"show": False},
+                            "dayLabel": {"nameMap": "ZH"},
+                            "monthLabel": {"nameMap": "ZH", "position": "start"},
+                            "itemStyle": {"color": "transparent", "borderWidth": 0},
+                            "splitLine": {"show": False},
+                            "left": _cal_lefts[_cal_index],
+                            "top": "12%",
+                        }
+                        _cal_calendars.append(_cal_calendar)
+                        _cal_series.append(
+                            {
+                                "type": "heatmap",
+                                "coordinateSystem": "calendar",
+                                "calendarIndex": _cal_index,
+                                "data": [
+                                    [_date_str, _value]
+                                    for _date_str, _value in _cal_points
+                                    if _date_str[:7] == _cal_month_key
+                                ],
+                                "itemStyle": {"borderRadius": 3},
+                            }
                         )
-                        _sandbox_scenarios_fn = getattr(
-                            db, "simulate_sandbox_scenarios", None
-                        )
-                        if not callable(_sandbox_scenarios_fn):
-                            print("[sandbox] db.simulate_sandbox_scenarios 不可用")
-                            st.error("推演失败，请稍后再试")
+
+                    # tooltip 用 ECharts 默认的 item 触发（显示「日期, 值」）：
+                    # st_echarts 通过 JSON 传参，JS 函数字符串不会被执行，故不写 formatter 函数。
+                    _cal_option = {
+                        "tooltip": {"trigger": "item"},
+                        "visualMap": {
+                            "min": 0,
+                            "max": _cal_vmax,
+                            "orient": "horizontal",
+                            "left": "center",
+                            "bottom": 0,
+                            "calculable": False,
+                            "itemWidth": 12,
+                            "itemHeight": 80,
+                            "inRange": {
+                                "color": [
+                                    "#f1f3f5",
+                                    "#ffe3e3",
+                                    "#ffb3b3",
+                                    "#ff6b6b",
+                                    "#c92a2a",
+                                ]
+                            },
+                            "text": ["高", "低"],
+                        },
+                        "calendar": _cal_calendars,
+                        "series": _cal_series,
+                    }
+                    # 左图右榜：左侧日历热力图，右侧是跟随当前时间范围的花钱 Top 3。
+                    # 图表保留原有 st.container() + 异常降级（容器在列内，不会视觉双框）。
+                    _cal_left, _cal_right = st.columns([2, 1], gap="large")
+                    with _cal_left:
+                        try:
+                            with st.container():
+                                st_echarts(_cal_option, height=_cal_height)
+                        except Exception as _cal_chart_exc:
+                            print(
+                                f"[chart] 日历热力图渲染失败："
+                                f"{type(_cal_chart_exc).__name__}: {_cal_chart_exc}"
+                            )
+                            st.warning("日历热力图暂时无法渲染，请刷新页面重试")
+                    with _cal_right:
+                        st.markdown("#### 🏆 花钱最猛 Top 3")
+                        st.caption("按当前选择的时间范围统计")
+                        # 用归一化后的 _cal_points（日期已校验、金额已转 float）：
+                        # 榜单范围随上方 radio 走（本月 → 本月 Top3；近三个月 → 近三个月 Top3）。
+                        _cal_top3 = sorted(
+                            ((_day, _amount) for _day, _amount in _cal_points if _amount > 0),
+                            key=lambda _item: _item[1],
+                            reverse=True,
+                        )[:3]
+                        if not _cal_top3:
+                            st.caption("这段时间还没有支出")
                         else:
-                            try:
-                                with st.spinner(
-                                    f"正在推演未来 {_sandbox_months} 个月的三种情景…"
-                                ):
-                                    _sandbox_scenarios = _sandbox_scenarios_fn(
-                                        _sandbox_balance,
-                                        _sandbox_monthly_base,
-                                        extra_expense=float(_sandbox_extra),
-                                        cut_expense=float(_sandbox_cut),
-                                        months=int(_sandbox_months),
-                                        today=_sandbox_today,
-                                    )
-                                if (
-                                    not isinstance(_sandbox_scenarios, dict)
-                                    or not isinstance(
-                                        _sandbox_scenarios.get("scenarios"), list
-                                    )
-                                    or not _sandbox_scenarios["scenarios"]
-                                    or not isinstance(
-                                        _sandbox_scenarios.get("current"), dict
-                                    )
-                                    or not isinstance(
-                                        _sandbox_scenarios.get("months"), list
-                                    )
-                                ):
-                                    raise ValueError(
-                                        "simulate_sandbox_scenarios 返回结构不合规"
-                                    )
-                            except Exception as _sandbox_sim_exc:
-                                print(
-                                    f"[sandbox] 推演失败："
-                                    f"{type(_sandbox_sim_exc).__name__}: "
-                                    f"{_sandbox_sim_exc}"
+                            for _cal_rank, (_cal_day_str, _cal_amount) in enumerate(_cal_top3):
+                                _cal_medal = ["🥇", "🥈", "🥉"][_cal_rank]
+                                _cal_day = datetime.strptime(_cal_day_str, "%Y-%m-%d")
+                                st.markdown(
+                                    f"{_cal_medal} **{_cal_day.month}月{_cal_day.day}日**："
+                                    f"花了 **{_cal_amount:.0f}** 元"
                                 )
-                                st.session_state.pop("sandbox_result_v2", None)
+
+        with _dash_chart_tabs[2]:
+            # ---- 🧪 财务沙盘推演（放在「我的挑战」之后，Tab2 最后一张卡片）----
+            # 推演后端 db.simulate_sandbox_scenarios / ai_agent.generate_sandbox_advice、
+            # 折线图 option（sandbox_chart）任一缺失 / 异常都只在卡片内降级，绝不红屏。
+            with st.container(border=True, key="card_sandbox"):
+                st.subheader("🧪 财务沙盘推演")
+                _sandbox_months = st.slider(
+                    "推演月数（月）",
+                    min_value=1,
+                    max_value=24,
+                    value=6,
+                    step=1,
+                    key="sandbox_months",
+                    help="1~24 个月自由拖拽；月份从下个月开始算",
+                )
+                st.caption(
+                    f"假设未来的收支变化，推演接下来 {_sandbox_months} 个月的结余走势："
+                    "保守消费省 20%、现行消费不变、激进消费多花 20%"
+                )
+
+                try:
+                    _sandbox_col_extra, _sandbox_col_cut = st.columns(2)
+                    with _sandbox_col_extra:
+                        _sandbox_extra = st.number_input(
+                            "每月额外增加支出（元）",
+                            min_value=0,
+                            value=300,
+                            step=50,
+                            key="sandbox_extra",
+                        )
+                    with _sandbox_col_cut:
+                        _sandbox_cut = st.number_input(
+                            "每月减少支出（元）",
+                            min_value=0,
+                            value=0,
+                            step=50,
+                            key="sandbox_cut",
+                        )
+
+                    if st.button(
+                        f"📊 推演未来 {_sandbox_months} 个月",
+                        key="sandbox_run",
+                        use_container_width=True,
+                    ):
+                        _sandbox_balance = float(total_income - total_expense)
+                        try:
+                            _sandbox_month_expense = float(month_expense)
+                        except (TypeError, ValueError):
+                            _sandbox_month_expense = 0.0
+                        try:
+                            _sandbox_today = db._report_today()
+                        except Exception as _sandbox_today_exc:
+                            print(
+                                f"[sandbox] 读取日报时钟失败："
+                                f"{type(_sandbox_today_exc).__name__}: {_sandbox_today_exc}"
+                            )
+                            _sandbox_today = date.today()
+                        # 本月支出 / 已过天数 → 日均；再估算整月基线支出。
+                        _sandbox_daily_avg = _sandbox_month_expense / max(
+                            int(getattr(_sandbox_today, "day", 1) or 1), 1
+                        )
+                        try:
+                            _sandbox_budget = float(st.session_state.monthly_budget)
+                        except (TypeError, ValueError):
+                            _sandbox_budget = 0.0
+
+                        if _sandbox_budget <= 0 and _sandbox_daily_avg <= 0:
+                            st.info("缺少预算与消费数据，无法推演")
+                        else:
+                            _sandbox_monthly_base = (
+                                _sandbox_budget
+                                if _sandbox_budget > 0
+                                else _sandbox_daily_avg * 30.0
+                            )
+                            _sandbox_scenarios_fn = getattr(
+                                db, "simulate_sandbox_scenarios", None
+                            )
+                            if not callable(_sandbox_scenarios_fn):
+                                print("[sandbox] db.simulate_sandbox_scenarios 不可用")
                                 st.error("推演失败，请稍后再试")
                             else:
-                                # 结果持久化：按钮只在点击那一次为 True，rerun 后靠 session 继续展示。
-                                st.session_state["sandbox_result_v2"] = {
-                                    "input": {
-                                        "initial_balance": _sandbox_balance,
-                                        "monthly_base_expense": _sandbox_monthly_base,
-                                        "extra_expense": float(_sandbox_extra),
-                                        "cut_expense": float(_sandbox_cut),
-                                        "months": int(_sandbox_months),
-                                        "today": str(_sandbox_today),
-                                    },
-                                    "scenarios": _sandbox_scenarios,
-                                }
-
-                # ---- 渲染推演结果：独立于按钮，rerun 后仍在 ----
-                _sandbox_saved = st.session_state.get("sandbox_result_v2")
-                if (
-                    isinstance(_sandbox_saved, dict)
-                    and isinstance(_sandbox_saved.get("scenarios"), dict)
-                    and isinstance(
-                        _sandbox_saved["scenarios"].get("scenarios"), list
-                    )
-                    and isinstance(_sandbox_saved["scenarios"].get("current"), dict)
-                ):
-                    try:
-                        _sandbox_chart_data = _sandbox_saved["scenarios"]
-                        _sandbox_input = _sandbox_saved.get("input")
-                        if not isinstance(_sandbox_input, dict):
-                            _sandbox_input = {}
-                        _sandbox_current = _sandbox_chart_data["current"]
-                        _sandbox_months_count = int(
-                            _sandbox_chart_data.get("months_count")
-                            or len(_sandbox_chart_data.get("months") or [])
-                            or 6
-                        )
-
-                        # 滑块 / 输入框改过但没点按钮：明确提示「下面是旧结果」，
-                        # 否则用户拖完滑块会误以为图已经变了（图上的月份其实是上一次的）。
-                        try:
-                            _sandbox_input_extra = float(
-                                _sandbox_input.get("extra_expense")
-                            )
-                            _sandbox_input_cut = float(
-                                _sandbox_input.get("cut_expense")
-                            )
-                        except (TypeError, ValueError):
-                            _sandbox_input_extra = float(_sandbox_extra)
-                            _sandbox_input_cut = float(_sandbox_cut)
-                        if (
-                            _sandbox_months_count != int(_sandbox_months)
-                            or _sandbox_input_extra != float(_sandbox_extra)
-                            or _sandbox_input_cut != float(_sandbox_cut)
-                        ):
-                            st.caption(
-                                "⚠️ 参数已变更，下方仍是上一次推演的结果，"
-                                "点「推演」按钮更新"
-                            )
-
-                        # ---- 三条情景折线（tooltip 金额带 ¥，0 元参考线）----
-                        if build_sandbox_option is None:
-                            st.caption("折线图模块暂不可用，下方指标仍然有效")
-                        else:
-                            st_echarts(
-                                build_sandbox_option(_sandbox_chart_data),
-                                height="340px",
-                            )
-
-                        # 破产提示只看「现行」一档：那才是用户当前真实的消费节奏。
-                        _sandbox_broke_month = _sandbox_current.get("broke_month")
-                        if _sandbox_broke_month:
-                            st.error(
-                                f"⚠️ 现行消费下，第 {_sandbox_current.get('broke_index')} 个月"
-                                f"（{_sandbox_broke_month}）结余将跌破 0，"
-                                "请提前调整计划！"
-                            )
-                        else:
-                            _sandbox_final_balance = float(
-                                _sandbox_current.get("final_balance") or 0.0
-                            )
-                            st.success(
-                                f"✅ 按现行消费，{_sandbox_months_count} 个月后仍有结余 "
-                                f"¥{_sandbox_final_balance:.2f}"
-                            )
-
-                        _sandbox_metric1, _sandbox_metric2, _sandbox_metric3 = (
-                            st.columns(3)
-                        )
-                        with _sandbox_metric1:
-                            st.metric(
-                                f"{_sandbox_months_count} 个月后结余",
-                                f"¥{float(_sandbox_current.get('final_balance') or 0.0):.2f}",
-                            )
-                        with _sandbox_metric2:
-                            st.metric(
-                                "最低结余",
-                                f"¥{float(_sandbox_current.get('min_balance') or 0.0):.2f}",
-                            )
-                        with _sandbox_metric3:
-                            st.metric(
-                                "破产月份",
-                                str(_sandbox_broke_month or "不会破产"),
-                            )
-
-                        # 三档期末结余横向对比：图看走势，这行看落点。
-                        _sandbox_final_parts = []
-                        for _scenario in _sandbox_chart_data["scenarios"]:
-                            if not isinstance(_scenario, dict):
-                                continue
-                            _sandbox_final_parts.append(
-                                f"{_scenario.get('label') or _scenario.get('key')} "
-                                f"¥{float(_scenario.get('final_balance') or 0.0):.2f}"
-                            )
-                        if _sandbox_final_parts:
-                            st.caption(
-                                f"推演 {_sandbox_months_count} 个月后的期末结余："
-                                + " ｜ ".join(_sandbox_final_parts)
-                            )
-
-                        # ---- AI 沙盘顾问：命中进程缓存不调 API、不扣额度 ----
-                        # 点评对象是「现行」档（stats 里就是现行逐月余额），
-                        # 月数按月滑块走，系统提示词由 ai_agent 按实际月数渲染。
-                        _sandbox_stats = {
-                            "input": dict(_sandbox_input),
-                            "result": _sandbox_current,
-                            "initial_balance": float(
-                                _sandbox_input.get(
-                                    "initial_balance",
-                                    _sandbox_chart_data.get("initial_balance") or 0.0,
-                                )
-                            ),
-                            "monthly_base_expense": float(
-                                _sandbox_input.get(
-                                    "monthly_base_expense",
-                                    _sandbox_current.get("monthly_base_expense")
-                                    or 0.0,
-                                )
-                            ),
-                            "extra_expense": float(
-                                _sandbox_input.get(
-                                    "extra_expense",
-                                    _sandbox_chart_data.get("extra_expense") or 0.0,
-                                )
-                            ),
-                            "cut_expense": float(
-                                _sandbox_input.get(
-                                    "cut_expense",
-                                    _sandbox_chart_data.get("cut_expense") or 0.0,
-                                )
-                            ),
-                            "months_count": _sandbox_months_count,
-                            "broke_month": _sandbox_current.get("broke_month"),
-                            "broke_index": _sandbox_current.get("broke_index"),
-                            "min_balance": float(
-                                _sandbox_current.get("min_balance") or 0.0
-                            ),
-                            "final_balance": float(
-                                _sandbox_current.get("final_balance") or 0.0
-                            ),
-                            "months": [
-                                {
-                                    "month": _month_row.get("month"),
-                                    "balance": _month_row.get("balance"),
-                                }
-                                for _month_row in (_sandbox_current.get("months") or [])
-                            ],
-                        }
-                        _sandbox_cache_key = _sandbox_advice_key(_sandbox_stats)
-                        _sandbox_store = _sandbox_advice_store()
-                        _sandbox_entry = _sandbox_store.get(_sandbox_cache_key)
-
-                        if not (
-                            isinstance(_sandbox_entry, dict)
-                            and _sandbox_entry.get("text")
-                        ):
-                            if st.session_state.get("ai_daily_count", 0) >= 20:
-                                # 额度用完：不调用、不写缓存（额度恢复后同一组数据仍可生成）
-                                st.caption("今日 AI 额度已用完，暂不生成沙盘点评")
-                                _sandbox_entry = None
-                            else:
-                                _sandbox_fallback_text = _sandbox_fallback_advice(
-                                    _sandbox_current
-                                )
-                                _sandbox_advice_fn = _get_sandbox_advice_fn()
-                                if _sandbox_advice_fn is None:
-                                    # 后端尚未合入：本地兜底并写缓存；按「已尝试」+1 额度
+                                try:
+                                    with st.spinner(
+                                        f"正在推演未来 {_sandbox_months} 个月的三种情景…"
+                                    ):
+                                        _sandbox_scenarios = _sandbox_scenarios_fn(
+                                            _sandbox_balance,
+                                            _sandbox_monthly_base,
+                                            extra_expense=float(_sandbox_extra),
+                                            cut_expense=float(_sandbox_cut),
+                                            months=int(_sandbox_months),
+                                            today=_sandbox_today,
+                                        )
+                                    if (
+                                        not isinstance(_sandbox_scenarios, dict)
+                                        or not isinstance(
+                                            _sandbox_scenarios.get("scenarios"), list
+                                        )
+                                        or not _sandbox_scenarios["scenarios"]
+                                        or not isinstance(
+                                            _sandbox_scenarios.get("current"), dict
+                                        )
+                                        or not isinstance(
+                                            _sandbox_scenarios.get("months"), list
+                                        )
+                                    ):
+                                        raise ValueError(
+                                            "simulate_sandbox_scenarios 返回结构不合规"
+                                        )
+                                except Exception as _sandbox_sim_exc:
                                     print(
-                                        "[sandbox] ai_agent.generate_sandbox_advice "
-                                        "不可用，使用本地兜底"
+                                        f"[sandbox] 推演失败："
+                                        f"{type(_sandbox_sim_exc).__name__}: "
+                                        f"{_sandbox_sim_exc}"
                                     )
-                                    _sandbox_entry = {
-                                        "text": _sandbox_fallback_text,
-                                        "fallback": True,
-                                    }
-                                    _sandbox_store[_sandbox_cache_key] = (
-                                        _sandbox_entry
-                                    )
-                                    st.session_state.ai_daily_count = (
-                                        st.session_state.get("ai_daily_count", 0)
-                                        + 1
-                                    )
+                                    st.session_state.pop("sandbox_result_v2", None)
+                                    st.error("推演失败，请稍后再试")
                                 else:
-                                    try:
-                                        with st.spinner("AI 正在读沙盘结果…"):
-                                            _sandbox_ai_text = _sandbox_advice_fn(
-                                                _sandbox_stats,
-                                                get_deepseek_api_key(),
-                                            )
-                                        if (
-                                            not isinstance(_sandbox_ai_text, str)
-                                            or not _sandbox_ai_text.strip()
-                                        ):
-                                            raise ValueError(
-                                                "generate_sandbox_advice 返回空文本"
-                                            )
-                                    except Exception as _sandbox_ai_exc:
-                                        # SandboxAdviceError（未配 key / 网络 / 解析）与
-                                        # 其它异常统一兜底：不红屏，写缓存避免反复失败。
+                                    # 结果持久化：按钮只在点击那一次为 True，rerun 后靠 session 继续展示。
+                                    st.session_state["sandbox_result_v2"] = {
+                                        "input": {
+                                            "initial_balance": _sandbox_balance,
+                                            "monthly_base_expense": _sandbox_monthly_base,
+                                            "extra_expense": float(_sandbox_extra),
+                                            "cut_expense": float(_sandbox_cut),
+                                            "months": int(_sandbox_months),
+                                            "today": str(_sandbox_today),
+                                        },
+                                        "scenarios": _sandbox_scenarios,
+                                    }
+
+                    # ---- 渲染推演结果：独立于按钮，rerun 后仍在 ----
+                    _sandbox_saved = st.session_state.get("sandbox_result_v2")
+                    if (
+                        isinstance(_sandbox_saved, dict)
+                        and isinstance(_sandbox_saved.get("scenarios"), dict)
+                        and isinstance(
+                            _sandbox_saved["scenarios"].get("scenarios"), list
+                        )
+                        and isinstance(_sandbox_saved["scenarios"].get("current"), dict)
+                    ):
+                        try:
+                            _sandbox_chart_data = _sandbox_saved["scenarios"]
+                            _sandbox_input = _sandbox_saved.get("input")
+                            if not isinstance(_sandbox_input, dict):
+                                _sandbox_input = {}
+                            _sandbox_current = _sandbox_chart_data["current"]
+                            _sandbox_months_count = int(
+                                _sandbox_chart_data.get("months_count")
+                                or len(_sandbox_chart_data.get("months") or [])
+                                or 6
+                            )
+
+                            # 滑块 / 输入框改过但没点按钮：明确提示「下面是旧结果」，
+                            # 否则用户拖完滑块会误以为图已经变了（图上的月份其实是上一次的）。
+                            try:
+                                _sandbox_input_extra = float(
+                                    _sandbox_input.get("extra_expense")
+                                )
+                                _sandbox_input_cut = float(
+                                    _sandbox_input.get("cut_expense")
+                                )
+                            except (TypeError, ValueError):
+                                _sandbox_input_extra = float(_sandbox_extra)
+                                _sandbox_input_cut = float(_sandbox_cut)
+                            if (
+                                _sandbox_months_count != int(_sandbox_months)
+                                or _sandbox_input_extra != float(_sandbox_extra)
+                                or _sandbox_input_cut != float(_sandbox_cut)
+                            ):
+                                st.caption(
+                                    "⚠️ 参数已变更，下方仍是上一次推演的结果，"
+                                    "点「推演」按钮更新"
+                                )
+
+                            # ---- 三条情景折线（tooltip 金额带 ¥，0 元参考线）----
+                            if build_sandbox_option is None:
+                                st.caption("折线图模块暂不可用，下方指标仍然有效")
+                            else:
+                                st_echarts(
+                                    build_sandbox_option(_sandbox_chart_data),
+                                    height="340px",
+                                )
+
+                            # 破产提示只看「现行」一档：那才是用户当前真实的消费节奏。
+                            _sandbox_broke_month = _sandbox_current.get("broke_month")
+                            if _sandbox_broke_month:
+                                st.error(
+                                    f"⚠️ 现行消费下，第 {_sandbox_current.get('broke_index')} 个月"
+                                    f"（{_sandbox_broke_month}）结余将跌破 0，"
+                                    "请提前调整计划！"
+                                )
+                            else:
+                                _sandbox_final_balance = float(
+                                    _sandbox_current.get("final_balance") or 0.0
+                                )
+                                st.success(
+                                    f"✅ 按现行消费，{_sandbox_months_count} 个月后仍有结余 "
+                                    f"¥{_sandbox_final_balance:.2f}"
+                                )
+
+                            _sandbox_metric1, _sandbox_metric2, _sandbox_metric3 = (
+                                st.columns(3)
+                            )
+                            with _sandbox_metric1:
+                                st.metric(
+                                    f"{_sandbox_months_count} 个月后结余",
+                                    f"¥{float(_sandbox_current.get('final_balance') or 0.0):.2f}",
+                                )
+                            with _sandbox_metric2:
+                                st.metric(
+                                    "最低结余",
+                                    f"¥{float(_sandbox_current.get('min_balance') or 0.0):.2f}",
+                                )
+                            with _sandbox_metric3:
+                                st.metric(
+                                    "破产月份",
+                                    str(_sandbox_broke_month or "不会破产"),
+                                )
+
+                            # 三档期末结余横向对比：图看走势，这行看落点。
+                            _sandbox_final_parts = []
+                            for _scenario in _sandbox_chart_data["scenarios"]:
+                                if not isinstance(_scenario, dict):
+                                    continue
+                                _sandbox_final_parts.append(
+                                    f"{_scenario.get('label') or _scenario.get('key')} "
+                                    f"¥{float(_scenario.get('final_balance') or 0.0):.2f}"
+                                )
+                            if _sandbox_final_parts:
+                                st.caption(
+                                    f"推演 {_sandbox_months_count} 个月后的期末结余："
+                                    + " ｜ ".join(_sandbox_final_parts)
+                                )
+
+                            # ---- AI 沙盘顾问：命中进程缓存不调 API、不扣额度 ----
+                            # 点评对象是「现行」档（stats 里就是现行逐月余额），
+                            # 月数按月滑块走，系统提示词由 ai_agent 按实际月数渲染。
+                            _sandbox_stats = {
+                                "input": dict(_sandbox_input),
+                                "result": _sandbox_current,
+                                "initial_balance": float(
+                                    _sandbox_input.get(
+                                        "initial_balance",
+                                        _sandbox_chart_data.get("initial_balance") or 0.0,
+                                    )
+                                ),
+                                "monthly_base_expense": float(
+                                    _sandbox_input.get(
+                                        "monthly_base_expense",
+                                        _sandbox_current.get("monthly_base_expense")
+                                        or 0.0,
+                                    )
+                                ),
+                                "extra_expense": float(
+                                    _sandbox_input.get(
+                                        "extra_expense",
+                                        _sandbox_chart_data.get("extra_expense") or 0.0,
+                                    )
+                                ),
+                                "cut_expense": float(
+                                    _sandbox_input.get(
+                                        "cut_expense",
+                                        _sandbox_chart_data.get("cut_expense") or 0.0,
+                                    )
+                                ),
+                                "months_count": _sandbox_months_count,
+                                "broke_month": _sandbox_current.get("broke_month"),
+                                "broke_index": _sandbox_current.get("broke_index"),
+                                "min_balance": float(
+                                    _sandbox_current.get("min_balance") or 0.0
+                                ),
+                                "final_balance": float(
+                                    _sandbox_current.get("final_balance") or 0.0
+                                ),
+                                "months": [
+                                    {
+                                        "month": _month_row.get("month"),
+                                        "balance": _month_row.get("balance"),
+                                    }
+                                    for _month_row in (_sandbox_current.get("months") or [])
+                                ],
+                            }
+                            _sandbox_cache_key = _sandbox_advice_key(_sandbox_stats)
+                            _sandbox_store = _sandbox_advice_store()
+                            _sandbox_entry = _sandbox_store.get(_sandbox_cache_key)
+
+                            if not (
+                                isinstance(_sandbox_entry, dict)
+                                and _sandbox_entry.get("text")
+                            ):
+                                if st.session_state.get("ai_daily_count", 0) >= 20:
+                                    # 额度用完：不调用、不写缓存（额度恢复后同一组数据仍可生成）
+                                    st.caption("今日 AI 额度已用完，暂不生成沙盘点评")
+                                    _sandbox_entry = None
+                                else:
+                                    _sandbox_fallback_text = _sandbox_fallback_advice(
+                                        _sandbox_current
+                                    )
+                                    _sandbox_advice_fn = _get_sandbox_advice_fn()
+                                    if _sandbox_advice_fn is None:
+                                        # 后端尚未合入：本地兜底并写缓存；按「已尝试」+1 额度
                                         print(
-                                            f"[sandbox] AI 沙盘点评失败："
-                                            f"{type(_sandbox_ai_exc).__name__}: "
-                                            f"{_sandbox_ai_exc}"
+                                            "[sandbox] ai_agent.generate_sandbox_advice "
+                                            "不可用，使用本地兜底"
                                         )
                                         _sandbox_entry = {
                                             "text": _sandbox_fallback_text,
@@ -3058,386 +3025,419 @@ with tab_dash:
                                             _sandbox_entry
                                         )
                                         st.session_state.ai_daily_count = (
-                                            st.session_state.get(
-                                                "ai_daily_count", 0
-                                            )
+                                            st.session_state.get("ai_daily_count", 0)
                                             + 1
                                         )
                                     else:
-                                        _sandbox_entry = {
-                                            "text": _sandbox_ai_text.strip(),
-                                            "fallback": False,
-                                        }
-                                        _sandbox_store[_sandbox_cache_key] = (
-                                            _sandbox_entry
-                                        )
-                                        st.session_state.ai_daily_count = (
-                                            st.session_state.get(
-                                                "ai_daily_count", 0
+                                        try:
+                                            with st.spinner("AI 正在读沙盘结果…"):
+                                                _sandbox_ai_text = _sandbox_advice_fn(
+                                                    _sandbox_stats,
+                                                    get_deepseek_api_key(),
+                                                )
+                                            if (
+                                                not isinstance(_sandbox_ai_text, str)
+                                                or not _sandbox_ai_text.strip()
+                                            ):
+                                                raise ValueError(
+                                                    "generate_sandbox_advice 返回空文本"
+                                                )
+                                        except Exception as _sandbox_ai_exc:
+                                            # SandboxAdviceError（未配 key / 网络 / 解析）与
+                                            # 其它异常统一兜底：不红屏，写缓存避免反复失败。
+                                            print(
+                                                f"[sandbox] AI 沙盘点评失败："
+                                                f"{type(_sandbox_ai_exc).__name__}: "
+                                                f"{_sandbox_ai_exc}"
                                             )
-                                            + 1
-                                        )
+                                            _sandbox_entry = {
+                                                "text": _sandbox_fallback_text,
+                                                "fallback": True,
+                                            }
+                                            _sandbox_store[_sandbox_cache_key] = (
+                                                _sandbox_entry
+                                            )
+                                            st.session_state.ai_daily_count = (
+                                                st.session_state.get(
+                                                    "ai_daily_count", 0
+                                                )
+                                                + 1
+                                            )
+                                        else:
+                                            _sandbox_entry = {
+                                                "text": _sandbox_ai_text.strip(),
+                                                "fallback": False,
+                                            }
+                                            _sandbox_store[_sandbox_cache_key] = (
+                                                _sandbox_entry
+                                            )
+                                            st.session_state.ai_daily_count = (
+                                                st.session_state.get(
+                                                    "ai_daily_count", 0
+                                                )
+                                                + 1
+                                            )
 
-                        if isinstance(_sandbox_entry, dict) and _sandbox_entry.get(
-                            "text"
-                        ):
-                            st.info(_sandbox_entry["text"])
-                            st.caption(
-                                "AI 沙盘点评"
-                                + (
-                                    "（本地兜底）"
-                                    if _sandbox_entry.get("fallback")
-                                    else ""
+                            if isinstance(_sandbox_entry, dict) and _sandbox_entry.get(
+                                "text"
+                            ):
+                                st.info(_sandbox_entry["text"])
+                                st.caption(
+                                    "AI 沙盘点评"
+                                    + (
+                                        "（本地兜底）"
+                                        if _sandbox_entry.get("fallback")
+                                        else ""
+                                    )
                                 )
+                        except Exception as _sandbox_render_exc:
+                            print(
+                                f"[sandbox] 结果渲染失败："
+                                f"{type(_sandbox_render_exc).__name__}: "
+                                f"{_sandbox_render_exc}"
                             )
-                    except Exception as _sandbox_render_exc:
-                        print(
-                            f"[sandbox] 结果渲染失败："
-                            f"{type(_sandbox_render_exc).__name__}: "
-                            f"{_sandbox_render_exc}"
-                        )
-                        st.caption("沙盘结果暂时无法展示，请重新推演")
-            except Exception as _sandbox_exc:
-                print(
-                    f"[sandbox] 卡片渲染失败："
-                    f"{type(_sandbox_exc).__name__}: {_sandbox_exc}"
-                )
-                st.caption("财务沙盘推演暂不可用")
-
-    with _dash_chart_tabs[3]:
-        # ===== 💼 我的财务大盘：现金 + 资产残值 − 待还负债 =====
-        # db.get_asset_overview / add_asset / delete_asset 由并行方提供：
-        # 一律 getattr 取模块属性（缺失 / 抛错 / 返回非 dict 都只降级成一行 caption），
-        # 取不到数时整块内容用 if 包住，绝不 st.stop()、绝不让 Tab1 红屏。
-        with st.container(border=True, key="card_asset_dashboard"):
-            st.subheader("💼 我的财务大盘")
-            st.caption(
-                "现金 + 资产残值 − 待还负债 = 你现在真正拥有的钱（资产按直线法折旧）"
-            )
-
-            # 1) 取数：函数不可调用 / 返回非 dict / 抛错 → 只给一行提示，
-            #    下面的指标、图表、清单、表单全部不渲染（不是 st.stop，页面其它区块照常）。
-            _asset_overview_fn = getattr(db, "get_asset_overview", None)
-            _asset_overview = None
-            if callable(_asset_overview_fn):
-                try:
-                    _asset_overview = _asset_overview_fn(st.session_state.user_id)
-                except Exception as _asset_overview_exc:
+                            st.caption("沙盘结果暂时无法展示，请重新推演")
+                except Exception as _sandbox_exc:
                     print(
-                        f"[asset] get_asset_overview 调用失败："
-                        f"{type(_asset_overview_exc).__name__}: {_asset_overview_exc}"
+                        f"[sandbox] 卡片渲染失败："
+                        f"{type(_sandbox_exc).__name__}: {_sandbox_exc}"
                     )
-                    _asset_overview = None
+                    st.caption("财务沙盘推演暂不可用")
 
-            if not isinstance(_asset_overview, dict):
-                st.caption("资产大盘暂不可用，先记几笔账或稍后再来")
-            else:
-                # 脏值统一收敛成有限 float（复用 _peer_number，口径与雷达 / 拿铁因子一致）
-                _asset_net = _peer_number(_asset_overview.get("net_worth"))
-                _asset_cash = _peer_number(_asset_overview.get("cash_balance"))
-                _asset_residual = _peer_number(_asset_overview.get("assets_residual"))
-                _asset_liab = _peer_number(_asset_overview.get("liabilities"))
-
-                st.metric(
-                    "当前净资产",
-                    f"¥{_asset_net:,.2f}",
-                    delta=(
-                        f"现金 ¥{_asset_cash:,.0f} · 资产 ¥{_asset_residual:,.0f}"
-                        f" · 负债 ¥{_asset_liab:,.0f}"
-                    ),
+        with _dash_chart_tabs[3]:
+            # ===== 💼 我的财务大盘：现金 + 资产残值 − 待还负债 =====
+            # db.get_asset_overview / add_asset / delete_asset 由并行方提供：
+            # 一律 getattr 取模块属性（缺失 / 抛错 / 返回非 dict 都只降级成一行 caption），
+            # 取不到数时整块内容用 if 包住，绝不 st.stop()、绝不让 Tab1 红屏。
+            with st.container(border=True, key="card_asset_dashboard"):
+                st.subheader("💼 我的财务大盘")
+                st.caption(
+                    "现金 + 资产残值 − 待还负债 = 你现在真正拥有的钱（资产按直线法折旧）"
                 )
-                _asset_col_cash, _asset_col_residual, _asset_col_liab = st.columns(3)
-                with _asset_col_cash:
-                    st.metric("现金结余", f"¥{_asset_cash:,.2f}")
-                with _asset_col_residual:
-                    st.metric("资产残值", f"¥{_asset_residual:,.2f}")
-                with _asset_col_liab:
-                    st.metric("待还负债", f"¥{_asset_liab:,.2f}", delta="估算")
 
-                # 2) 资产负债对比柱状图：option 纯函数在 asset_chart.py，缺失 / 抛错只降级提示
-                _asset_balance_option = None
-                _asset_balance_builder = (
-                    getattr(asset_chart, "build_balance_option", None)
-                    if asset_chart is not None
-                    else None
-                )
-                if callable(_asset_balance_builder):
+                # 1) 取数：函数不可调用 / 返回非 dict / 抛错 → 只给一行提示，
+                #    下面的指标、图表、清单、表单全部不渲染（不是 st.stop，页面其它区块照常）。
+                _asset_overview_fn = getattr(db, "get_asset_overview", None)
+                _asset_overview = None
+                if callable(_asset_overview_fn):
                     try:
-                        _asset_balance_option = _asset_balance_builder(
-                            _asset_overview,
-                            today_label=str(_asset_overview.get("today") or ""),
-                        )
-                    except Exception as _asset_balance_exc:
+                        _asset_overview = _asset_overview_fn(st.session_state.user_id)
+                    except Exception as _asset_overview_exc:
                         print(
-                            f"[asset] 资产负债图构造失败："
-                            f"{type(_asset_balance_exc).__name__}: {_asset_balance_exc}"
+                            f"[asset] get_asset_overview 调用失败："
+                            f"{type(_asset_overview_exc).__name__}: {_asset_overview_exc}"
                         )
-                        _asset_balance_option = None
-                if isinstance(_asset_balance_option, dict):
-                    st_echarts(
-                        _asset_balance_option, height="300px", key="asset_balance"
-                    )
-                else:
-                    st.caption("图表组件暂不可用")
+                        _asset_overview = None
 
-                # 3) 资产清单：只保留 dict 项；缺字段按 0 / 未命名 / 其他兜底
-                _asset_records = [
-                    _asset_item
-                    for _asset_item in (_asset_overview.get("assets") or [])
-                    if isinstance(_asset_item, dict)
-                ]
-                _asset_names = [
-                    (str(_asset_item.get("name") or "").strip() or "未命名资产")
-                    for _asset_item in _asset_records
-                ]
-                if _asset_records:
-                    st.dataframe(
-                        pd.DataFrame(
-                            [
-                                {
-                                    "名称": _asset_name,
-                                    "分类": str(_asset_item.get("category") or "其他"),
-                                    "购入价": (
-                                        f"¥{_peer_number(_asset_item.get('purchase_price')):,.2f}"
-                                    ),
-                                    "当前残值": (
-                                        f"¥{_peer_number(_asset_item.get('residual')):,.2f}"
-                                    ),
-                                    "残值率": _asset_rate_text(
-                                        _asset_item.get("residual_rate")
-                                    ),
-                                    "每月蒸发": (
-                                        f"¥{_peer_number(_asset_item.get('monthly_loss')):,.2f}"
-                                    ),
-                                }
-                                for _asset_name, _asset_item in zip(
-                                    _asset_names, _asset_records
-                                )
-                            ]
+                if not isinstance(_asset_overview, dict):
+                    st.caption("资产大盘暂不可用，先记几笔账或稍后再来")
+                else:
+                    # 脏值统一收敛成有限 float（复用 _peer_number，口径与雷达 / 拿铁因子一致）
+                    _asset_net = _peer_number(_asset_overview.get("net_worth"))
+                    _asset_cash = _peer_number(_asset_overview.get("cash_balance"))
+                    _asset_residual = _peer_number(_asset_overview.get("assets_residual"))
+                    _asset_liab = _peer_number(_asset_overview.get("liabilities"))
+
+                    st.metric(
+                        "当前净资产",
+                        f"¥{_asset_net:,.2f}",
+                        delta=(
+                            f"现金 ¥{_asset_cash:,.0f} · 资产 ¥{_asset_residual:,.0f}"
+                            f" · 负债 ¥{_asset_liab:,.0f}"
                         ),
-                        hide_index=True,
-                        width="stretch",
                     )
-                else:
-                    st.caption("还没有资产，展开下面「➕ 添加资产」记一台")
+                    _asset_col_cash, _asset_col_residual, _asset_col_liab = st.columns(3)
+                    with _asset_col_cash:
+                        st.metric("现金结余", f"¥{_asset_cash:,.2f}")
+                    with _asset_col_residual:
+                        st.metric("资产残值", f"¥{_asset_residual:,.2f}")
+                    with _asset_col_liab:
+                        st.metric("待还负债", f"¥{_asset_liab:,.2f}", delta="估算")
 
-                # 4) 单件资产折旧曲线：选中项直接喂给 asset_chart 的纯函数
-                if _asset_records:
-                    _asset_curve_label = st.selectbox(
-                        "想看哪件资产的折旧曲线？",
-                        _asset_names,
-                        key="asset_curve_select",
-                    )
-                    try:
-                        _asset_curve_index = _asset_names.index(_asset_curve_label)
-                    except ValueError:
-                        _asset_curve_index = 0
-                    _asset_curve_option = None
-                    _asset_curve_builder = (
-                        getattr(asset_chart, "build_depreciation_option", None)
+                    # 2) 资产负债对比柱状图：option 纯函数在 asset_chart.py，缺失 / 抛错只降级提示
+                    _asset_balance_option = None
+                    _asset_balance_builder = (
+                        getattr(asset_chart, "build_balance_option", None)
                         if asset_chart is not None
                         else None
                     )
-                    if callable(_asset_curve_builder):
+                    if callable(_asset_balance_builder):
                         try:
-                            _asset_curve_option = _asset_curve_builder(
-                                _asset_records[_asset_curve_index]
+                            _asset_balance_option = _asset_balance_builder(
+                                _asset_overview,
+                                today_label=str(_asset_overview.get("today") or ""),
                             )
-                        except Exception as _asset_curve_exc:
+                        except Exception as _asset_balance_exc:
                             print(
-                                f"[asset] 折旧曲线构造失败："
-                                f"{type(_asset_curve_exc).__name__}: {_asset_curve_exc}"
+                                f"[asset] 资产负债图构造失败："
+                                f"{type(_asset_balance_exc).__name__}: {_asset_balance_exc}"
                             )
-                            _asset_curve_option = None
-                    if isinstance(_asset_curve_option, dict):
+                            _asset_balance_option = None
+                    if isinstance(_asset_balance_option, dict):
                         st_echarts(
-                            _asset_curve_option, height="320px", key="asset_curve"
+                            _asset_balance_option, height="300px", key="asset_balance"
                         )
                     else:
                         st.caption("图表组件暂不可用")
 
-                # 5) 添加 / 删除：写库后统一 flash + 清缓存 + rerun，与项目其它写操作一致
-                with st.expander("➕ 添加资产 / 管理", expanded=False):
-                    _asset_categories = (
-                        tuple(getattr(db, "ASSET_CATEGORIES", ()) or ())
-                        or ("数码", "生活", "其他")
-                    )
-                    with st.form("asset_add_form"):
-                        _asset_name_input = st.text_input(
-                            "资产名称", max_chars=100, placeholder="例如：iPad Air 5"
+                    # 3) 资产清单：只保留 dict 项；缺字段按 0 / 未命名 / 其他兜底
+                    _asset_records = [
+                        _asset_item
+                        for _asset_item in (_asset_overview.get("assets") or [])
+                        if isinstance(_asset_item, dict)
+                    ]
+                    _asset_names = [
+                        (str(_asset_item.get("name") or "").strip() or "未命名资产")
+                        for _asset_item in _asset_records
+                    ]
+                    if _asset_records:
+                        st.dataframe(
+                            pd.DataFrame(
+                                [
+                                    {
+                                        "名称": _asset_name,
+                                        "分类": str(_asset_item.get("category") or "其他"),
+                                        "购入价": (
+                                            f"¥{_peer_number(_asset_item.get('purchase_price')):,.2f}"
+                                        ),
+                                        "当前残值": (
+                                            f"¥{_peer_number(_asset_item.get('residual')):,.2f}"
+                                        ),
+                                        "残值率": _asset_rate_text(
+                                            _asset_item.get("residual_rate")
+                                        ),
+                                        "每月蒸发": (
+                                            f"¥{_peer_number(_asset_item.get('monthly_loss')):,.2f}"
+                                        ),
+                                    }
+                                    for _asset_name, _asset_item in zip(
+                                        _asset_names, _asset_records
+                                    )
+                                ]
+                            ),
+                            hide_index=True,
+                            width="stretch",
                         )
-                        _asset_cat_input = st.selectbox("分类", list(_asset_categories))
-                        _asset_price_input = st.number_input(
-                            "购入价（元）",
-                            min_value=0.0,
-                            step=100.0,
-                            format="%.2f",
-                        )
-                        _asset_date_input = st.date_input("购入日期", value=date.today())
-                        _asset_rate_input = st.number_input(
-                            "年折旧率（%）",
-                            min_value=0.0,
-                            max_value=100.0,
-                            value=20.0,
-                            step=1.0,
-                            help="数码一般 20%~30%，生活用品 10%",
-                        )
-                        _asset_add_submitted = st.form_submit_button("保存这台资产")
+                    else:
+                        st.caption("还没有资产，展开下面「➕ 添加资产」记一台")
 
-                    if _asset_add_submitted:
-                        _asset_add_fn = getattr(db, "add_asset", None)
-                        _asset_date_value = _asset_date_input or date.today()
-                        _asset_clean_name = str(_asset_name_input or "").strip()
-                        if not callable(_asset_add_fn):
-                            st.caption("添加资产暂不可用，先记几笔账或稍后再来")
-                        elif not _asset_clean_name:
-                            st.warning("请填写资产名称")
-                        elif float(_asset_price_input) <= 0:
-                            st.warning("购入价必须大于 0")
-                        elif _asset_date_value > date.today():
-                            st.warning("购入日期不能晚于今天")
-                        else:
-                            try:
-                                _asset_add_fn(
-                                    st.session_state.user_id,
-                                    _asset_clean_name,
-                                    _asset_cat_input,
-                                    float(_asset_price_input),
-                                    _asset_date_value.strftime("%Y-%m-%d"),
-                                    float(_asset_rate_input) / 100.0,
-                                )
-                                st.session_state["flash"] = {
-                                    "level": "success",
-                                    "msg": (
-                                        f"已添加资产：{_asset_clean_name} "
-                                        f"¥{float(_asset_price_input):,.2f}"
-                                    ),
-                                }
-                                st.cache_data.clear()
-                                st.rerun()
-                            except Exception as _asset_add_exc:
-                                print(
-                                    f"[asset] 添加资产失败："
-                                    f"{type(_asset_add_exc).__name__}: {_asset_add_exc}"
-                                )
-                                st.error(f"添加失败：{_asset_add_exc}")
-
-                    # 删除：必须先勾选确认，避免误点把资产直接删掉
-                    _asset_delete_fn = getattr(db, "delete_asset", None)
-                    if callable(_asset_delete_fn) and _asset_names:
-                        _asset_delete_label = st.selectbox(
-                            "要删除哪件资产？", _asset_names, key="asset_delete_select"
+                    # 4) 单件资产折旧曲线：选中项直接喂给 asset_chart 的纯函数
+                    if _asset_records:
+                        _asset_curve_label = st.selectbox(
+                            "想看哪件资产的折旧曲线？",
+                            _asset_names,
+                            key="asset_curve_select",
                         )
                         try:
-                            _asset_delete_index = _asset_names.index(_asset_delete_label)
+                            _asset_curve_index = _asset_names.index(_asset_curve_label)
                         except ValueError:
-                            _asset_delete_index = 0
-                        _asset_delete_confirm = st.checkbox(
-                            "我确认要删除", key="asset_delete_confirm"
+                            _asset_curve_index = 0
+                        _asset_curve_option = None
+                        _asset_curve_builder = (
+                            getattr(asset_chart, "build_depreciation_option", None)
+                            if asset_chart is not None
+                            else None
                         )
-                        if st.button("删除选中资产", key="asset_delete_btn"):
-                            if not _asset_delete_confirm:
-                                st.warning("先勾选「我确认要删除」")
-                            else:
-                                _asset_delete_target = _asset_records[_asset_delete_index]
-                                _asset_delete_id = _asset_delete_target.get("asset_id")
-                                if _asset_delete_id is None:
-                                    _asset_delete_id = _asset_delete_target.get("id")
-                                if _asset_delete_id is None:
-                                    st.caption("无法定位要删除的资产，请刷新后重试")
-                                else:
-                                    try:
-                                        _asset_delete_fn(
-                                            st.session_state.user_id, _asset_delete_id
-                                        )
-                                        st.session_state["flash"] = {
-                                            "level": "success",
-                                            "msg": f"已删除资产：{_asset_delete_label}",
-                                        }
-                                        st.cache_data.clear()
-                                        st.rerun()
-                                    except Exception as _asset_delete_exc:
-                                        print(
-                                            f"[asset] 删除资产失败："
-                                            f"{type(_asset_delete_exc).__name__}: {_asset_delete_exc}"
-                                        )
-                                        st.error(f"删除失败：{_asset_delete_exc}")
-
-                # 6) AI 资产管家：额度口径与页面其它 AI 区块一致（每日 20 次）；
-                #    同一份 overview 命中 session 缓存 → 不重复调用、不重复扣额度。
-                try:
-                    _asset_advice_key = hashlib.sha256(
-                        json.dumps(
-                            _asset_overview,
-                            sort_keys=True,
-                            ensure_ascii=False,
-                            default=str,
-                        ).encode("utf-8", "ignore")
-                    ).hexdigest()
-                except Exception as _asset_key_exc:
-                    print(
-                        f"[asset] 资产数据归一化失败："
-                        f"{type(_asset_key_exc).__name__}: {_asset_key_exc}"
-                    )
-                    _asset_advice_key = ""
-
-                if st.button("🧠 让学长看看我的资产", key="asset_advisor_btn"):
-                    _asset_saved = st.session_state.get("asset_advice_cache")
-                    _asset_cached_text = ""
-                    if (
-                        isinstance(_asset_saved, dict)
-                        and _asset_saved.get("key") == _asset_advice_key
-                        and str(_asset_saved.get("text") or "").strip()
-                    ):
-                        _asset_cached_text = str(_asset_saved["text"]).strip()
-
-                    if _asset_cached_text:
-                        pass  # 同一份资产已生成过：直接展示下方缓存，不再调用 API
-                    elif st.session_state.get("ai_daily_count", 0) >= 20:
-                        st.caption("今日免费额度已用完，明天再让学长看吧")
-                    else:
-                        _asset_advice_fn = _get_asset_advice_fn()
-                        if not callable(_asset_advice_fn):
-                            st.caption("学长暂时没空：AI 资产管家模块还没准备好")
-                        else:
+                        if callable(_asset_curve_builder):
                             try:
-                                with st.spinner("学长正在翻你的资产清单…"):
-                                    _asset_advice_text = _asset_advice_fn(_asset_overview)
-                            except Exception as _asset_advice_exc:
-                                # 失败只提示、不扣额度、不写缓存：下次点击可重试
+                                _asset_curve_option = _asset_curve_builder(
+                                    _asset_records[_asset_curve_index]
+                                )
+                            except Exception as _asset_curve_exc:
                                 print(
-                                    f"[asset] AI 资产管家调用失败："
-                                    f"{type(_asset_advice_exc).__name__}: {_asset_advice_exc}"
+                                    f"[asset] 折旧曲线构造失败："
+                                    f"{type(_asset_curve_exc).__name__}: {_asset_curve_exc}"
                                 )
-                                st.caption(f"学长暂时没空：{_asset_advice_exc}")
-                            else:
-                                _asset_advice_text = (
-                                    str(_asset_advice_text).strip()
-                                    if isinstance(_asset_advice_text, str)
-                                    else ""
-                                )
-                                if _asset_advice_text:
-                                    st.session_state["asset_advice_cache"] = {
-                                        "key": _asset_advice_key,
-                                        "text": _asset_advice_text,
-                                    }
-                                    st.session_state.ai_daily_count = (
-                                        st.session_state.get("ai_daily_count", 0) + 1
-                                    )
-                                    st.session_state.ai_last_count_date = date.today()
-                                else:
-                                    st.caption("学长暂时没空：这次没有给出内容")
+                                _asset_curve_option = None
+                        if isinstance(_asset_curve_option, dict):
+                            st_echarts(
+                                _asset_curve_option, height="320px", key="asset_curve"
+                            )
+                        else:
+                            st.caption("图表组件暂不可用")
 
-                # 缓存渲染独立于按钮：rerun 后只要资产数据没变（key 相同）就继续展示
-                _asset_advice_saved = st.session_state.get("asset_advice_cache")
-                if (
-                    isinstance(_asset_advice_saved, dict)
-                    and _asset_advice_saved.get("key") == _asset_advice_key
-                    and str(_asset_advice_saved.get("text") or "").strip()
-                ):
-                    st.info(
-                        f"🎓 学长说：{str(_asset_advice_saved['text']).strip()}"
-                    )
+                    # 5) 添加 / 删除：写库后统一 flash + 清缓存 + rerun，与项目其它写操作一致
+                    with st.expander("➕ 添加资产 / 管理", expanded=False):
+                        _asset_categories = (
+                            tuple(getattr(db, "ASSET_CATEGORIES", ()) or ())
+                            or ("数码", "生活", "其他")
+                        )
+                        with st.form("asset_add_form"):
+                            _asset_name_input = st.text_input(
+                                "资产名称", max_chars=100, placeholder="例如：iPad Air 5"
+                            )
+                            _asset_cat_input = st.selectbox("分类", list(_asset_categories))
+                            _asset_price_input = st.number_input(
+                                "购入价（元）",
+                                min_value=0.0,
+                                step=100.0,
+                                format="%.2f",
+                            )
+                            _asset_date_input = st.date_input("购入日期", value=date.today())
+                            _asset_rate_input = st.number_input(
+                                "年折旧率（%）",
+                                min_value=0.0,
+                                max_value=100.0,
+                                value=20.0,
+                                step=1.0,
+                                help="数码一般 20%~30%，生活用品 10%",
+                            )
+                            _asset_add_submitted = st.form_submit_button("保存这台资产")
+
+                        if _asset_add_submitted:
+                            _asset_add_fn = getattr(db, "add_asset", None)
+                            _asset_date_value = _asset_date_input or date.today()
+                            _asset_clean_name = str(_asset_name_input or "").strip()
+                            if not callable(_asset_add_fn):
+                                st.caption("添加资产暂不可用，先记几笔账或稍后再来")
+                            elif not _asset_clean_name:
+                                st.warning("请填写资产名称")
+                            elif float(_asset_price_input) <= 0:
+                                st.warning("购入价必须大于 0")
+                            elif _asset_date_value > date.today():
+                                st.warning("购入日期不能晚于今天")
+                            else:
+                                try:
+                                    _asset_add_fn(
+                                        st.session_state.user_id,
+                                        _asset_clean_name,
+                                        _asset_cat_input,
+                                        float(_asset_price_input),
+                                        _asset_date_value.strftime("%Y-%m-%d"),
+                                        float(_asset_rate_input) / 100.0,
+                                    )
+                                    st.session_state["flash"] = {
+                                        "level": "success",
+                                        "msg": (
+                                            f"已添加资产：{_asset_clean_name} "
+                                            f"¥{float(_asset_price_input):,.2f}"
+                                        ),
+                                    }
+                                    st.cache_data.clear()
+                                    st.rerun()
+                                except Exception as _asset_add_exc:
+                                    print(
+                                        f"[asset] 添加资产失败："
+                                        f"{type(_asset_add_exc).__name__}: {_asset_add_exc}"
+                                    )
+                                    st.error(f"添加失败：{_asset_add_exc}")
+
+                        # 删除：必须先勾选确认，避免误点把资产直接删掉
+                        _asset_delete_fn = getattr(db, "delete_asset", None)
+                        if callable(_asset_delete_fn) and _asset_names:
+                            _asset_delete_label = st.selectbox(
+                                "要删除哪件资产？", _asset_names, key="asset_delete_select"
+                            )
+                            try:
+                                _asset_delete_index = _asset_names.index(_asset_delete_label)
+                            except ValueError:
+                                _asset_delete_index = 0
+                            _asset_delete_confirm = st.checkbox(
+                                "我确认要删除", key="asset_delete_confirm"
+                            )
+                            if st.button("删除选中资产", key="asset_delete_btn"):
+                                if not _asset_delete_confirm:
+                                    st.warning("先勾选「我确认要删除」")
+                                else:
+                                    _asset_delete_target = _asset_records[_asset_delete_index]
+                                    _asset_delete_id = _asset_delete_target.get("asset_id")
+                                    if _asset_delete_id is None:
+                                        _asset_delete_id = _asset_delete_target.get("id")
+                                    if _asset_delete_id is None:
+                                        st.caption("无法定位要删除的资产，请刷新后重试")
+                                    else:
+                                        try:
+                                            _asset_delete_fn(
+                                                st.session_state.user_id, _asset_delete_id
+                                            )
+                                            st.session_state["flash"] = {
+                                                "level": "success",
+                                                "msg": f"已删除资产：{_asset_delete_label}",
+                                            }
+                                            st.cache_data.clear()
+                                            st.rerun()
+                                        except Exception as _asset_delete_exc:
+                                            print(
+                                                f"[asset] 删除资产失败："
+                                                f"{type(_asset_delete_exc).__name__}: {_asset_delete_exc}"
+                                            )
+                                            st.error(f"删除失败：{_asset_delete_exc}")
+
+                    # 6) AI 资产管家：额度口径与页面其它 AI 区块一致（每日 20 次）；
+                    #    同一份 overview 命中 session 缓存 → 不重复调用、不重复扣额度。
+                    try:
+                        _asset_advice_key = hashlib.sha256(
+                            json.dumps(
+                                _asset_overview,
+                                sort_keys=True,
+                                ensure_ascii=False,
+                                default=str,
+                            ).encode("utf-8", "ignore")
+                        ).hexdigest()
+                    except Exception as _asset_key_exc:
+                        print(
+                            f"[asset] 资产数据归一化失败："
+                            f"{type(_asset_key_exc).__name__}: {_asset_key_exc}"
+                        )
+                        _asset_advice_key = ""
+
+                    if st.button("🧠 让学长看看我的资产", key="asset_advisor_btn"):
+                        _asset_saved = st.session_state.get("asset_advice_cache")
+                        _asset_cached_text = ""
+                        if (
+                            isinstance(_asset_saved, dict)
+                            and _asset_saved.get("key") == _asset_advice_key
+                            and str(_asset_saved.get("text") or "").strip()
+                        ):
+                            _asset_cached_text = str(_asset_saved["text"]).strip()
+
+                        if _asset_cached_text:
+                            pass  # 同一份资产已生成过：直接展示下方缓存，不再调用 API
+                        elif st.session_state.get("ai_daily_count", 0) >= 20:
+                            st.caption("今日免费额度已用完，明天再让学长看吧")
+                        else:
+                            _asset_advice_fn = _get_asset_advice_fn()
+                            if not callable(_asset_advice_fn):
+                                st.caption("学长暂时没空：AI 资产管家模块还没准备好")
+                            else:
+                                try:
+                                    with st.spinner("学长正在翻你的资产清单…"):
+                                        _asset_advice_text = _asset_advice_fn(_asset_overview)
+                                except Exception as _asset_advice_exc:
+                                    # 失败只提示、不扣额度、不写缓存：下次点击可重试
+                                    print(
+                                        f"[asset] AI 资产管家调用失败："
+                                        f"{type(_asset_advice_exc).__name__}: {_asset_advice_exc}"
+                                    )
+                                    st.caption(f"学长暂时没空：{_asset_advice_exc}")
+                                else:
+                                    _asset_advice_text = (
+                                        str(_asset_advice_text).strip()
+                                        if isinstance(_asset_advice_text, str)
+                                        else ""
+                                    )
+                                    if _asset_advice_text:
+                                        st.session_state["asset_advice_cache"] = {
+                                            "key": _asset_advice_key,
+                                            "text": _asset_advice_text,
+                                        }
+                                        st.session_state.ai_daily_count = (
+                                            st.session_state.get("ai_daily_count", 0) + 1
+                                        )
+                                        st.session_state.ai_last_count_date = date.today()
+                                    else:
+                                        st.caption("学长暂时没空：这次没有给出内容")
+
+                    # 缓存渲染独立于按钮：rerun 后只要资产数据没变（key 相同）就继续展示
+                    _asset_advice_saved = st.session_state.get("asset_advice_cache")
+                    if (
+                        isinstance(_asset_advice_saved, dict)
+                        and _asset_advice_saved.get("key") == _asset_advice_key
+                        and str(_asset_advice_saved.get("text") or "").strip()
+                    ):
+                        st.info(
+                            f"🎓 学长说：{str(_asset_advice_saved['text']).strip()}"
+                        )
 
     with st.expander("📊 预算、扣费与还款预警", expanded=False):
         # ===== 吃土倒计时（近 7 天 / 本月日均 → 月底是否见底）=====
@@ -6681,305 +6681,349 @@ with tab_dash:
 
 with tab_tools:
     st.subheader("💡 实用工具")
-    st.caption("记账、分期、心愿单、语音与挑战，两列排布，一屏看全")
-    _tool_left, _tool_right = st.columns(2, gap="large")
-    with _tool_left:
-        # ---- 分期真实利率试算 ----
-        with st.container(border=True, key="card_installment"):
-            st.subheader("💰 算算分期有多贵？")
-            st.caption("按现金流 IRR 计算真实年化利率，不是“手续费/本金”的简单除法")
+    st.caption("先记账，再看计算与目标：常用功能两列平铺，低频工具折叠在下面")
 
-            inst_mode = st.radio(
-                "输入方式",
-                ["每期还款总额", "每期手续费"],
-                horizontal=True,
-                key="inst_mode",
-            )
-
-            inst_col1, inst_col2 = st.columns(2)
-            with inst_col1:
-                inst_principal = st.number_input(
-                    "本金（元）",
-                    min_value=1.0,
-                    value=5000.0,
-                    step=100.0,
-                    format="%.2f",
-                    key="inst_principal",
+    _rec_left, _rec_right = st.columns(2, gap="large")
+    with _rec_left:
+        with st.container(border=True, key="card_manual"):
+            st.subheader("✏️ 手动记一笔")
+            # 手动记账
+            submitted = False  # 先初始化，避免 expander 将来被条件包裹时 submitted 未定义
+            with st.form("manual_add_bill_form", clear_on_submit=True):
+                row1_col1, row1_col2 = st.columns(2)
+                with row1_col1:
+                    bill_date = st.date_input("日期", value=date.today())
+                with row1_col2:
+                    merchant = st.text_input("商户", placeholder="例如：食堂、蜜雪冰城", max_chars=100)
+                row2_col1, row2_col2 = st.columns(2)
+                with row2_col1:
+                    amount = st.number_input("金额（元）", min_value=0.0, step=1.0, format="%.2f")
+                with row2_col2:
+                    bill_type = st.selectbox("类型", ["支出", "收入"])
+                # 情绪标签只做展示：提交时映射成 db.MOOD_OPTIONS 原值，空选写 NULL
+                mood_label = st.selectbox(
+                    "消费时的心情（可选）",
+                    list(_MOOD_FORM_LABELS),
+                    help="记录下来，气象站会分析情绪和花钱的关系",
                 )
-            with inst_col2:
-                inst_periods = st.number_input(
-                    "期数（月）",
-                    min_value=1,
-                    max_value=60,
-                    value=12,
-                    step=1,
-                    key="inst_periods",
+                # 副标签（022）：主分类照旧算钱，副标签记录「这笔钱是什么场景」。
+                # 允许现场新建标签（如「考研」「答谢」），不必等产品更新选项表。
+                sub_tags = st.multiselect(
+                    "副标签（可多选）",
+                    options=list(db.SUB_TAG_OPTIONS),
+                    default=[],
+                    accept_new_options=True,
+                    max_selections=db.SUB_TAG_MAX_COUNT,
+                    help="场景标签：人情、答谢、考研、冲动消费…可直接输入新标签",
                 )
-
-            # 两种模式下金额的语义不同：总额模式直接就是每期还款，手续费模式要加上每期本金
-            if inst_mode == "每期手续费":
-                inst_amount = st.number_input(
-                    "每期手续费（元）",
-                    min_value=0.0,
-                    value=450.0,
-                    step=10.0,
-                    format="%.2f",
-                    key="inst_amount",
-                )
-            else:
-                inst_amount = st.number_input(
-                    "每期还款额（元）",
-                    min_value=0.0,
-                    value=450.0,
-                    step=10.0,
-                    format="%.2f",
-                    key="inst_amount",
-                )
-
-            inst_clicked = st.button("计算真实利率", key="inst_calc_btn")
-
-            if inst_clicked:
-                # 控件本身已有下限，这里再校验一次业务口径：任何一项不合法都不调用后端
-                try:
-                    if inst_principal <= 0:
-                        raise ValueError("本金必须大于 0 元")
-                    if inst_periods < 1 or inst_periods > 60:
-                        raise ValueError("期数需在 1~60 期之间")
-                    if inst_amount <= 0:
-                        raise ValueError("每期还款额/手续费必须大于 0 元")
-                    if inst_mode == "每期手续费":
-                        inst_payment = float(
-                            payment_from_fee(float(inst_principal), int(inst_periods), float(inst_amount))
-                        )
-                    else:
-                        inst_payment = float(inst_amount)
-                    inst_irr = compute_irr(float(inst_principal), int(inst_periods), inst_payment)
-                    # 结果存进 session_state：侧边栏改生活费触发 rerun 时，试算结果和负债诊断不会消失
-                    st.session_state["inst_result"] = {
-                        "mode": inst_mode,
-                        "annual_rate": float(inst_irr["annual_rate"]),
-                        "total_payment": float(inst_irr["total_payment"]),
-                        "total_interest": float(inst_irr["total_interest"]),
-                        "payment": inst_payment,
-                        "periods": int(inst_periods),
-                        "principal": float(inst_principal),
-                    }
-                except ValueError as e:
-                    # 后端主动抛出的中文业务错误，可以直接展示给用户
-                    st.session_state.pop("inst_result", None)
-                    st.error(str(e))
-                except Exception as e:
-                    # 其它异常可能包含实现细节，只进服务端日志，页面给通用文案（不红屏）
-                    st.session_state.pop("inst_result", None)
-                    print(f"[installment] 真实利率计算失败：{type(e).__name__}: {e}")
-                    st.error("计算失败，请检查输入")
-
-            inst_result = st.session_state.get("inst_result")
-            # 结果只在同一输入方式下展示：切换 radio 后语义已变，旧结果不应继续挂在页面上
-            if inst_result and inst_result.get("mode") == inst_mode:
-                inst_annual = inst_result["annual_rate"]
-                inst_payment = inst_result["payment"]
-                inst_periods_done = inst_result["periods"]
-                inst_total_payment = inst_result["total_payment"]
-                inst_total_interest = inst_result["total_interest"]
-
-                # 醒目结论：标题 + 粗体，不用 unsafe_allow_html；年化 <= 0 时换掉“高达”措辞
-                if inst_annual <= 0:
-                    st.markdown(f"### 这笔分期没有额外利息（年化 {inst_annual * 100:.2f}%）")
-                else:
-                    st.markdown(f"### 这笔分期的真实年化利率高达 **{inst_annual * 100:.2f}%**！")
-
-                st.caption(
-                    f"每期还款 {inst_payment:.2f} 元 × {inst_periods_done} 期 = 共还 {inst_total_payment:.2f} 元，"
-                    f"利息/手续费合计 {inst_total_interest:.2f} 元"
-                )
-                st.warning("这比一般理财收益高多了，建议谨慎超前消费")
-
-                # ---- 负债健康诊断：用本次试算的每期还款额对比每月生活费 ----
-                inst_living = st.session_state.monthly_living
-                if inst_living <= 0:
-                    st.info("请先在侧边栏设置每月生活费，才能计算负债率")
+                submitted = st.form_submit_button("保存这笔")
+            # 提交逻辑放在 expander 外，避免校验/错误提示被折叠面板收起；
+            # 成功提示用 session_state flash 传递，跨 rerun 在页面顶部展示一次
+            if submitted:
+                merchant = merchant.strip()
+                if not bill_date:
+                    st.warning("请选择日期")
+                elif not merchant:
+                    st.warning("请填写商户名称")
+                elif amount <= 0:
+                    st.warning("金额必须大于 0")
+                elif bill_date > date.today():
+                    st.warning("记账日期不能晚于今天")
                 else:
                     try:
-                        ratio = debt_ratio(inst_payment, inst_living)
-                    except Exception as e:
-                        print(f"[installment] 负债率计算失败：{type(e).__name__}: {e}")
-                        ratio = None
-                    if ratio is None:
-                        # 契约里生活费 <= 0 才返回 None（上面已拦住），这里兜底避免任何异常路径红屏
-                        st.info("请先在侧边栏设置每月生活费，才能计算负债率")
-                    else:
-                        st.metric("负债率", f"{ratio * 100:.1f}%")
-                        if ratio > 0.3:
-                            st.error(
-                                f"🚨 负债率 {ratio * 100:.1f}% 已超过 30% 警戒线：本月待还分期 {inst_payment:.2f} 元，"
-                                f"占每月生活费 {inst_living:.2f} 元的 {ratio * 100:.1f}%。"
-                                "建议降低分期金额或延长前先重估还款能力。"
-                            )
-                        else:
-                            st.success(
-                                f"✅ 负债率 {ratio * 100:.1f}%，处于可承受范围（未超过 30% 警戒线）。"
-                            )
+                        _mood_value = _mood_value_from_label(mood_label)
+                        _add_bill_with_mood(
+                            st.session_state.user_id,
+                            bill_date.strftime("%Y-%m-%d"),
+                            merchant,
+                            float(amount),
+                            "手动录入",
+                            bill_type,
+                            mood=_mood_value,
+                            sub_tags=sub_tags,
+                        )
+                        _flash_msg = (
+                            f"已记录：{bill_date.strftime('%Y-%m-%d')} {merchant} "
+                            f"¥{amount:.2f}（{bill_type}）"
+                        )
+                        if _mood_value:
+                            _flash_msg += f" · 心情：{_mood_value}"
+                        if sub_tags:
+                            _flash_msg += f" · 标签：{' / '.join(sub_tags)}"
+                        st.session_state["flash"] = {"level": "success", "msg": _flash_msg}
+                        st.cache_data.clear()          # 清缓存，保证下面的指标/图表/提示条立刻更新
+                        st.session_state.page = 0      # 回到第一页，新账单按日期倒序通常在最前
+                        st.rerun()                     # 刷新页面，成功提示由顶部 flash 显示
+                    except Exception as exc:
+                        st.error(f"保存失败：{exc}")
 
-        # ---- AI 智能预算（放在心愿单之后）----
-        with st.container(border=True, key="card_budget"):
-            st.subheader("🤖 AI 智能预算")
-            try:
-                _budget_details = get_budget_details(st.session_state.user_id)
-            except RuntimeError as _budget_exc:
-                # 015 未执行：这是已知的“功能未启用”，给黄色提示，不红屏
-                print(f"[budget] 读取细分预算失败：{type(_budget_exc).__name__}: {_budget_exc}")
-                st.warning("智能预算功能未启用（请确认已执行 migrations/015）")
-            except Exception as _budget_exc:
-                print(f"[budget] 读取细分预算失败：{type(_budget_exc).__name__}: {_budget_exc}")
-                st.error("智能预算暂时不可用，请稍后再试")
-            else:
-                # 已有细分预算：展示表格 + 合计；契约不支持清空，只提供“重新生成”
-                _existing_items = {}
-                if isinstance(_budget_details, dict):
-                    for _cat, _amount in _budget_details.items():
-                        try:
-                            _value = float(_amount)
-                        except (TypeError, ValueError):
-                            continue
-                        if not math.isfinite(_value) or _value <= 0:
-                            continue
-                        _cat_name = str(_cat).strip()
-                        if not _cat_name:
-                            continue
-                        _existing_items[_cat_name] = _value
+        # ---- 我的心愿单 ----
 
-                if _existing_items:
-                    st.dataframe(
-                        pd.DataFrame(
-                            [
-                                {"类别": _cat, "预算金额": f"¥{_value:.2f}"}
-                                for _cat, _value in _existing_items.items()
-                            ]
-                        ),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                    st.caption(
-                        f"本月总预算 {st.session_state.monthly_budget:.0f} 元，"
-                        f"细分合计 {sum(_existing_items.values()):.0f} 元"
-                    )
-                    _budget_clicked = st.button("重新生成预算", key="budget_regen_btn")
+    with _rec_right:
+        with st.container(border=True, key="card_voice"):
+            st.subheader("🎤 语音记账")
+            st.caption("按住麦克风说一句，例如：今天食堂花了 25 块（≤30 秒）")
+            _voice_audio = st.audio_input(
+                "录制语音", key=f"voice_input_{st.session_state.user_id}"
+            )
+            # 成功路径 rerun 前无法展示识别文本：把上一次结果常驻在卡片里（月份/用户变化不必清理）
+            _last_voice = st.session_state.get("last_voice_text")
+            if isinstance(_last_voice, dict) and _last_voice.get("text"):
+                st.caption(f"上次识别：{_last_voice['text']}")
+
+            if _voice_audio is not None:
+                _voice_bytes = _voice_audio.getvalue()
+                # 整段录音内容做签名：audio_input 的值跨 rerun 保留，成功后的 st.rerun() 会让同一段
+                # 录音再跑一遍 —— 只按「用户ID + 内容哈希」去重，绝不重复记账、也不重复调 API。
+                _voice_sig = (
+                    f"{st.session_state.user_id}:{hashlib.sha256(_voice_bytes).hexdigest()}"
+                )
+                if st.session_state.get("last_voice_sig") == _voice_sig:
+                    st.info("这段语音已处理过；如需重新记账，请再录一段")
+                elif st.session_state.ai_daily_count >= 20:
+                    # 额度用完只提示：不转写、不解析、不写库，也不占用签名
+                    st.warning("今日免费额度已用完，请明天再来")
                 else:
-                    st.caption("让 AI 参考你上个月的账单，给出本月的分类预算建议")
-                    _budget_clicked = st.button(
-                        "根据上月账单，让 AI 帮我做预算", key="budget_gen_btn"
+                    # 从这里开始这段录音就算「已处理」：失败也落签名，避免同一条录音每次 rerun 都
+                    # 反复调用 API；用户重新录一段会得到新签名，可以立即重试。
+                    st.session_state["last_voice_sig"] = _voice_sig
+                    st.audio(_voice_bytes, format="audio/wav")  # 回放，方便用户确认录到的内容
+                    st.caption(
+                        f"已收到录音（约 {_voice_audio.size / 16000:.1f} 秒，按 WAV 16kHz 粗略估算）"
                     )
 
-                if _budget_clicked:
-                    if st.session_state.ai_daily_count >= 20:
-                        st.warning("今日免费额度已用完，请明天再来")
+                    # 额度口径（与截图记账保持一致）：too_long / too_big / empty_audio / no_api_key
+                    # 属于**前置失败，不扣额度**；只要真正发起了转写（network / http / empty_text /
+                    # 解析失败）就扣 1 次，避免同一段录音反复刷免费额度。
+                    _voice_quota_charged = False
+                    try:
+                        from ai_agent import (
+                            transcribe_audio,
+                            extract_bill_from_text,
+                            AudioTranscribeError,
+                            TextBillError,
+                        )
+                    except ImportError as _voice_import_exc:
+                        # ai_agent 的语音函数未合入时优雅降级：细节只进服务端日志，不红屏
+                        print(
+                            f"[voice] 语音记账模块不可用："
+                            f"{type(_voice_import_exc).__name__}: {_voice_import_exc}"
+                        )
+                        st.info("🎤 语音已收到，但转写暂不可用，建议打字或上传截图记账")
                     else:
-                        # 延迟导入：不在 app 启动时就拉起 ai_agent 的 Supabase 依赖
                         try:
-                            from ai_agent import BudgetPlanError
-                        except Exception as _ai_import_exc:
-                            print(
-                                f"[budget] AI 预算模块不可用：{type(_ai_import_exc).__name__}: {_ai_import_exc}"
+                            _voice_text = transcribe_audio(
+                                _voice_bytes, "voice.wav", ZHIPU_API_KEY
                             )
-
-                            class BudgetPlanError(Exception):
-                                """降级占位：ai_agent 不可用时仅用于异常归口。"""
-
-                        with st.spinner("AI 正在为你规划本月预算…"):
-                            try:
-                                _plan_result = generate_smart_budget(
-                                    st.session_state.user_id,
-                                    float(st.session_state.monthly_budget),
-                                )
-                            except ValueError as _plan_exc:
-                                # 业务前置条件不满足（如上个月还没有账单）：蓝色提示，不消耗额度
-                                st.info(str(_plan_exc))
-                            except BudgetPlanError as _plan_exc:
-                                st.error(str(_plan_exc))
-                            except RuntimeError as _plan_exc:
-                                st.error(str(_plan_exc))
-                            except Exception as _plan_exc:
-                                # 其它异常可能含实现细节，只进服务端日志，页面给通用文案
-                                if type(_plan_exc).__name__ == "BudgetPlanError":
-                                    st.error(str(_plan_exc))
-                                else:
-                                    print(
-                                        f"[budget] AI 预算生成失败：{type(_plan_exc).__name__}: {_plan_exc}"
-                                    )
-                                    st.error("AI 预算生成失败，请稍后再试")
-                            else:
+                        except AudioTranscribeError as _voice_err:
+                            _voice_code = getattr(_voice_err, "code", "")
+                            if _voice_code == "too_long":
+                                # 时长限制属于前置校验：不记账、不扣额度
+                                st.warning("录音超过 30 秒，请说短一点再试")
+                            elif _voice_code == "too_big":
+                                st.warning("录音文件太大，请缩短录音")
+                            elif _voice_code == "empty_audio":
+                                st.warning("没有录到声音，请重新录制")
+                            elif _voice_code == "empty_text":
+                                # 已经真正调用过转写服务，只是没返回文字：扣 1 次
                                 st.session_state.ai_daily_count += 1
-                                # 不 rerun：就地渲染下方方案，避免闪一下空白
-                                st.session_state["budget_plan"] = _plan_result
-
-                # 方案跨 rerun 显示：source_month 与「上个月」不一致时视为过期，直接丢弃
-                _plan = st.session_state.get("budget_plan")
-                _last_month_str = (date.today().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
-                if isinstance(_plan, dict):
-                    _plan_source_month = str(_plan.get("source_month") or "")
-                    if _plan_source_month and _plan_source_month != _last_month_str:
-                        st.session_state.pop("budget_plan", None)
-                        _plan = None
-
-                if isinstance(_plan, dict) and isinstance(_plan.get("items"), dict) and _plan["items"]:
-                    _plan_rows = []
-                    for _cat, _amount in _plan["items"].items():
-                        try:
-                            _value = float(_amount)
-                        except (TypeError, ValueError):
-                            continue
-                        if not math.isfinite(_value) or _value <= 0:
-                            continue
-                        _cat_name = str(_cat).strip()
-                        if not _cat_name:
-                            continue
-                        _plan_rows.append({"类别": _cat_name, "预算金额": f"¥{_value:.2f}"})
-                    if _plan_rows:
-                        st.dataframe(
-                            pd.DataFrame(_plan_rows),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-                        try:
-                            _plan_total = float(
-                                _plan.get("total") or sum(float(v) for v in _plan["items"].values())
-                            )
-                        except (TypeError, ValueError):
-                            _plan_total = sum(
-                                float(row["预算金额"].lstrip("¥")) for row in _plan_rows
-                            )
-                        try:
-                            _plan_total_budget = float(
-                                _plan.get("total_budget") or st.session_state.monthly_budget
-                            )
-                        except (TypeError, ValueError):
-                            _plan_total_budget = float(st.session_state.monthly_budget)
-                        st.caption(
-                            f"参考 {_plan.get('source_month') or '上月'} 账单 · "
-                            f"合计 ¥{_plan_total:.2f} / 总预算 ¥{_plan_total_budget:.2f}"
-                        )
-                        if _plan.get("scaled"):
-                            st.info("已按总预算等比压缩")
-                        if st.button("采纳此预算", key="budget_adopt_btn"):
-                            try:
-                                save_budget_details(st.session_state.user_id, _plan["items"])
-                            except Exception as _save_exc:
-                                print(
-                                    f"[budget] 采纳预算失败：{type(_save_exc).__name__}: {_save_exc}"
-                                )
-                                st.error("保存预算失败，请稍后再试")
+                                _voice_quota_charged = True
+                                st.info("没听清，请再说一遍，尽量靠近麦克风")
+                            elif _voice_code == "no_api_key":
+                                st.error("未配置智谱 API Key，语音记账暂不可用")
                             else:
+                                # network / http / 未知错误：兜底 C —— 录音已收到，但转写暂不可用；
+                                # 细节只 print 到服务端，页面绝不出现 traceback
+                                st.session_state.ai_daily_count += 1
+                                _voice_quota_charged = True
+                                print(
+                                    f"[voice] 转写失败（{_voice_code}）："
+                                    f"{type(_voice_err).__name__}: {_voice_err}"
+                                )
+                                st.info("🎤 语音已收到，但转写暂不可用，建议打字或上传截图记账")
+                        except Exception as _voice_err:
+                            # 未预期异常：页面只给通用文案；真正发起过转写就按口径扣 1 次
+                            if not _voice_quota_charged:
+                                st.session_state.ai_daily_count += 1
+                                _voice_quota_charged = True
+                            print(
+                                f"[voice] 转写异常：{type(_voice_err).__name__}: {_voice_err}"
+                            )
+                            st.error("语音处理失败，请稍后再试")
+                        else:
+                            # 转写成功：额度 +1（后续解析/入库失败也不退，与截图记账口径一致）
+                            st.session_state.ai_daily_count += 1
+                            _voice_quota_charged = True
+                            try:
+                                # 隐私模式：先把手机号/证件/卡号/邮箱在本地替换，再发给 AI
+                                _voice_bill = extract_bill_from_text(
+                                    _mask_sensitive(_voice_text), get_deepseek_api_key()
+                                )
+                                _add_bill_with_mood(
+                                    st.session_state.user_id,
+                                    _voice_bill["occurred_at"],
+                                    _voice_bill["merchant"],
+                                    _voice_bill["amount"],
+                                    "语音记账",
+                                    _voice_bill["bill_type"],
+                                    mood=_voice_bill.get("mood") if isinstance(_voice_bill, dict) else "",
+                                    sub_tags=_voice_bill.get("sub_tags") if isinstance(_voice_bill, dict) else None,
+                                )
+                            except TextBillError as _bill_err:
+                                _bill_code = getattr(_bill_err, "code", "")
+                                if _bill_code in ("invalid_bill", "parse"):
+                                    st.info(
+                                        f"识别为「{_mask_sensitive(_voice_text)}」，"
+                                        f"但没提取到完整账单（{_bill_err}），建议手动补全"
+                                    )
+                                elif _bill_code in ("network", "http"):
+                                    st.warning("账单解析服务暂时不可用，请稍后再试或手动记账")
+                                else:
+                                    st.warning("语音已收到，但解析失败，建议手动记账")
+                            except Exception as _bill_exc:
+                                # 解析之后的写库失败等：AI 调用已消耗，额度不重复扣
+                                print(
+                                    f"[voice] 语音记账失败："
+                                    f"{type(_bill_exc).__name__}: {_bill_exc}"
+                                )
+                                st.error("语音处理失败，请稍后再试")
+                            else:
+                                # 成功：签名已在调用前落位，这里只补识别文本（跨 rerun 常驻展示）
+                                st.session_state["last_voice_text"] = {
+                                    "text": _voice_text,
+                                    "merchant": _voice_bill["merchant"],
+                                }
                                 st.session_state["flash"] = {
                                     "level": "success",
-                                    "msg": "预算已采纳，可在财务看板查看进度",
+                                    "msg": (
+                                        f"已通过语音为您记账 {_voice_bill['amount']:.2f} 元"
+                                        f"（{_voice_bill['merchant']}）"
+                                    ),
                                 }
-                                st.session_state.pop("budget_plan", None)
+                                st.cache_data.clear()      # 让指标/图表/明细立刻反映新账单
+                                st.session_state.page = 0  # 新账单按日期倒序，通常在第一页
                                 st.rerun()
 
-        # ---- 🏆 我的挑战（放在语音记账之后，Tab2 最后一张卡片）----
-        # AI 生成每周省钱挑战 + 完成领积分。后端：db.get_challenge_state / db.award_challenge_points
-        # （migrations/017）。后端缺失 / 017 未执行时整卡降级成一行提示，绝不红屏。
+    _goal_left, _goal_right = st.columns(2, gap="large")
+    with _goal_left:
+        with st.container(border=True, key="card_goal"):
+            st.subheader("🏺 我的心愿单")
+            try:
+                goal = get_goal(st.session_state.user_id)
+            except Exception as goal_exc:
+                # 数据层不可用（如 011 迁移未执行）：细节只进服务端日志，页面给黄色提示，不红屏
+                print(f"[goal] 读取心愿目标失败：{type(goal_exc).__name__}: {goal_exc}")
+                goal = None
+                goal_available = False
+            else:
+                goal_available = True
+
+            if not goal_available:
+                st.warning("心愿单功能暂不可用（请确认已执行 migrations/011）")
+            elif goal is None:
+                # 还没有目标：用表单一次性收集名称 / 金额 / 截止日期
+                st.caption("给未来的自己存点期待：先定一个小目标，存钱也会变得有点上头 ✨")
+                with st.form("goal_form"):
+                    new_goal_name = st.text_input("心愿名称", max_chars=50, placeholder="换一台新手机")
+                    new_goal_amount = st.number_input(
+                        "目标金额（元）",
+                        min_value=1.0,
+                        value=1000.0,
+                        step=100.0,
+                        format="%.2f",
+                    )
+                    new_goal_date = st.date_input("目标日期（可选）", value=date.today() + timedelta(days=1))
+                    goal_submit = st.form_submit_button("创建心愿目标")
+                if goal_submit:
+                    goal_name_clean = (new_goal_name or "").strip()
+                    if not goal_name_clean:
+                        st.warning("先给心愿起个名字吧～")
+                    else:
+                        try:
+                            set_goal(
+                                st.session_state.user_id,
+                                goal_name_clean,
+                                float(new_goal_amount),
+                                new_goal_date.strftime("%Y-%m-%d") if new_goal_date else None,
+                            )
+                        except ValueError as goal_err:
+                            st.error(str(goal_err))
+                        except Exception as goal_err:
+                            print(f"[goal] 创建心愿目标失败：{type(goal_err).__name__}: {goal_err}")
+                            st.error("创建失败，请稍后再试")
+                        else:
+                            # 成功提示走 flash：紧跟 rerun 的 st.success 会被吞掉
+                            st.session_state["flash"] = {"level": "success", "msg": "心愿目标已创建"}
+                            st.rerun()
+            else:
+                # 已有目标：名称是用户输入，只交给 st.subheader 渲染（纯文本，不拼 HTML）
+                st.subheader(str(goal.get("goal_name") or "未命名心愿"))
+                goal_progress = float(goal.get("progress") or 0)
+                st.progress(min(1.0, max(0.0, goal_progress)))
+                goal_current = float(goal.get("current_amount") or 0)
+                goal_target = float(goal.get("target_amount") or 0)
+                goal_remaining = float(goal.get("remaining") or 0)
+                metric_col1, metric_col2, metric_col3 = st.columns(3)
+                with metric_col1:
+                    st.metric("已存", f"¥{goal_current:,.2f}")
+                with metric_col2:
+                    st.metric("目标", f"¥{goal_target:,.2f}")
+                with metric_col3:
+                    st.metric("还差", f"¥{goal_remaining:,.2f}")
+                goal_target_date = goal.get("target_date")
+                if goal_target_date:
+                    st.caption(f"目标日期：{goal_target_date}")
+                if goal.get("reached"):
+                    st.success("🎉 心愿达成！你太自律了，给自己一点掌声")
+
+                st.divider()
+                deposit_col, month_balance_col = st.columns(2)
+                with deposit_col:
+                    deposit_amount = st.number_input(
+                        "存入金额（元）",
+                        min_value=1.0,
+                        value=50.0,
+                        step=10.0,
+                        format="%.2f",
+                    )
+                    deposit_clicked = st.button("存入心愿", key="goal_deposit_btn")
+                with month_balance_col:
+                    can_save_balance = float(month_balance) > 0
+                    balance_clicked = st.button(
+                        "把本月结余存进去",
+                        key="goal_balance_btn",
+                        disabled=not can_save_balance,
+                    )
+                    if not can_save_balance:
+                        st.caption("本月没有结余")
+
+                if deposit_clicked or balance_clicked:
+                    deposit_value = float(deposit_amount) if deposit_clicked else float(month_balance)
+                    if deposit_value <= 0:
+                        st.info("本月没有结余，等有结余再来存一笔吧")
+                    else:
+                        try:
+                            deposit_result = add_to_goal(st.session_state.user_id, deposit_value)
+                        except ValueError as deposit_err:
+                            st.error(str(deposit_err))
+                        except RuntimeError as deposit_err:
+                            st.error(str(deposit_err))
+                        except Exception as deposit_err:
+                            print(f"[goal] 存入心愿失败：{type(deposit_err).__name__}: {deposit_err}")
+                            st.error("存入失败，请稍后再试")
+                        else:
+                            after_progress = 0.0
+                            if isinstance(deposit_result, dict):
+                                after_progress = float(deposit_result.get("progress") or 0)
+                            st.session_state["flash"] = {
+                                "level": "success",
+                                "msg": f"已存入 ¥{deposit_value:.2f}，心愿进度 {after_progress * 100:.0f}%",
+                            }
+                            st.rerun()
+
+        # ---- 🎤 语音记账（放在 AI 智能预算之后；后端契约：ai_agent.transcribe_audio / extract_bill_from_text）----
+
+    with _goal_right:
         with st.container(border=True, key="card_challenge"):
             st.subheader("🏆 我的挑战")
             _challenge_uid = st.session_state.user_id
@@ -7285,340 +7329,302 @@ with tab_tools:
                     st.success("🎉 本周挑战已完成，下周再来！")
                     st.caption(f"当前积分：{_challenge_points_now} 分")
 
-    with _tool_right:
-        # ---- 手动记一笔 ----
-        with st.container(border=True, key="card_manual"):
-            st.subheader("✏️ 手动记一笔")
-            # 手动记账
-            submitted = False  # 先初始化，避免 expander 将来被条件包裹时 submitted 未定义
-            with st.form("manual_add_bill_form", clear_on_submit=True):
-                row1_col1, row1_col2 = st.columns(2)
-                with row1_col1:
-                    bill_date = st.date_input("日期", value=date.today())
-                with row1_col2:
-                    merchant = st.text_input("商户", placeholder="例如：食堂、蜜雪冰城", max_chars=100)
-                row2_col1, row2_col2 = st.columns(2)
-                with row2_col1:
-                    amount = st.number_input("金额（元）", min_value=0.0, step=1.0, format="%.2f")
-                with row2_col2:
-                    bill_type = st.selectbox("类型", ["支出", "收入"])
-                # 情绪标签只做展示：提交时映射成 db.MOOD_OPTIONS 原值，空选写 NULL
-                mood_label = st.selectbox(
-                    "消费时的心情（可选）",
-                    list(_MOOD_FORM_LABELS),
-                    help="记录下来，气象站会分析情绪和花钱的关系",
-                )
-                # 副标签（022）：主分类照旧算钱，副标签记录「这笔钱是什么场景」。
-                # 允许现场新建标签（如「考研」「答谢」），不必等产品更新选项表。
-                sub_tags = st.multiselect(
-                    "副标签（可多选）",
-                    options=list(db.SUB_TAG_OPTIONS),
-                    default=[],
-                    accept_new_options=True,
-                    max_selections=db.SUB_TAG_MAX_COUNT,
-                    help="场景标签：人情、答谢、考研、冲动消费…可直接输入新标签",
-                )
-                submitted = st.form_submit_button("保存这笔")
-            # 提交逻辑放在 expander 外，避免校验/错误提示被折叠面板收起；
-            # 成功提示用 session_state flash 传递，跨 rerun 在页面顶部展示一次
-            if submitted:
-                merchant = merchant.strip()
-                if not bill_date:
-                    st.warning("请选择日期")
-                elif not merchant:
-                    st.warning("请填写商户名称")
-                elif amount <= 0:
-                    st.warning("金额必须大于 0")
-                elif bill_date > date.today():
-                    st.warning("记账日期不能晚于今天")
-                else:
-                    try:
-                        _mood_value = _mood_value_from_label(mood_label)
-                        _add_bill_with_mood(
-                            st.session_state.user_id,
-                            bill_date.strftime("%Y-%m-%d"),
-                            merchant,
-                            float(amount),
-                            "手动录入",
-                            bill_type,
-                            mood=_mood_value,
-                            sub_tags=sub_tags,
-                        )
-                        _flash_msg = (
-                            f"已记录：{bill_date.strftime('%Y-%m-%d')} {merchant} "
-                            f"¥{amount:.2f}（{bill_type}）"
-                        )
-                        if _mood_value:
-                            _flash_msg += f" · 心情：{_mood_value}"
-                        if sub_tags:
-                            _flash_msg += f" · 标签：{' / '.join(sub_tags)}"
-                        st.session_state["flash"] = {"level": "success", "msg": _flash_msg}
-                        st.cache_data.clear()          # 清缓存，保证下面的指标/图表/提示条立刻更新
-                        st.session_state.page = 0      # 回到第一页，新账单按日期倒序通常在最前
-                        st.rerun()                     # 刷新页面，成功提示由顶部 flash 显示
-                    except Exception as exc:
-                        st.error(f"保存失败：{exc}")
+    with st.expander("🧮 计算器与预算（低频工具）", expanded=False):
+        _calc_left, _calc_right = st.columns(2, gap="large")
+        with _calc_left:
+            with st.container(border=True, key="card_installment"):
+                st.subheader("💰 算算分期有多贵？")
+                st.caption("按现金流 IRR 计算真实年化利率，不是“手续费/本金”的简单除法")
 
-        # ---- 我的心愿单 ----
-        with st.container(border=True, key="card_goal"):
-            st.subheader("🏺 我的心愿单")
-            try:
-                goal = get_goal(st.session_state.user_id)
-            except Exception as goal_exc:
-                # 数据层不可用（如 011 迁移未执行）：细节只进服务端日志，页面给黄色提示，不红屏
-                print(f"[goal] 读取心愿目标失败：{type(goal_exc).__name__}: {goal_exc}")
-                goal = None
-                goal_available = False
-            else:
-                goal_available = True
+                inst_mode = st.radio(
+                    "输入方式",
+                    ["每期还款总额", "每期手续费"],
+                    horizontal=True,
+                    key="inst_mode",
+                )
 
-            if not goal_available:
-                st.warning("心愿单功能暂不可用（请确认已执行 migrations/011）")
-            elif goal is None:
-                # 还没有目标：用表单一次性收集名称 / 金额 / 截止日期
-                st.caption("给未来的自己存点期待：先定一个小目标，存钱也会变得有点上头 ✨")
-                with st.form("goal_form"):
-                    new_goal_name = st.text_input("心愿名称", max_chars=50, placeholder="换一台新手机")
-                    new_goal_amount = st.number_input(
-                        "目标金额（元）",
+                inst_col1, inst_col2 = st.columns(2)
+                with inst_col1:
+                    inst_principal = st.number_input(
+                        "本金（元）",
                         min_value=1.0,
-                        value=1000.0,
+                        value=5000.0,
                         step=100.0,
                         format="%.2f",
+                        key="inst_principal",
                     )
-                    new_goal_date = st.date_input("目标日期（可选）", value=date.today() + timedelta(days=1))
-                    goal_submit = st.form_submit_button("创建心愿目标")
-                if goal_submit:
-                    goal_name_clean = (new_goal_name or "").strip()
-                    if not goal_name_clean:
-                        st.warning("先给心愿起个名字吧～")
-                    else:
-                        try:
-                            set_goal(
-                                st.session_state.user_id,
-                                goal_name_clean,
-                                float(new_goal_amount),
-                                new_goal_date.strftime("%Y-%m-%d") if new_goal_date else None,
-                            )
-                        except ValueError as goal_err:
-                            st.error(str(goal_err))
-                        except Exception as goal_err:
-                            print(f"[goal] 创建心愿目标失败：{type(goal_err).__name__}: {goal_err}")
-                            st.error("创建失败，请稍后再试")
-                        else:
-                            # 成功提示走 flash：紧跟 rerun 的 st.success 会被吞掉
-                            st.session_state["flash"] = {"level": "success", "msg": "心愿目标已创建"}
-                            st.rerun()
-            else:
-                # 已有目标：名称是用户输入，只交给 st.subheader 渲染（纯文本，不拼 HTML）
-                st.subheader(str(goal.get("goal_name") or "未命名心愿"))
-                goal_progress = float(goal.get("progress") or 0)
-                st.progress(min(1.0, max(0.0, goal_progress)))
-                goal_current = float(goal.get("current_amount") or 0)
-                goal_target = float(goal.get("target_amount") or 0)
-                goal_remaining = float(goal.get("remaining") or 0)
-                metric_col1, metric_col2, metric_col3 = st.columns(3)
-                with metric_col1:
-                    st.metric("已存", f"¥{goal_current:,.2f}")
-                with metric_col2:
-                    st.metric("目标", f"¥{goal_target:,.2f}")
-                with metric_col3:
-                    st.metric("还差", f"¥{goal_remaining:,.2f}")
-                goal_target_date = goal.get("target_date")
-                if goal_target_date:
-                    st.caption(f"目标日期：{goal_target_date}")
-                if goal.get("reached"):
-                    st.success("🎉 心愿达成！你太自律了，给自己一点掌声")
+                with inst_col2:
+                    inst_periods = st.number_input(
+                        "期数（月）",
+                        min_value=1,
+                        max_value=60,
+                        value=12,
+                        step=1,
+                        key="inst_periods",
+                    )
 
-                st.divider()
-                deposit_col, month_balance_col = st.columns(2)
-                with deposit_col:
-                    deposit_amount = st.number_input(
-                        "存入金额（元）",
-                        min_value=1.0,
-                        value=50.0,
+                # 两种模式下金额的语义不同：总额模式直接就是每期还款，手续费模式要加上每期本金
+                if inst_mode == "每期手续费":
+                    inst_amount = st.number_input(
+                        "每期手续费（元）",
+                        min_value=0.0,
+                        value=450.0,
                         step=10.0,
                         format="%.2f",
+                        key="inst_amount",
                     )
-                    deposit_clicked = st.button("存入心愿", key="goal_deposit_btn")
-                with month_balance_col:
-                    can_save_balance = float(month_balance) > 0
-                    balance_clicked = st.button(
-                        "把本月结余存进去",
-                        key="goal_balance_btn",
-                        disabled=not can_save_balance,
-                    )
-                    if not can_save_balance:
-                        st.caption("本月没有结余")
-
-                if deposit_clicked or balance_clicked:
-                    deposit_value = float(deposit_amount) if deposit_clicked else float(month_balance)
-                    if deposit_value <= 0:
-                        st.info("本月没有结余，等有结余再来存一笔吧")
-                    else:
-                        try:
-                            deposit_result = add_to_goal(st.session_state.user_id, deposit_value)
-                        except ValueError as deposit_err:
-                            st.error(str(deposit_err))
-                        except RuntimeError as deposit_err:
-                            st.error(str(deposit_err))
-                        except Exception as deposit_err:
-                            print(f"[goal] 存入心愿失败：{type(deposit_err).__name__}: {deposit_err}")
-                            st.error("存入失败，请稍后再试")
-                        else:
-                            after_progress = 0.0
-                            if isinstance(deposit_result, dict):
-                                after_progress = float(deposit_result.get("progress") or 0)
-                            st.session_state["flash"] = {
-                                "level": "success",
-                                "msg": f"已存入 ¥{deposit_value:.2f}，心愿进度 {after_progress * 100:.0f}%",
-                            }
-                            st.rerun()
-
-        # ---- 🎤 语音记账（放在 AI 智能预算之后；后端契约：ai_agent.transcribe_audio / extract_bill_from_text）----
-        with st.container(border=True, key="card_voice"):
-            st.subheader("🎤 语音记账")
-            st.caption("按住麦克风说一句，例如：今天食堂花了 25 块（≤30 秒）")
-            _voice_audio = st.audio_input(
-                "录制语音", key=f"voice_input_{st.session_state.user_id}"
-            )
-            # 成功路径 rerun 前无法展示识别文本：把上一次结果常驻在卡片里（月份/用户变化不必清理）
-            _last_voice = st.session_state.get("last_voice_text")
-            if isinstance(_last_voice, dict) and _last_voice.get("text"):
-                st.caption(f"上次识别：{_last_voice['text']}")
-
-            if _voice_audio is not None:
-                _voice_bytes = _voice_audio.getvalue()
-                # 整段录音内容做签名：audio_input 的值跨 rerun 保留，成功后的 st.rerun() 会让同一段
-                # 录音再跑一遍 —— 只按「用户ID + 内容哈希」去重，绝不重复记账、也不重复调 API。
-                _voice_sig = (
-                    f"{st.session_state.user_id}:{hashlib.sha256(_voice_bytes).hexdigest()}"
-                )
-                if st.session_state.get("last_voice_sig") == _voice_sig:
-                    st.info("这段语音已处理过；如需重新记账，请再录一段")
-                elif st.session_state.ai_daily_count >= 20:
-                    # 额度用完只提示：不转写、不解析、不写库，也不占用签名
-                    st.warning("今日免费额度已用完，请明天再来")
                 else:
-                    # 从这里开始这段录音就算「已处理」：失败也落签名，避免同一条录音每次 rerun 都
-                    # 反复调用 API；用户重新录一段会得到新签名，可以立即重试。
-                    st.session_state["last_voice_sig"] = _voice_sig
-                    st.audio(_voice_bytes, format="audio/wav")  # 回放，方便用户确认录到的内容
-                    st.caption(
-                        f"已收到录音（约 {_voice_audio.size / 16000:.1f} 秒，按 WAV 16kHz 粗略估算）"
+                    inst_amount = st.number_input(
+                        "每期还款额（元）",
+                        min_value=0.0,
+                        value=450.0,
+                        step=10.0,
+                        format="%.2f",
+                        key="inst_amount",
                     )
 
-                    # 额度口径（与截图记账保持一致）：too_long / too_big / empty_audio / no_api_key
-                    # 属于**前置失败，不扣额度**；只要真正发起了转写（network / http / empty_text /
-                    # 解析失败）就扣 1 次，避免同一段录音反复刷免费额度。
-                    _voice_quota_charged = False
+                inst_clicked = st.button("计算真实利率", key="inst_calc_btn")
+
+                if inst_clicked:
+                    # 控件本身已有下限，这里再校验一次业务口径：任何一项不合法都不调用后端
                     try:
-                        from ai_agent import (
-                            transcribe_audio,
-                            extract_bill_from_text,
-                            AudioTranscribeError,
-                            TextBillError,
-                        )
-                    except ImportError as _voice_import_exc:
-                        # ai_agent 的语音函数未合入时优雅降级：细节只进服务端日志，不红屏
-                        print(
-                            f"[voice] 语音记账模块不可用："
-                            f"{type(_voice_import_exc).__name__}: {_voice_import_exc}"
-                        )
-                        st.info("🎤 语音已收到，但转写暂不可用，建议打字或上传截图记账")
+                        if inst_principal <= 0:
+                            raise ValueError("本金必须大于 0 元")
+                        if inst_periods < 1 or inst_periods > 60:
+                            raise ValueError("期数需在 1~60 期之间")
+                        if inst_amount <= 0:
+                            raise ValueError("每期还款额/手续费必须大于 0 元")
+                        if inst_mode == "每期手续费":
+                            inst_payment = float(
+                                payment_from_fee(float(inst_principal), int(inst_periods), float(inst_amount))
+                            )
+                        else:
+                            inst_payment = float(inst_amount)
+                        inst_irr = compute_irr(float(inst_principal), int(inst_periods), inst_payment)
+                        # 结果存进 session_state：侧边栏改生活费触发 rerun 时，试算结果和负债诊断不会消失
+                        st.session_state["inst_result"] = {
+                            "mode": inst_mode,
+                            "annual_rate": float(inst_irr["annual_rate"]),
+                            "total_payment": float(inst_irr["total_payment"]),
+                            "total_interest": float(inst_irr["total_interest"]),
+                            "payment": inst_payment,
+                            "periods": int(inst_periods),
+                            "principal": float(inst_principal),
+                        }
+                    except ValueError as e:
+                        # 后端主动抛出的中文业务错误，可以直接展示给用户
+                        st.session_state.pop("inst_result", None)
+                        st.error(str(e))
+                    except Exception as e:
+                        # 其它异常可能包含实现细节，只进服务端日志，页面给通用文案（不红屏）
+                        st.session_state.pop("inst_result", None)
+                        print(f"[installment] 真实利率计算失败：{type(e).__name__}: {e}")
+                        st.error("计算失败，请检查输入")
+
+                inst_result = st.session_state.get("inst_result")
+                # 结果只在同一输入方式下展示：切换 radio 后语义已变，旧结果不应继续挂在页面上
+                if inst_result and inst_result.get("mode") == inst_mode:
+                    inst_annual = inst_result["annual_rate"]
+                    inst_payment = inst_result["payment"]
+                    inst_periods_done = inst_result["periods"]
+                    inst_total_payment = inst_result["total_payment"]
+                    inst_total_interest = inst_result["total_interest"]
+
+                    # 醒目结论：标题 + 粗体，不用 unsafe_allow_html；年化 <= 0 时换掉“高达”措辞
+                    if inst_annual <= 0:
+                        st.markdown(f"### 这笔分期没有额外利息（年化 {inst_annual * 100:.2f}%）")
+                    else:
+                        st.markdown(f"### 这笔分期的真实年化利率高达 **{inst_annual * 100:.2f}%**！")
+
+                    st.caption(
+                        f"每期还款 {inst_payment:.2f} 元 × {inst_periods_done} 期 = 共还 {inst_total_payment:.2f} 元，"
+                        f"利息/手续费合计 {inst_total_interest:.2f} 元"
+                    )
+                    st.warning("这比一般理财收益高多了，建议谨慎超前消费")
+
+                    # ---- 负债健康诊断：用本次试算的每期还款额对比每月生活费 ----
+                    inst_living = st.session_state.monthly_living
+                    if inst_living <= 0:
+                        st.info("请先在侧边栏设置每月生活费，才能计算负债率")
                     else:
                         try:
-                            _voice_text = transcribe_audio(
-                                _voice_bytes, "voice.wav", ZHIPU_API_KEY
-                            )
-                        except AudioTranscribeError as _voice_err:
-                            _voice_code = getattr(_voice_err, "code", "")
-                            if _voice_code == "too_long":
-                                # 时长限制属于前置校验：不记账、不扣额度
-                                st.warning("录音超过 30 秒，请说短一点再试")
-                            elif _voice_code == "too_big":
-                                st.warning("录音文件太大，请缩短录音")
-                            elif _voice_code == "empty_audio":
-                                st.warning("没有录到声音，请重新录制")
-                            elif _voice_code == "empty_text":
-                                # 已经真正调用过转写服务，只是没返回文字：扣 1 次
-                                st.session_state.ai_daily_count += 1
-                                _voice_quota_charged = True
-                                st.info("没听清，请再说一遍，尽量靠近麦克风")
-                            elif _voice_code == "no_api_key":
-                                st.error("未配置智谱 API Key，语音记账暂不可用")
-                            else:
-                                # network / http / 未知错误：兜底 C —— 录音已收到，但转写暂不可用；
-                                # 细节只 print 到服务端，页面绝不出现 traceback
-                                st.session_state.ai_daily_count += 1
-                                _voice_quota_charged = True
-                                print(
-                                    f"[voice] 转写失败（{_voice_code}）："
-                                    f"{type(_voice_err).__name__}: {_voice_err}"
-                                )
-                                st.info("🎤 语音已收到，但转写暂不可用，建议打字或上传截图记账")
-                        except Exception as _voice_err:
-                            # 未预期异常：页面只给通用文案；真正发起过转写就按口径扣 1 次
-                            if not _voice_quota_charged:
-                                st.session_state.ai_daily_count += 1
-                                _voice_quota_charged = True
-                            print(
-                                f"[voice] 转写异常：{type(_voice_err).__name__}: {_voice_err}"
-                            )
-                            st.error("语音处理失败，请稍后再试")
+                            ratio = debt_ratio(inst_payment, inst_living)
+                        except Exception as e:
+                            print(f"[installment] 负债率计算失败：{type(e).__name__}: {e}")
+                            ratio = None
+                        if ratio is None:
+                            # 契约里生活费 <= 0 才返回 None（上面已拦住），这里兜底避免任何异常路径红屏
+                            st.info("请先在侧边栏设置每月生活费，才能计算负债率")
                         else:
-                            # 转写成功：额度 +1（后续解析/入库失败也不退，与截图记账口径一致）
-                            st.session_state.ai_daily_count += 1
-                            _voice_quota_charged = True
-                            try:
-                                # 隐私模式：先把手机号/证件/卡号/邮箱在本地替换，再发给 AI
-                                _voice_bill = extract_bill_from_text(
-                                    _mask_sensitive(_voice_text), get_deepseek_api_key()
+                            st.metric("负债率", f"{ratio * 100:.1f}%")
+                            if ratio > 0.3:
+                                st.error(
+                                    f"🚨 负债率 {ratio * 100:.1f}% 已超过 30% 警戒线：本月待还分期 {inst_payment:.2f} 元，"
+                                    f"占每月生活费 {inst_living:.2f} 元的 {ratio * 100:.1f}%。"
+                                    "建议降低分期金额或延长前先重估还款能力。"
                                 )
-                                _add_bill_with_mood(
-                                    st.session_state.user_id,
-                                    _voice_bill["occurred_at"],
-                                    _voice_bill["merchant"],
-                                    _voice_bill["amount"],
-                                    "语音记账",
-                                    _voice_bill["bill_type"],
-                                    mood=_voice_bill.get("mood") if isinstance(_voice_bill, dict) else "",
-                                    sub_tags=_voice_bill.get("sub_tags") if isinstance(_voice_bill, dict) else None,
-                                )
-                            except TextBillError as _bill_err:
-                                _bill_code = getattr(_bill_err, "code", "")
-                                if _bill_code in ("invalid_bill", "parse"):
-                                    st.info(
-                                        f"识别为「{_mask_sensitive(_voice_text)}」，"
-                                        f"但没提取到完整账单（{_bill_err}），建议手动补全"
-                                    )
-                                elif _bill_code in ("network", "http"):
-                                    st.warning("账单解析服务暂时不可用，请稍后再试或手动记账")
-                                else:
-                                    st.warning("语音已收到，但解析失败，建议手动记账")
-                            except Exception as _bill_exc:
-                                # 解析之后的写库失败等：AI 调用已消耗，额度不重复扣
-                                print(
-                                    f"[voice] 语音记账失败："
-                                    f"{type(_bill_exc).__name__}: {_bill_exc}"
-                                )
-                                st.error("语音处理失败，请稍后再试")
                             else:
-                                # 成功：签名已在调用前落位，这里只补识别文本（跨 rerun 常驻展示）
-                                st.session_state["last_voice_text"] = {
-                                    "text": _voice_text,
-                                    "merchant": _voice_bill["merchant"],
-                                }
-                                st.session_state["flash"] = {
-                                    "level": "success",
-                                    "msg": (
-                                        f"已通过语音为您记账 {_voice_bill['amount']:.2f} 元"
-                                        f"（{_voice_bill['merchant']}）"
-                                    ),
-                                }
-                                st.cache_data.clear()      # 让指标/图表/明细立刻反映新账单
-                                st.session_state.page = 0  # 新账单按日期倒序，通常在第一页
-                                st.rerun()
+                                st.success(
+                                    f"✅ 负债率 {ratio * 100:.1f}%，处于可承受范围（未超过 30% 警戒线）。"
+                                )
+
+            # ---- AI 智能预算（放在心愿单之后）----
+
+        with _calc_right:
+            with st.container(border=True, key="card_budget"):
+                st.subheader("🤖 AI 智能预算")
+                try:
+                    _budget_details = get_budget_details(st.session_state.user_id)
+                except RuntimeError as _budget_exc:
+                    # 015 未执行：这是已知的“功能未启用”，给黄色提示，不红屏
+                    print(f"[budget] 读取细分预算失败：{type(_budget_exc).__name__}: {_budget_exc}")
+                    st.warning("智能预算功能未启用（请确认已执行 migrations/015）")
+                except Exception as _budget_exc:
+                    print(f"[budget] 读取细分预算失败：{type(_budget_exc).__name__}: {_budget_exc}")
+                    st.error("智能预算暂时不可用，请稍后再试")
+                else:
+                    # 已有细分预算：展示表格 + 合计；契约不支持清空，只提供“重新生成”
+                    _existing_items = {}
+                    if isinstance(_budget_details, dict):
+                        for _cat, _amount in _budget_details.items():
+                            try:
+                                _value = float(_amount)
+                            except (TypeError, ValueError):
+                                continue
+                            if not math.isfinite(_value) or _value <= 0:
+                                continue
+                            _cat_name = str(_cat).strip()
+                            if not _cat_name:
+                                continue
+                            _existing_items[_cat_name] = _value
+
+                    if _existing_items:
+                        st.dataframe(
+                            pd.DataFrame(
+                                [
+                                    {"类别": _cat, "预算金额": f"¥{_value:.2f}"}
+                                    for _cat, _value in _existing_items.items()
+                                ]
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                        st.caption(
+                            f"本月总预算 {st.session_state.monthly_budget:.0f} 元，"
+                            f"细分合计 {sum(_existing_items.values()):.0f} 元"
+                        )
+                        _budget_clicked = st.button("重新生成预算", key="budget_regen_btn")
+                    else:
+                        st.caption("让 AI 参考你上个月的账单，给出本月的分类预算建议")
+                        _budget_clicked = st.button(
+                            "根据上月账单，让 AI 帮我做预算", key="budget_gen_btn"
+                        )
+
+                    if _budget_clicked:
+                        if st.session_state.ai_daily_count >= 20:
+                            st.warning("今日免费额度已用完，请明天再来")
+                        else:
+                            # 延迟导入：不在 app 启动时就拉起 ai_agent 的 Supabase 依赖
+                            try:
+                                from ai_agent import BudgetPlanError
+                            except Exception as _ai_import_exc:
+                                print(
+                                    f"[budget] AI 预算模块不可用：{type(_ai_import_exc).__name__}: {_ai_import_exc}"
+                                )
+
+                                class BudgetPlanError(Exception):
+                                    """降级占位：ai_agent 不可用时仅用于异常归口。"""
+
+                            with st.spinner("AI 正在为你规划本月预算…"):
+                                try:
+                                    _plan_result = generate_smart_budget(
+                                        st.session_state.user_id,
+                                        float(st.session_state.monthly_budget),
+                                    )
+                                except ValueError as _plan_exc:
+                                    # 业务前置条件不满足（如上个月还没有账单）：蓝色提示，不消耗额度
+                                    st.info(str(_plan_exc))
+                                except BudgetPlanError as _plan_exc:
+                                    st.error(str(_plan_exc))
+                                except RuntimeError as _plan_exc:
+                                    st.error(str(_plan_exc))
+                                except Exception as _plan_exc:
+                                    # 其它异常可能含实现细节，只进服务端日志，页面给通用文案
+                                    if type(_plan_exc).__name__ == "BudgetPlanError":
+                                        st.error(str(_plan_exc))
+                                    else:
+                                        print(
+                                            f"[budget] AI 预算生成失败：{type(_plan_exc).__name__}: {_plan_exc}"
+                                        )
+                                        st.error("AI 预算生成失败，请稍后再试")
+                                else:
+                                    st.session_state.ai_daily_count += 1
+                                    # 不 rerun：就地渲染下方方案，避免闪一下空白
+                                    st.session_state["budget_plan"] = _plan_result
+
+                    # 方案跨 rerun 显示：source_month 与「上个月」不一致时视为过期，直接丢弃
+                    _plan = st.session_state.get("budget_plan")
+                    _last_month_str = (date.today().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+                    if isinstance(_plan, dict):
+                        _plan_source_month = str(_plan.get("source_month") or "")
+                        if _plan_source_month and _plan_source_month != _last_month_str:
+                            st.session_state.pop("budget_plan", None)
+                            _plan = None
+
+                    if isinstance(_plan, dict) and isinstance(_plan.get("items"), dict) and _plan["items"]:
+                        _plan_rows = []
+                        for _cat, _amount in _plan["items"].items():
+                            try:
+                                _value = float(_amount)
+                            except (TypeError, ValueError):
+                                continue
+                            if not math.isfinite(_value) or _value <= 0:
+                                continue
+                            _cat_name = str(_cat).strip()
+                            if not _cat_name:
+                                continue
+                            _plan_rows.append({"类别": _cat_name, "预算金额": f"¥{_value:.2f}"})
+                        if _plan_rows:
+                            st.dataframe(
+                                pd.DataFrame(_plan_rows),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                            try:
+                                _plan_total = float(
+                                    _plan.get("total") or sum(float(v) for v in _plan["items"].values())
+                                )
+                            except (TypeError, ValueError):
+                                _plan_total = sum(
+                                    float(row["预算金额"].lstrip("¥")) for row in _plan_rows
+                                )
+                            try:
+                                _plan_total_budget = float(
+                                    _plan.get("total_budget") or st.session_state.monthly_budget
+                                )
+                            except (TypeError, ValueError):
+                                _plan_total_budget = float(st.session_state.monthly_budget)
+                            st.caption(
+                                f"参考 {_plan.get('source_month') or '上月'} 账单 · "
+                                f"合计 ¥{_plan_total:.2f} / 总预算 ¥{_plan_total_budget:.2f}"
+                            )
+                            if _plan.get("scaled"):
+                                st.info("已按总预算等比压缩")
+                            if st.button("采纳此预算", key="budget_adopt_btn"):
+                                try:
+                                    save_budget_details(st.session_state.user_id, _plan["items"])
+                                except Exception as _save_exc:
+                                    print(
+                                        f"[budget] 采纳预算失败：{type(_save_exc).__name__}: {_save_exc}"
+                                    )
+                                    st.error("保存预算失败，请稍后再试")
+                                else:
+                                    st.session_state["flash"] = {
+                                        "level": "success",
+                                        "msg": "预算已采纳，可在财务看板查看进度",
+                                    }
+                                    st.session_state.pop("budget_plan", None)
+                                    st.rerun()
 
 with tab_ai:
     # AI Chat

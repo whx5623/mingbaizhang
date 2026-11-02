@@ -23,9 +23,13 @@
   * 不对侧边栏 / chat_input / 按钮 / input·textarea·select 使用 display:none、visibility:hidden、
     pointer-events:none（本文件仅在 Tabs 的旧版 BaseWeb 高亮条上用了 display:none，该元素是
     纯装饰条，不承载任何交互）；
-  * 不设置全局 z-index / position:fixed 覆盖层；
+  * 不设置 z-index / position 覆盖层（全文 0 条 position、0 条 z-index），不改侧边栏定位；
   * 不使用 ``*`` 通配符重置 padding/margin；
-  * 不改侧边栏的 position / z-index，不遮挡任何控件。
+  * **不对承载内容的容器写死 height / max-height**（Tabs 页签 height:auto、指标卡已无
+    min-height、Expander 无任何高度约束），避免内容被裁切或折叠面板点击异常；
+  * 唯一的 overflow 只出现在三处「必要且不裁交互」的位置：文本级省略号（原生 truncate）、
+    移动端表格横向滚动容器（<=640px）、以及 stDataFrame 刻意不写 overflow:hidden
+    （留出列菜单弹层）。
 
 CSS 分段
 --------
@@ -33,6 +37,7 @@ CSS 分段
 4. 指标卡          5. 按钮                6. Tabs 胶囊
 7. 带边框容器      8. 侧边栏              9. 表格 / DataFrame
 10. 提示条         11. 细节打磨（分隔线 / caption / 链接 / 空状态）
+12. 移动端兜底（max-width: 640px）
 """
 
 CSS = r"""
@@ -123,37 +128,41 @@ h3 {
 
 /* ---------- 4. 指标卡 ---------- */
 /* [data-testid="stMetric"]：1.65 st.metric 的最外层 div（内层含 stMetricLabel /
-   stMetricValue / stMetricDelta）。白底卡片 + 12px 圆角 + 柔和投影。 */
+   stMetricValue / stMetricDelta）。白底卡片 + 12px 圆角 + 柔和投影。
+   ⚠️ 只做「视觉外壳」：**不再**写 min-height / display:flex / justify-content。
+   1.65 原生给这个节点 height:100%（卡片由所在列等高），再叠 min-height:108px +
+   flex + 垂直居中，会让「内容比卡片高」时从上下两侧溢出色块（长标签 / 多行 delta /
+   带图表的 metric），窄列里尤其明显。高度交还给内容与列拉伸，卡片多高内容就多高。 */
 [data-testid="stMetric"] {
     background: var(--mbz-surface);
     border: 1px solid var(--mbz-border);
     border-radius: 12px;
     box-shadow: var(--mbz-shadow-card);
     padding: 16px 18px;
-    /* 统一四张核心指标卡的高度与内部对齐：数值纵向居中，避免长短标签把卡片撑得参差 */
-    min-height: 108px;
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    gap: 2px;
-    transition: box-shadow .18s ease, transform .18s ease;
+    max-width: 100%;
+    min-width: 0;
+    transition: box-shadow .18s ease;
 }
 
-/* 悬浮轻微抬升：纯观感，不影响点击热区 */
+/* 悬浮只换阴影、不做 translateY 位移：位移在等高卡片网格里会看起来「互相压边」，
+   且 1.65 卡片本身 overflow:hidden（border 版）时上浮的阴影会被邻居裁掉。 */
 [data-testid="stMetric"]:hover {
     box-shadow: var(--mbz-shadow-card-hover);
-    transform: translateY(-1px);
 }
 
+/* 标签：只调字体，**不再**重复 white-space:nowrap / overflow:hidden / ellipsis。
+   1.65 的 metric 标签本身用原生 truncate（overflow:hidden + nowrap + 省略号），我们再抄
+   一遍等于把长中文标签「永久截断」；这里放开换行，窄列下宁可两行也不丢字。 */
 [data-testid="stMetricLabel"],
 [data-testid="stMetricLabel"] p {
     color: var(--mbz-text-muted);
     font-size: .85rem;
     font-weight: 500;
     letter-spacing: .01em;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    line-height: 1.35;
+    white-space: normal;
+    overflow: visible;
+    overflow-wrap: anywhere;
 }
 
 /* 数值：加大 + 700 字重（1.65 的 stMetricValue 内层还有一层 markdown，字号需落在容器上） */
@@ -204,7 +213,7 @@ h3 {
 .stDownloadButton > button:not([data-testid^="stBaseButton"]):hover:not([disabled]),
 .stFormSubmitButton > button:not([data-testid^="stBaseButton"]):hover:not([disabled]) {
     background: var(--mbz-primary-soft-hover);
-    transform: translateY(-1px) scale(1.03);
+    transform: translateY(-1px);
 }
 
 /* primary：科技蓝实底；hover 渐变 + 上浮 + 放大 */
@@ -218,7 +227,7 @@ h3 {
 [data-testid^="stBaseButton-primary"]:not([disabled]):not([aria-disabled="true"]):hover {
     background: linear-gradient(135deg, #1E88E5, #42A5F5);
     color: #FFFFFF;
-    transform: translateY(-1px) scale(1.03);
+    transform: translateY(-1px);
     box-shadow: 0 8px 20px rgba(30, 136, 229, .32);
 }
 
@@ -232,7 +241,7 @@ h3 {
 [data-testid^="stBaseButton-secondary"]:not([disabled]):not([aria-disabled="true"]):hover {
     background: var(--mbz-primary-soft-hover);
     color: #1565C0;
-    transform: translateY(-1px) scale(1.03);
+    transform: translateY(-1px);
     box-shadow: 0 6px 16px rgba(30, 136, 229, .18);
 }
 
@@ -501,7 +510,9 @@ hr {
     font-size: .82rem;
 }
 
-/* ---------- 15. 移动端适配：窄屏不挤压、不横向溢出 ---------- */
+/* ---------- 15. 移动端适配：窄屏单列、不挤压、不横向溢出 ---------- */
+/* 产品口径（答辩演示）：手机上所有 st.columns 一律折叠成单列，不并排两列；
+   表格允许横向滚动，图表/iframe 宽度不超过容器。 */
 @media (max-width: 640px) {
     /* 页面留白收窄，把宽度让给图表与指标 */
     .block-container,
@@ -510,9 +521,8 @@ hr {
         padding-right: .9rem !important;
     }
 
-    /* 指标卡：四张卡在手机上两列一行，高度收紧但保持等高 */
+    /* 指标卡：只收内边距与字号，不写 height / min-height（高度交给内容，避免裁切） */
     [data-testid="stMetric"] {
-        min-height: 92px;
         padding: 12px 14px;
     }
 
@@ -524,15 +534,16 @@ hr {
         font-size: .78rem;
     }
 
-    /* 列在窄屏改为两列自适应，避免四列被压成一条细线 */
+    /* 列在窄屏折叠成单列：任何 st.columns(2)/(3)/(4) 都竖排，不挤压 */
     [data-testid="stHorizontalBlock"] {
         flex-wrap: wrap;
+        gap: .5rem;
     }
 
     [data-testid="column"] {
-        flex: 1 1 calc(50% - .5rem) !important;
-        min-width: calc(50% - .5rem) !important;
-        width: auto !important;
+        flex: 1 1 100% !important;
+        min-width: 100% !important;
+        width: 100% !important;
     }
 
     /* Tab 头横向可滚，不换行撑破页面 */
@@ -560,6 +571,13 @@ hr {
     [data-testid="stImage"] img {
         max-width: 100%;
         height: auto;
+    }
+
+    /* 表格：外框不超过容器，宽表在卡片内横向滚动（不裁列、不撑破页面） */
+    [data-testid="stDataFrame"],
+    [data-testid="stTable"] {
+        max-width: 100% !important;
+        overflow-x: auto;
     }
 
     [data-testid="stExpander"],
