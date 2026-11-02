@@ -6296,12 +6296,12 @@ with tab_dash:
         if "payment_method" in df.columns
         else []
     )
-    # 副标签（022）：从全量 df 里拍平去重，作为筛选下拉候选；老库没有该列时为空。
+    # 副标签（022）：候选 = 内置标签 + 该用户历史用过的标签（含自定义）；
+    # 老库没有该列时为空。这里直接查库而不是只从当前 df 拍平：
+    # 用户自定义过的标签即使本月没再用，也应继续出现在下拉里。
     _bill_has_sub_tags = "sub_tags" in df.columns
     _bill_tag_options = (
-        sorted({tag for _tags in df["sub_tags"] for tag in db.normalize_sub_tags(_tags)})
-        if _bill_has_sub_tags
-        else []
+        db.get_user_all_sub_tags(st.session_state.user_id) if _bill_has_sub_tags else []
     )
 
     # 导入新数据后旧的多选值可能已不在新选项里：先收敛，避免 multiselect 报错
@@ -6454,11 +6454,11 @@ with tab_dash:
             _bill_tag_col, _bill_tag_kw_col = st.columns([1.4, 1])
             with _bill_tag_col:
                 _bill_sub_tags = st.multiselect(
-                    "副标签（任一命中）",
+                    "副标签（任一命中，含自定义）",
                     options=_bill_tag_options,
                     key="bill_sub_tags",
                     accept_new_options=True,
-                    help="例：选「人情」只看人情往来；选「考研 + 冲动消费」看两类场景的并集",
+                    help="候选包含你历史用过的全部标签（含自定义）；也可直接输入新标签筛选",
                 )
             with _bill_tag_kw_col:
                 # 搜索兜底：标签太多不想翻、或想找一个还没出现在下拉里的标签时，直接输入子串
@@ -6707,14 +6707,16 @@ with tab_tools:
                     help="记录下来，气象站会分析情绪和花钱的关系",
                 )
                 # 副标签（022）：主分类照旧算钱，副标签记录「这笔钱是什么场景」。
-                # 允许现场新建标签（如「考研」「答谢」），不必等产品更新选项表。
+                # 候选 = 内置常用标签 + 该用户历史用过的标签（含自定义），
+                # 配合 accept_new_options：没见过的场景也能现场输入，输入即入库。
+                _manual_tag_options = db.get_user_all_sub_tags(st.session_state.user_id)
                 sub_tags = st.multiselect(
-                    "副标签（可多选）",
-                    options=list(db.SUB_TAG_OPTIONS),
+                    "副标签（可多选，支持自定义）",
+                    options=_manual_tag_options,
                     default=[],
                     accept_new_options=True,
                     max_selections=db.SUB_TAG_MAX_COUNT,
-                    help="场景标签：人情、答谢、考研、冲动消费…可直接输入新标签",
+                    help="场景标签：人情、答谢、考研、恋爱、冲动消费…可直接输入新标签，下次会出现在候选里",
                 )
                 submitted = st.form_submit_button("保存这笔")
             # 提交逻辑放在 expander 外，避免校验/错误提示被折叠面板收起；

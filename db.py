@@ -2486,6 +2486,47 @@ def aggregate_sub_tag_spending(bills_df, limit=None):
         return []
 
 
+def get_user_all_sub_tags(user_id):
+    """返回该用户历史账单里用过的全部副标签（去重、顺序稳定）。
+
+    用途：手动记账 / 明细筛选的下拉候选 —— 让用户自定义过的场景（如「毕业论文调研」）
+    下次还能直接选，而不是每次重新输入。
+
+    顺序：内置常用标签（SUB_TAG_OPTIONS 原顺序）在前；其余自定义标签按使
+    用次数降序、同次数按字符序追加。
+    降级：022 未执行 / 读库失败 / user_id 非法 → 只返回内置标签，**绝不抛异常**
+    （下拉候选是辅助信息，不能因此让记账页红屏）。
+    """
+    tags = list(SUB_TAG_OPTIONS)
+    seen = set(tags)
+    if not _bills_sub_tags_supported():
+        return tags
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return tags
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT sub_tags FROM bills "
+                    "WHERE user_id = :uid AND sub_tags IS NOT NULL"
+                ),
+                {"uid": uid},
+            ).scalars().all()
+    except Exception as exc:  # 只读辅助查询：失败就用内置标签
+        print(f"[db] 读取历史副标签失败：{type(exc).__name__}: {exc}")
+        return tags
+
+    counter = {}
+    for raw in rows:
+        for tag in normalize_sub_tags(raw):
+            counter[tag] = counter.get(tag, 0) + 1
+    extra = [tag for tag in counter if tag not in seen]
+    extra.sort(key=lambda tag: (-counter[tag], tag))
+    return tags + extra
+
+
 def _normalize_mood_months(months) -> int:
     """统计月数收敛到 1~24：非数字 / <=0 → 默认 3，>24 → 24。
 
